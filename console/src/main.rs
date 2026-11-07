@@ -151,6 +151,35 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
         )"
     };
     sqlx::query(metrics_ddl).execute(db).await?;
+    let audit_ddl = if is_mysql() {
+        "CREATE TABLE IF NOT EXISTS audit_logs (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            ts BIGINT NOT NULL,
+            action VARCHAR(64) NOT NULL,
+            node_id VARCHAR(128) NOT NULL,
+            network VARCHAR(255) NOT NULL,
+            detail TEXT
+        )"
+    } else if POSTGRES.load(Ordering::Relaxed) {
+        "CREATE TABLE IF NOT EXISTS audit_logs (
+            id BIGSERIAL PRIMARY KEY,
+            ts BIGINT NOT NULL,
+            action TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            network TEXT NOT NULL,
+            detail TEXT
+        )"
+    } else {
+        "CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            network TEXT NOT NULL,
+            detail TEXT
+        )"
+    };
+    sqlx::query(audit_ddl).execute(db).await?;
     Ok(())
 }
 
@@ -415,6 +444,14 @@ async fn post_command(
                     .bind(now())
                     .execute(&state.db)
                     .await;
+                    let _ = sqlx::query(&q("INSERT INTO audit_logs (ts, action, node_id, network, detail) VALUES (?, ?, ?, ?, ?)"))
+                        .bind(now())
+                        .bind("config.apply")
+                        .bind(&node_id)
+                        .bind(body.network.clone().unwrap_or_default())
+                        .bind(hash_token(&toml))
+                        .execute(&state.db)
+                        .await;
                 }
             }
             Json(value)
@@ -655,6 +692,15 @@ async fn get_version(
     }
 }
 
+async fn list_audit(State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(&q(
+        "SELECT ts, action, node_id, network, detail FROM audit_logs ORDER BY id DESC LIMIT 200",
+    )).fetch_all(&state.db).await.unwrap_or_default();
+    Json(json!({"logs": rows.into_iter().map(|(ts, action, node_id, network, detail)| json!({
+        "ts": ts, "action": action, "node_id": node_id, "network": network, "detail": detail,
+    })).collect::<Vec<_>>()}))
+}
+
 async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-console"})) }
 
 #[tokio::main]
@@ -722,6 +768,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/links", get(board_links))
         .route("/api/board/routes", get(board_routes))
         .route("/api/board/history", get(board_history))
+        .route("/api/board/audit", get(list_audit))
         .route("/api/login", axum::routing::post(login))
         .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))
