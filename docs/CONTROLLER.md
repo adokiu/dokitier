@@ -17,10 +17,10 @@
 dokitier-console（唯一 Web 入口）
   ├─ Web UI / HTTP API / 用户鉴权（会话、RBAC、审计）
   ├─ 节点注册表、配置版本、历史指标库
-  └─ Agent 接入（core 主动连入）：
-       ├─ WSS  /api/agent/ws
-       ├─ TCP  tcp://host:12800
-       └─ UDP  udp://host:12801（心跳；大数据走 TCP/WSS）
+  └─ Agent 接入（core 主动连入，三种独立传输）：
+       ├─ HTTP  POST 上报 + 长轮询拉命令（TCP）
+       ├─ WS    WebSocket 全双工（TCP）
+       └─ QUIC  原生 QUIC 全双工（纯 UDP，不需要 TCP 放通）
 
 dokitier-core（Agent）
   └─ [controller]
