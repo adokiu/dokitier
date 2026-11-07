@@ -75,8 +75,12 @@
         </v-list>
       </div>
       <div class="admin-sidebar__footer">
-        <v-btn variant="text" size="small" block @click="logout">
+        <v-btn v-if="!isRail" variant="text" size="small" block @click="logout">
           <LogOut :size="16" class="mr-2" />退出登录
+        </v-btn>
+        <v-btn v-else variant="text" size="small" icon @click="logout">
+          <LogOut :size="18" />
+          <v-tooltip activator="parent" location="right">退出登录</v-tooltip>
         </v-btn>
         <div v-if="!isRail" class="admin-sidebar__version">dokitier v2.7.0</div>
       </div>

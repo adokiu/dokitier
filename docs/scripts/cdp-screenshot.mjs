@@ -129,6 +129,10 @@ async function main() {
       await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: x2, y: y2, button: 'left', clickCount: 1 })
       await sleep(300)
     }
+    if (process.env.DOK_EVAL) {
+      const r = await send('Runtime.evaluate', { expression: process.env.DOK_EVAL, returnByValue: true })
+      console.log('EVAL', JSON.stringify(r.result?.value))
+    }
     const dom = await send('Runtime.evaluate', {
       expression: "JSON.stringify({res:performance.getEntriesByType('resource').map(r=>r.name.split('/').pop()).filter(n=>n.includes('HistoryView')||n.includes('index-')), scripts:[...document.querySelectorAll('script')].map(s=>s.src.split('/').pop())})",
       returnByValue: true,

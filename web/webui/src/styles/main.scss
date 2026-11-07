@@ -160,7 +160,18 @@ a { color: inherit; text-decoration: none; }
     width: 40px !important; min-width: 40px !important; max-width: 40px !important;
     min-height: 40px !important; margin: 2px auto !important; padding: 0 !important;
   }
+  .admin-shell.is-rail .admin-nav .v-list-item__prepend {
+    margin: 0 !important; width: auto !important; min-width: 0 !important; justify-content: center !important;
+  }
+  .admin-shell.is-rail .admin-nav .v-list-item__content,
+  .admin-shell.is-rail .admin-nav .v-list-item__append,
+  .admin-shell.is-rail .admin-nav .v-list-item__spacer { display: none !important; }
+  .admin-shell.is-rail .admin-nav .v-list-item .v-icon { margin: 0 !important; }
   .admin-shell.is-rail .admin-sidebar__footer { padding-inline: 4px; }
+  .admin-shell.is-rail .admin-sidebar__footer .v-btn {
+    width: 40px !important; min-width: 40px !important; height: 40px !important;
+    margin: 0 auto !important; padding: 0 !important; justify-content: center !important;
+  }
 }
 @media (max-width: 959.98px) {
   .admin-shell { grid-template-columns: 1fr; }
