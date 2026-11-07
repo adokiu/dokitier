@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use dokitier_controller::{hash_token, read_frame, write_frame, AgentFrame};
+use dokitier_controller::{hash_token, proof, read_frame, write_frame, AgentFrame, ConsoleFrame};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -67,6 +67,7 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS nodes (
             node_id VARCHAR(128) PRIMARY KEY,
             token_hash VARCHAR(128) NOT NULL,
+            token VARCHAR(255),
             hostname VARCHAR(255) NOT NULL DEFAULT '',
             version VARCHAR(64) NOT NULL DEFAULT '',
             networks LONGTEXT,
@@ -78,6 +79,7 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS nodes (
             node_id TEXT PRIMARY KEY,
             token_hash TEXT NOT NULL,
+            token TEXT,
             hostname TEXT NOT NULL DEFAULT '',
             version TEXT NOT NULL DEFAULT '',
             networks TEXT NOT NULL DEFAULT '[]',
@@ -87,6 +89,7 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
         )"
     };
     sqlx::query(nodes_ddl).execute(db).await?;
+    let _ = sqlx::query("ALTER TABLE nodes ADD COLUMN token TEXT").execute(db).await;
     let versions_ddl = if is_mysql() {
         "CREATE TABLE IF NOT EXISTS config_versions (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -151,6 +154,18 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn node_token(db: &AnyPool, node_id: &str) -> Option<String> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(&q("SELECT token FROM nodes WHERE node_id = ?"))
+        .bind(node_id).fetch_optional(db).await.ok().flatten();
+    row.and_then(|(token,)| token)
+}
+
+async fn verify_proof(db: &AnyPool, node_id: &str, nonce: &str, ts: i64, client_proof: &str) -> Option<String> {
+    let token = node_token(db, node_id).await?;
+    let expected = proof(&token, "client", node_id, nonce, ts);
+    (expected == client_proof && (now() - ts).abs() < 120).then_some(token)
+}
+
 async fn verify_node(db: &AnyPool, node_id: &str, token: &str) -> bool {
     let row: Option<(String,)> = sqlx::query_as(&q("SELECT token_hash FROM nodes WHERE node_id = ?"))
         .bind(node_id).fetch_optional(db).await.ok().flatten();
@@ -192,7 +207,7 @@ async fn merge_snapshot(state: &AppState, node_id: &str, data: &Value) -> Value 
 
 async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), String> {
     match frame {
-        AgentFrame::Hello { node_id, token, hostname, version, networks } => {
+        AgentFrame::Hello { node_id, token, hostname, version, networks, .. } => {
             if !verify_node(&state.db, &node_id, &token).await {
                 return Err("unknown node or invalid token".into());
             }
@@ -251,6 +266,10 @@ fn frame_network(frame: &AgentFrame) -> Option<String> {
 }
 
 async fn ws_session(state: AppState, mut socket: WebSocket) {
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let ts = now();
+    let challenge = serde_json::json!({"type":"challenge","nonce":nonce,"ts":ts});
+    send_json(&mut socket, challenge).await;
     let mut node_id: Option<String> = None;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
     loop {
@@ -267,11 +286,13 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
                     dispatch_result(&state, &value).await;
                 }
                 let Ok(frame) = serde_json::from_str::<AgentFrame>(&text) else { continue };
-                if let AgentFrame::Hello { node_id: id, token, .. } = &frame {
-                    if !verify_node(&state.db, id, token).await {
-                        let _ = socket.send(Message::Text(json!({"type":"error","error":"unknown node or invalid token"}).to_string().into())).await;
+                if let AgentFrame::Hello { node_id: id, proof: client_proof, .. } = &frame {
+                    let Some(token) = verify_proof(&state.db, id, &nonce, ts, client_proof).await else {
+                        let _ = socket.send(Message::Text(json!({"type":"error","error":"invalid node proof"}).to_string().into())).await;
                         break;
-                    }
+                    };
+                    let server_proof = proof(&token, "server", id, &nonce, ts);
+                    send_json(&mut socket, json!({"type":"challenge_ok","proof":server_proof})).await;
                     let network = frame_network(&frame).unwrap_or_else(|| "default".to_string());
                     let key = format!("{}:{}", id, network);
                     node_id = Some(id.clone());
@@ -413,13 +434,18 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
             let Ok(conn) = incoming.await else { return };
             tracing::info!(remote = ?conn.remote_address(), "quic agent connected");
             let Ok((mut send, mut recv)) = conn.accept_bi().await else { tracing::warn!("quic stream open failed"); return };
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let ts = now();
+            if write_frame(&mut send, &json!({"type":"challenge","nonce":nonce,"ts":ts})).await.is_err() { return; }
             let Ok(hello) = read_frame(&mut recv).await else { return };
             let Ok(frame) = serde_json::from_value::<AgentFrame>(hello) else { return };
-            let AgentFrame::Hello { node_id, token, hostname, version, networks } = &frame else { return };
-            if !verify_node(&state.db, node_id, token).await {
-                let _ = write_frame(&mut send, &json!({"type":"error","error":"unauthorized"})).await;
+            let AgentFrame::Hello { node_id, proof: client_proof, hostname, version, networks, .. } = &frame else { return };
+            let Some(token) = verify_proof(&state.db, node_id, &nonce, ts, client_proof).await else {
+                let _ = write_frame(&mut send, &json!({"type":"error","error":"invalid node proof"})).await;
                 return;
-            }
+            };
+            let server_proof = proof(&token, "server", node_id, &nonce, ts);
+            if write_frame(&mut send, &json!({"type":"challenge_ok","proof":server_proof})).await.is_err() { return; }
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
             let network = networks.first().and_then(|n| n.get("name")).and_then(|v| v.as_str()).unwrap_or("default");
             state.agents.insert(format!("{node_id}:{network}"), tx);
@@ -660,12 +686,12 @@ async fn main() -> anyhow::Result<()> {
     init_db(&db).await?;
     for (node_id, token) in &add_nodes {
         let upsert = if is_mysql() {
-            "INSERT INTO nodes (node_id, token_hash) VALUES (?, ?) ON DUPLICATE KEY UPDATE token_hash = VALUES(token_hash)"
+            "INSERT INTO nodes (node_id, token_hash, token) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE token_hash = VALUES(token_hash), token = VALUES(token)"
         } else {
-            "INSERT INTO nodes (node_id, token_hash) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET token_hash = excluded.token_hash"
+            "INSERT INTO nodes (node_id, token_hash, token) VALUES (?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET token_hash = excluded.token_hash, token = excluded.token"
         };
         sqlx::query(upsert)
-            .bind(node_id).bind(hash_token(token)).execute(&db).await?;
+            .bind(node_id).bind(hash_token(token)).bind(token).execute(&db).await?;
         tracing::info!(%node_id, "registered node");
     }
     let state = AppState { db, postgres, webui: PathBuf::from(webui),

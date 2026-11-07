@@ -1783,6 +1783,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "futures-util",
+ "hmac 0.12.1",
  "quinn",
  "rustls",
  "serde",

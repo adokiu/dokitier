@@ -15,9 +15,34 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConsoleFrame {
+    Challenge {
+        nonce: String,
+        ts: i64,
+    },
+    ChallengeOk {
+        proof: String,
+    },
+    Ack,
+    Error { error: String },
+    Command {
+        request_id: String,
+        command: ConsoleCommand,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentFrame {
     Hello {
         node_id: String,
+        #[serde(default)]
+        nonce: String,
+        #[serde(default)]
+        ts: i64,
+        #[serde(default)]
+        proof: String,
+        #[serde(default)]
         token: String,
         #[serde(default)]
         hostname: String,
@@ -47,22 +72,25 @@ pub enum AgentFrame {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ConsoleFrame {
-    Ack,
-    Error { error: String },
-    Command {
-        request_id: String,
-        command: ConsoleCommand,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConsoleCommand {
     GetConfig,
     ApplyConfig { toml: String },
     RestartInstance,
+}
+
+pub fn proof(token: &str, role: &str, node_id: &str, nonce: &str, ts: i64) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("hmac key");
+    mac.update(role.as_bytes());
+    mac.update(b"|");
+    mac.update(node_id.as_bytes());
+    mac.update(b"|");
+    mac.update(nonce.as_bytes());
+    mac.update(b"|");
+    mac.update(ts.to_string().as_bytes());
+    B64.encode(mac.finalize().into_bytes())
 }
 
 pub fn hash_token(token: &str) -> String {

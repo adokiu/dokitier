@@ -173,7 +173,28 @@ async fn session(
     )
     .await
     .map_err(|_| anyhow::anyhow!("controller connect timeout"))??;
-    transport.send(&hello(manager, settings).await).await?;
+
+    let challenge = transport.recv().await?;
+    let (nonce, ts) = match serde_json::from_value::<ConsoleFrame>(challenge)? {
+        ConsoleFrame::Challenge { nonce, ts } => (nonce, ts),
+        other => anyhow::bail!("expected challenge, got {other:?}"),
+    };
+    let client_proof = dokitier_controller::proof(&settings.token, "client", &settings.node_id, &nonce, ts);
+    let mut hello = hello(manager, settings).await;
+    hello["nonce"] = json!(nonce);
+    hello["ts"] = json!(ts);
+    hello["proof"] = json!(client_proof);
+    transport.send(&hello).await?;
+    let response = transport.recv().await?;
+    match serde_json::from_value::<ConsoleFrame>(response)? {
+        ConsoleFrame::ChallengeOk { proof: server_proof } => {
+            let expected = dokitier_controller::proof(&settings.token, "server", &settings.node_id, &nonce, ts);
+            if expected != server_proof {
+                anyhow::bail!("controller server proof mismatch");
+            }
+        }
+        other => anyhow::bail!("expected challenge_ok, got {other:?}"),
+    }
     tracing::info!(endpoint = %settings.url, node_id = %settings.node_id, "controller agent connected");
 
     let interval = Duration::from_secs(settings.interval_secs.max(1));
