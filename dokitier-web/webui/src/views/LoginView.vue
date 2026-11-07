@@ -26,6 +26,15 @@
         >{{ error }}</v-alert>
 
         <v-text-field
+          v-model="username"
+          label="管理员用户名"
+          prepend-inner-icon="mdi-account-outline"
+          autocomplete="username"
+          density="comfortable"
+          :disabled="loading"
+          class="mb-3"
+        />
+        <v-text-field
           v-model="password"
           label="控制台密码"
           prepend-inner-icon="mdi-lock-outline"
@@ -59,6 +68,7 @@ import { useTheme } from 'vuetify'
 import { Moon, Sun } from '@lucide/vue'
 import { api } from '@/api'
 
+const username = ref('admin')
 const password = ref('')
 const error = ref('')
 const loading = ref(false)
@@ -76,14 +86,14 @@ function toggleTheme() {
 
 async function submit() {
   if (loading.value) return
-  if (!password.value) {
-    error.value = '请输入控制台密码'
+  if (!username.value || !password.value) {
+    error.value = '请输入用户名和密码'
     return
   }
   loading.value = true
   error.value = ''
   try {
-    await api.login(password.value)
+    await api.login(username.value, password.value)
     router.push('/dashboard')
   } catch (e) {
     error.value = e.message === 'unauthorized' ? '密码错误' : String(e.message || e)

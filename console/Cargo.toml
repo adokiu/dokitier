@@ -28,4 +28,6 @@ uuid = { workspace = true, features = ["v4"] }
 quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
+argon2.workspace = true
+rand.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }

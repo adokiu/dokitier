@@ -1757,12 +1757,14 @@ name = "dokitier-console"
 version = "2.7.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "axum",
  "base64 0.22.1",
  "chrono",
  "dashmap",
  "dokitier-controller",
  "quinn",
+ "rand 0.8.8",
  "rcgen 0.13.2",
  "rustls",
  "serde",

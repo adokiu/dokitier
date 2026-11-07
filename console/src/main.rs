@@ -8,7 +8,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use dokitier_controller::{hash_token, proof, read_frame, write_frame, AgentFrame, ConsoleFrame, SessionCipher};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{any::AnyPoolOptions, AnyPool};
@@ -18,6 +18,7 @@ use tower_http::services::ServeDir;
 #[derive(Clone)]
 struct AppState {
     db: AnyPool,
+    sessions: std::sync::Arc<dashmap::DashMap<String, String>>,
     postgres: bool,
     webui: PathBuf,
     agents: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<Value>>>,
@@ -180,6 +181,32 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
         )"
     };
     sqlx::query(audit_ddl).execute(db).await?;
+    let users_ddl = if is_mysql() {
+        "CREATE TABLE IF NOT EXISTS users (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(128) NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role VARCHAR(32) NOT NULL DEFAULT 'admin',
+            created BIGINT NOT NULL
+        )"
+    } else if POSTGRES.load(Ordering::Relaxed) {
+        "CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            created BIGINT NOT NULL
+        )"
+    } else {
+        "CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            created INTEGER NOT NULL
+        )"
+    };
+    sqlx::query(users_ddl).execute(db).await?;
     Ok(())
 }
 
@@ -686,8 +713,93 @@ async fn overview(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"instances": count.0, "nodes": count.0, "links": 0, "routing": {}}))
 }
 
-async fn login() -> Json<Value> { Json(json!({"ok": true})) }
-async fn logout() -> Json<Value> { Json(json!({"ok": true})) }
+async fn ensure_admin(db: &AnyPool) -> anyhow::Result<()> {
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use rand::Rng;
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
+    if count.0 > 0 { return Ok(()); }
+    let password: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(18)
+        .map(char::from)
+        .collect();
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("argon2: {e}"))?
+        .to_string();
+    sqlx::query(&q("INSERT INTO users (username, password_hash, role, created) VALUES (?, ?, ?, ?)"))
+        .bind("admin").bind(hash).bind("admin").bind(now())
+        .execute(db).await?;
+    tracing::warn!("==============================================");
+    tracing::warn!("dokitier console initial admin account");
+    tracing::warn!("username: admin");
+    tracing::warn!("password: {password}");
+    tracing::warn!("==============================================");
+    eprintln!("dokitier console initial admin: admin / {password}");
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct LoginBody { username: String, password: String }
+
+async fn login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginBody>,
+) -> axum::response::Response {
+    use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHash};
+    let row: Option<(String, String)> = sqlx::query_as(&q(
+        "SELECT password_hash, role FROM users WHERE username = ?",
+    )).bind(&body.username).fetch_optional(&state.db).await.ok().flatten();
+    let Some((hash, role)) = row else {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error":"invalid credentials"}))).into_response();
+    };
+    let ok = PasswordHash::new(&hash)
+        .ok()
+        .and_then(|parsed| Argon2::default().verify_password(body.password.as_bytes(), &parsed).ok())
+        .is_some();
+    if !ok {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error":"invalid credentials"}))).into_response();
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    state.sessions.insert(token.clone(), body.username.clone());
+    let cookie = format!("dokitier_session={token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=86400");
+    let mut response = Json(json!({"ok": true, "username": body.username, "role": role})).into_response();
+    response.headers_mut().insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    response
+}
+
+async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Json<Value> {
+    if let Some(token) = session_token(&headers) {
+        state.sessions.remove(&token);
+    }
+    Json(json!({"ok": true}))
+}
+
+fn session_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("dokitier_session=") {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+async fn require_auth(
+    State(state): State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(token) = session_token(req.headers()) else {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error":"login required"}))).into_response();
+    };
+    if !state.sessions.contains_key(&token) {
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error":"login required"}))).into_response();
+    }
+    next.run(req).await
+}
 
 async fn list_versions(
     State(state): State<AppState>,
@@ -764,7 +876,9 @@ async fn main() -> anyhow::Result<()> {
             .bind(node_id).bind(hash_token(token)).bind(token).execute(&db).await?;
         tracing::info!(%node_id, "registered node");
     }
+    ensure_admin(&db).await?;
     let state = AppState { db, postgres, webui: PathBuf::from(webui),
+        sessions: std::sync::Arc::new(dashmap::DashMap::new()),
         agents: std::sync::Arc::new(dashmap::DashMap::new()),
         pending: std::sync::Arc::new(dashmap::DashMap::new()) };
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -787,8 +901,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%listen, %agent_quic, "console listeners ready (websocket + quic agent endpoints)");
     let quic_state = state.clone();
     tokio::spawn(async move { quic_accept_loop(quic_state, quic_endpoint).await });
-    let app = Router::new()
-        .route("/healthz", get(health))
+    let protected = Router::new()
         .route("/api/overview", get(overview))
         .route("/api/board/overview", get(board_overview))
         .route("/api/board/topology", get(board_topology))
@@ -796,14 +909,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/routes", get(board_routes))
         .route("/api/board/history", get(board_history))
         .route("/api/board/audit", get(list_audit))
-        .route("/api/login", axum::routing::post(login))
-        .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))
         .route("/api/board/nodes/{node_id}", get(get_node))
-        .route("/api/agent/ws", get(ws_agent))
         .route("/api/board/nodes/{node_id}/versions", get(list_versions))
         .route("/api/board/nodes/{node_id}/versions/{version_id}", get(get_version))
         .route("/api/board/nodes/{node_id}/command", axum::routing::post(post_command))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
+    let app = Router::new()
+        .route("/healthz", get(health))
+        .route("/api/login", axum::routing::post(login))
+        .route("/api/logout", axum::routing::post(logout))
+        .route("/api/agent/ws", get(ws_agent))
+        .merge(protected)
         .fallback_service(ServeDir::new(&state.webui).append_index_html_on_directories(true))
         .with_state(state);
     let listener = TcpListener::bind(&listen).await?;

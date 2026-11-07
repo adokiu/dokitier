@@ -15,7 +15,7 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  login: (password) => request('/api/login', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ password }) }),
+  login: (username, password) => request('/api/login', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ username, password }) }),
   logout: () => request('/api/logout', { method: 'POST' }),
   overview: () => request('/api/overview'),
   topology: () => request('/api/topology'),
