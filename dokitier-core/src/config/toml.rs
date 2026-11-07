@@ -182,6 +182,8 @@ pub struct NetworkIdentity {
     pub network_secret: Option<String>,
     #[serde(skip)]
     pub network_secret_digest: Option<NetworkSecretDigest>,
+    #[serde(default)]
+    pub p2p_group: Option<String>,
 }
 
 impl From<super::NetworkIdentity> for NetworkIdentity {
@@ -190,6 +192,7 @@ impl From<super::NetworkIdentity> for NetworkIdentity {
             network_name: value.network_name,
             network_secret: value.network_secret,
             network_secret_digest: value.network_secret_digest,
+            p2p_group: value.p2p_group.clone(),
         }
     }
 }
@@ -200,6 +203,7 @@ impl From<&NetworkIdentity> for super::NetworkIdentity {
             network_name: value.network_name.clone(),
             network_secret: value.network_secret.clone(),
             network_secret_digest: value.network_secret_digest,
+            p2p_group: value.p2p_group.clone(),
         }
     }
 }
@@ -210,6 +214,7 @@ impl From<NetworkIdentity> for super::NetworkIdentity {
             network_name: value.network_name,
             network_secret: value.network_secret,
             network_secret_digest: value.network_secret_digest,
+            p2p_group: value.p2p_group.clone(),
         }
     }
 }
@@ -415,6 +420,8 @@ struct ControllerToml {
     token: Option<String>,
     #[serde(default)]
     interval_secs: Option<u64>,
+    #[serde(default)]
+    heartbeat_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -561,6 +568,7 @@ impl TomlConfig {
             node_id: controller.node_id.clone().unwrap_or_default(),
             token: controller.token.clone().unwrap_or_default(),
             interval_secs: controller.interval_secs.unwrap_or(2).max(1),
+            heartbeat_secs: controller.heartbeat_secs.unwrap_or(20).max(5),
         })
     }
 
@@ -938,12 +946,12 @@ impl ConfigLoader for TomlConfig {
     }
 
     fn get_network_identity(&self) -> NetworkIdentity {
-        self.config
-            .lock()
-            .unwrap()
-            .network_identity
-            .clone()
-            .unwrap_or_default()
+        let config = self.config.lock().unwrap();
+        let mut identity = config.network_identity.clone().unwrap_or_default();
+        if identity.p2p_group.is_none() {
+            identity.p2p_group = config.p2p_group.clone();
+        }
+        identity
     }
 
     fn set_network_identity(&self, identity: NetworkIdentity) {

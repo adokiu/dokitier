@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, UdpSocket}};
+use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
@@ -146,60 +146,6 @@ async fn dispatch_result(state: &AppState, value: &Value) {
     }
 }
 
-fn frame_from_bytes(buf: &[u8]) -> Option<(AgentFrame, Value)> {
-    let value: Value = serde_json::from_slice(buf).ok()?;
-    let frame: AgentFrame = serde_json::from_value(value.clone()).ok()?;
-    Some((frame, value))
-}
-
-async fn tcp_agent_listener(state: AppState, listener: TcpListener) {
-    loop {
-        let Ok((mut stream, peer)) = listener.accept().await else { continue };
-        let state = state.clone();
-        tokio::spawn(async move {
-            tracing::info!(%peer, "tcp agent connected");
-            let mut authenticated = false;
-            loop {
-                let mut len = [0u8; 4];
-                if stream.read_exact(&mut len).await.is_err() { break; }
-                let len = u32::from_be_bytes(len) as usize;
-                if len == 0 || len > 8 * 1024 * 1024 { break; }
-                let mut buf = vec![0u8; len];
-                if stream.read_exact(&mut buf).await.is_err() { break; }
-                let Some((frame, value)) = frame_from_bytes(&buf) else { break };
-                if !authenticated {
-                    match &frame {
-                        AgentFrame::Hello { node_id, token, .. } => {
-                            if verify_node(&state.db, node_id, token).await { authenticated = true; }
-                            else { let _ = stream.write_all(b"{\"type\":\"error\",\"error\":\"unauthorized\"}\n").await; break; }
-                        }
-                        _ => break,
-                    }
-                }
-                if let Err(err) = handle_agent_frame(&state, frame).await {
-                    let _ = stream.write_all(format!("{{\"type\":\"error\",\"error\":{:?}}}\n", err).as_bytes()).await;
-                    break;
-                }
-                let ack = json!({"type":"ack","echo":value.get("type")}).to_string();
-                let _ = stream.write_all(format!("{ack}\n").as_bytes()).await;
-            }
-        });
-    }
-}
-
-async fn udp_agent_listener(state: AppState, socket: UdpSocket) {
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let Ok((n, peer)) = socket.recv_from(&mut buf).await else { continue };
-        let Ok(value) = serde_json::from_slice::<Value>(&buf[..n]) else { continue };
-        let node_id = value.get("node_id").and_then(|v| v.as_str()).unwrap_or_default();
-        let token = value.get("token").and_then(|v| v.as_str()).unwrap_or_default();
-        if node_id.is_empty() || !verify_node(&state.db, node_id, token).await { continue; }
-        touch_node(&state.db, node_id, None, None, None, None, "online").await;
-        let _ = socket.send_to(br#"{"type":"ack"}"#, peer).await;
-    }
-}
-
 #[derive(Serialize)]
 struct NodeView { node_id: String, hostname: String, version: String, networks: Value, snapshot: Value, last_seen: i64, status: String }
 
@@ -272,8 +218,6 @@ async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
     let mut listen = "127.0.0.1:12800".to_string();
-    let mut agent_tcp = "127.0.0.1:12801".to_string();
-    let mut agent_udp = "127.0.0.1:12802".to_string();
     let mut db_path = "board.db".to_string();
     let mut webui = "../dokitier-web/webui/dist".to_string();
     let mut add_nodes: Vec<(String, String)> = Vec::new();
@@ -282,8 +226,6 @@ async fn main() -> anyhow::Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--listen" => { listen = args[i + 1].clone(); i += 2; }
-            "--agent-tcp" => { agent_tcp = args[i + 1].clone(); i += 2; }
-            "--agent-udp" => { agent_udp = args[i + 1].clone(); i += 2; }
             "--db" => { db_path = args[i + 1].clone(); i += 2; }
             "--webui" => { webui = args[i + 1].clone(); i += 2; }
             "--add-node" => { add_nodes.push((args[i + 1].clone(), args[i + 2].clone())); i += 3; }
@@ -301,13 +243,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { db, webui: PathBuf::from(webui),
         agents: std::sync::Arc::new(dashmap::DashMap::new()),
         pending: std::sync::Arc::new(dashmap::DashMap::new()) };
-    let tcp_listener = TcpListener::bind(&agent_tcp).await?;
-    let udp_socket = UdpSocket::bind(&agent_udp).await?;
-    tracing::info!(%agent_tcp, %agent_udp, %listen, "agent listeners ready");
-    let tcp_state = state.clone();
-    tokio::spawn(async move { tcp_agent_listener(tcp_state, tcp_listener).await });
-    let udp_state = state.clone();
-    tokio::spawn(async move { udp_agent_listener(udp_state, udp_socket).await });
+    tracing::info!(%listen, "console listeners ready (websocket agent endpoint)");
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/api/board/nodes", get(list_nodes))

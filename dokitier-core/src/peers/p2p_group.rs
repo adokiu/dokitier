@@ -25,10 +25,15 @@ pub fn local_group() -> Option<String> {
 /// not advertise one), so it is treated as ungrouped and left untouched for
 /// backward compatibility.
 pub fn is_cross_group(remote: &str) -> bool {
+    is_cross_group_for(local_group().as_deref(), remote)
+}
+
+/// Per-network variant: `local` comes from the network identity of the instance.
+pub fn is_cross_group_for(local: Option<&str>, remote: &str) -> bool {
     if remote.is_empty() {
         return false;
     }
-    match local_group() {
+    match local.filter(|g| !g.is_empty()) {
         Some(local) => local != remote,
         None => false,
     }

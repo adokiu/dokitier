@@ -1162,6 +1162,11 @@ impl PeerManagerCore {
         self.my_peer_id
     }
 
+    /// Network identity of this instance, including its per-network P2P group.
+    pub fn network_identity(&self) -> crate::config::NetworkIdentity {
+        self.context.network_identity()
+    }
+
     pub(crate) fn credential_manager(&self) -> Arc<CredentialManager> {
         self.context.credential_manager()
     }
@@ -2032,12 +2037,20 @@ impl PeerConnectionAdmission {
             origin,
         );
         peer.do_handshake_as_client().await?;
+        let local_group = self
+            .context
+            .network_identity()
+            .p2p_group
+            .clone()
+            .unwrap_or_default();
         if origin.is_auto_p2p()
-            && crate::peers::p2p_group::is_cross_group(peer.get_remote_p2p_group())
+            && crate::peers::p2p_group::is_cross_group_for(
+                Some(local_group.as_str()),
+                peer.get_remote_p2p_group(),
+            )
         {
             return Err(Error::SecretKeyError(format!(
-                "p2p group mismatch: local={:?}, remote={:?}",
-                crate::peers::p2p_group::local_group(),
+                "p2p group mismatch: local={local_group:?}, remote={:?}",
                 peer.get_remote_p2p_group()
             )));
         }
@@ -2134,12 +2147,20 @@ impl PeerConnectionAdmission {
             }
             return Err(err);
         }
+        let local_group = self
+            .context
+            .network_identity()
+            .p2p_group
+            .clone()
+            .unwrap_or_default();
         if origin.is_auto_p2p()
-            && crate::peers::p2p_group::is_cross_group(conn.get_remote_p2p_group())
+            && crate::peers::p2p_group::is_cross_group_for(
+                Some(local_group.as_str()),
+                conn.get_remote_p2p_group(),
+            )
         {
             return Err(Error::SecretKeyError(format!(
-                "p2p group mismatch: local={:?}, remote={:?}",
-                crate::peers::p2p_group::local_group(),
+                "p2p group mismatch: local={local_group:?}, remote={:?}",
                 conn.get_remote_p2p_group()
             )));
         }

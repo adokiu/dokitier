@@ -550,7 +550,7 @@ impl PeerConn {
             version: VERSION,
             features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
             network_name: network.network_name.clone(),
-            p2p_group: crate::peers::p2p_group::local_group().unwrap_or_default(),
+            p2p_group: self.context.network_identity().p2p_group.clone().unwrap_or_default(),
             ..Default::default()
         };
 
@@ -821,7 +821,7 @@ impl PeerConn {
             a_conn_id: Some(a_conn_id.into()),
             client_encryption_algorithm: self.my_encrypt_algo.clone(),
             features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
-            p2p_group: crate::peers::p2p_group::local_group().unwrap_or_default(),
+            p2p_group: self.context.network_identity().p2p_group.clone().unwrap_or_default(),
         };
 
         let mut hs = builder
@@ -1097,7 +1097,7 @@ impl PeerConn {
             secret_proof_32,
             server_encryption_algorithm: algo,
             features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
-            b_p2p_group: crate::peers::p2p_group::local_group().unwrap_or_default(),
+            b_p2p_group: self.context.network_identity().p2p_group.clone().unwrap_or_default(),
         };
         self.send_noise_msg(
             msg2_pb,
@@ -1197,7 +1197,7 @@ impl PeerConn {
 
             features: noise.remote_features.clone(),
             network_secret_digest: noise.secret_digest.clone(),
-            p2p_group: crate::peers::p2p_group::local_group().unwrap_or_default(),
+            p2p_group: self.context.network_identity().p2p_group.clone().unwrap_or_default(),
         }
     }
 
@@ -1443,6 +1443,7 @@ impl PeerConn {
             network_name: info.network_name.clone(),
             network_secret: None,
             network_secret_digest: Some([0u8; 32]),
+            p2p_group: self.context.network_identity().p2p_group.clone(),
         };
         ret.network_secret_digest
             .as_mut()

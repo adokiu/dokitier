@@ -2891,6 +2891,7 @@ impl PeerRouteServiceImpl {
                 continue;
             }
             let network_identity = CoreNetworkIdentity {
+                p2p_group: None,
                 network_name: key.network_name.clone(),
                 network_secret: None,
                 network_secret_digest: Some(

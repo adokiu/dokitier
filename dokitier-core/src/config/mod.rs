@@ -142,6 +142,9 @@ pub struct NetworkIdentity {
     pub network_name: String,
     pub network_secret: Option<String>,
     pub network_secret_digest: Option<NetworkSecretDigest>,
+    /// Per-network P2P isolation group.
+    #[serde(default)]
+    pub p2p_group: Option<String>,
 }
 
 impl NetworkIdentity {
@@ -150,6 +153,7 @@ impl NetworkIdentity {
             network_secret_digest: Some(network_secret_digest(&network_name, &network_secret)),
             network_name,
             network_secret: Some(network_secret),
+            p2p_group: None,
         }
     }
 
@@ -158,6 +162,7 @@ impl NetworkIdentity {
             network_name,
             network_secret: None,
             network_secret_digest: None,
+            p2p_group: None,
         }
     }
 
@@ -873,4 +878,5 @@ pub struct ControllerSettings {
     pub node_id: String,
     pub token: String,
     pub interval_secs: u64,
+    pub heartbeat_secs: u64,
 }

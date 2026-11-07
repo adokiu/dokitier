@@ -34,11 +34,14 @@ async fn snapshot(manager: &NativeInstanceManager) -> Value {
     let mut instances = Vec::new();
     for instance in manager.instances() {
         let node = instance.node_snapshot().await;
+        let identity = instance.peer_manager().network_identity();
         instances.push(json!({
             "instance_id": node.instance_id.to_string(),
             "peer_id": instance.peer_id(),
             "hostname": node.hostname,
             "version": node.version,
+            "network_name": identity.network_name,
+            "p2p_group": identity.p2p_group,
             "ipv4": node.ipv4_addr.map(|x| x.to_string()),
             "ipv6": node.ipv6_addr.map(|x| x.to_string()),
         }));
@@ -122,6 +125,8 @@ async fn session(
     tracing::info!(endpoint = %settings.url, node_id = %settings.node_id, "controller agent connected");
 
     let interval = Duration::from_secs(settings.interval_secs.max(1));
+    let heartbeat_every = Duration::from_secs(settings.heartbeat_secs.max(5));
+    let mut last_heartbeat = tokio::time::Instant::now();
     loop {
         match tokio::time::timeout(interval, transport.recv()).await {
             Ok(Ok(value)) => {
@@ -142,6 +147,15 @@ async fn session(
             }
             Ok(Err(err)) => return Err(err),
             Err(_) => {}
+        }
+        if last_heartbeat.elapsed() >= heartbeat_every {
+            let heartbeat = serde_json::json!({
+                "type": "heartbeat",
+                "node_id": settings.node_id,
+                "ts": chrono::Utc::now().timestamp(),
+            });
+            transport.send(&heartbeat).await?;
+            last_heartbeat = tokio::time::Instant::now();
         }
         let snap = serde_json::json!({
             "type": "snapshot",
