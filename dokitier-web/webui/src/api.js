@@ -34,5 +34,7 @@ export const api = {
   boardNodes: () => request('/api/board/nodes'),
   boardNode: (id) => request('/api/board/nodes/' + id),
   boardCommand: (id, command, network) => request('/api/board/nodes/' + id + '/command', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(network ? { command, network } : { command }) }),
+  boardVersions: (id) => request('/api/board/nodes/' + id + '/versions'),
+  boardVersion: (id, versionId) => request('/api/board/nodes/' + id + '/versions/' + versionId),
   saveConfig: (toml) => request('/api/config', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ toml }) }),
 }

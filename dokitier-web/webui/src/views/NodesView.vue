@@ -50,6 +50,7 @@
           <div class="d-flex align-center mb-2">
             <span class="stat-label">配置文件 / {{ network }}</span>
             <v-spacer />
+            <v-btn size="x-small" variant="text" prepend-icon="mdi-history" @click="openVersions">历史</v-btn>
             <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click="downloadConfig">下载</v-btn>
           </div>
           <v-textarea v-model="configText" class="config-editor mono" rows="18" variant="outlined" density="compact" spellcheck="false" :loading="configLoading" />
@@ -62,6 +63,22 @@
         </template>
       </template>
     </DetailDrawer>
+
+    <v-dialog v-model="versionsOpen" max-width="620">
+      <v-card class="pa-2">
+        <v-card-title>配置历史 / {{ network }}</v-card-title>
+        <v-list density="compact">
+          <v-list-item v-for="v in versions" :key="v.id">
+            <v-list-item-title>{{ new Date(v.created * 1000).toLocaleString() }}</v-list-item-title>
+            <v-list-item-subtitle class="mono">{{ v.network }} / {{ v.hash.slice(0, 16) }}</v-list-item-subtitle>
+            <template #append>
+              <v-btn size="x-small" variant="text" :loading="rollingBack === v.id" @click="rollback(v)">回滚</v-btn>
+            </template>
+          </v-list-item>
+          <v-list-item v-if="!versions.length"><v-list-item-title class="text-medium-emphasis">暂无版本</v-list-item-title></v-list-item>
+        </v-list>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
@@ -88,6 +105,9 @@ const configLoading = ref(false)
 const configError = ref('')
 const saving = ref(false)
 const saved = ref(false)
+const versionsOpen = ref(false)
+const versions = ref([])
+const rollingBack = ref(null)
 
 function networksOf(item) {
   return item.snapshot?.instances || item.instances || []
@@ -174,6 +194,33 @@ async function saveConfig() {
     configError.value = String(e.message || e)
   } finally {
     saving.value = false
+  }
+}
+
+async function openVersions() {
+  versionsOpen.value = true
+  try {
+    const data = await api.boardVersions(detail.value.node_id)
+    versions.value = data.versions || []
+  } catch {
+    versions.value = []
+  }
+}
+
+async function rollback(version) {
+  rollingBack.value = version.id
+  try {
+    const data = await api.boardVersion(detail.value.node_id, version.id)
+    const res = await api.boardCommand(detail.value.node_id, { kind: 'apply_config', toml: data.toml }, data.network || network.value)
+    if (!res.ok) throw new Error(res.error || '回滚失败')
+    versionsOpen.value = false
+    saved.value = true
+    configText.value = data.toml
+    await load()
+  } catch (e) {
+    configError.value = String(e.message || e)
+  } finally {
+    rollingBack.value = null
   }
 }
 

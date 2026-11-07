@@ -416,6 +416,21 @@ async fn list_versions(
     })).collect::<Vec<_>>()}))
 }
 
+async fn get_version(
+    State(state): State<AppState>,
+    Path((node_id, version_id)): Path<(String, i64)>,
+) -> Json<Value> {
+    let row: Option<(String, String, String, i64)> = sqlx::query_as(&q(
+        "SELECT network, hash, toml, created FROM config_versions WHERE node_id = ? AND id = ?",
+    )).bind(&node_id).bind(version_id).fetch_optional(&state.db).await.ok().flatten();
+    match row {
+        Some((network, hash, toml, created)) => Json(json!({
+            "network": network, "hash": hash, "toml": toml, "created": created,
+        })),
+        None => Json(json!({"error": "not found"})),
+    }
+}
+
 async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-console"})) }
 
 #[tokio::main]
@@ -484,6 +499,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/nodes/{node_id}", get(get_node))
         .route("/api/agent/ws", get(ws_agent))
         .route("/api/board/nodes/{node_id}/versions", get(list_versions))
+        .route("/api/board/nodes/{node_id}/versions/{version_id}", get(get_version))
         .route("/api/board/nodes/{node_id}/command", axum::routing::post(post_command))
         .fallback_service(ServeDir::new(&state.webui).append_index_html_on_directories(true))
         .with_state(state);
