@@ -1760,6 +1760,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "dashmap",
  "dokitier-controller",
  "serde",
  "serde_json",
@@ -1769,6 +1770,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

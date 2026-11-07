@@ -16,7 +16,12 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, UdpSocket}};
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
-struct AppState { db: SqlitePool, webui: PathBuf }
+struct AppState {
+    db: SqlitePool,
+    webui: PathBuf,
+    agents: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<Value>>>,
+    pending: std::sync::Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+}
 
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
 
@@ -68,7 +73,9 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
             touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
         }
         AgentFrame::Snapshot { node_id, data } => {
-            touch_node(&state.db, &node_id, None, None, None, Some(&data), "online").await; Ok(())
+            let hostname = data.pointer("/instances/0/hostname").and_then(|v| v.as_str());
+            let version = data.pointer("/instances/0/version").and_then(|v| v.as_str());
+            touch_node(&state.db, &node_id, hostname, version, None, Some(&data), "online").await; Ok(())
         }
         AgentFrame::Result { node_id, .. } => {
             touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
@@ -86,29 +93,57 @@ async fn send_json(socket: &mut WebSocket, value: Value) {
 
 async fn ws_session(state: AppState, mut socket: WebSocket) {
     let mut node_id: Option<String> = None;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
     loop {
-        let msg = match socket.recv().await {
-            Some(Ok(Message::Text(text))) => text.to_string(),
-            Some(Ok(Message::Binary(bin))) => String::from_utf8_lossy(&bin).to_string(),
-            Some(Ok(Message::Close(_))) | None => break,
-            Some(Ok(_)) => continue,
-            Some(Err(_)) => break,
-        };
-        let frame: AgentFrame = match serde_json::from_str(&msg) {
-            Ok(frame) => frame,
-            Err(err) => { send_json(&mut socket, json!({"type":"error","error":err.to_string()})).await; continue; }
-        };
-        if let AgentFrame::Hello { node_id: id, .. } = &frame { node_id = Some(id.clone()); }
-        match handle_agent_frame(&state, frame).await {
-            Ok(()) => send_json(&mut socket, json!({"type":"ack"})).await,
-            Err(err) => {
-                send_json(&mut socket, json!({"type":"error","error":err})).await;
-                let _ = socket.send(Message::Close(None)).await;
-                break;
+        tokio::select! {
+            msg = socket.recv() => {
+                let Some(Ok(msg)) = msg else { break };
+                let text = match msg {
+                    Message::Text(text) => text.to_string(),
+                    Message::Binary(bin) => String::from_utf8_lossy(&bin).to_string(),
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    dispatch_result(&state, &value).await;
+                }
+                let Ok(frame) = serde_json::from_str::<AgentFrame>(&text) else { continue };
+                if let AgentFrame::Hello { node_id: id, token, .. } = &frame {
+                    if !verify_node(&state.db, id, token).await {
+                        let _ = socket.send(Message::Text(json!({"type":"error","error":"unknown node or invalid token"}).to_string().into())).await;
+                        break;
+                    }
+                    node_id = Some(id.clone());
+                    state.agents.insert(id.clone(), tx.clone());
+                }
+                let id_matches = node_id.is_some();
+                if !id_matches { break; }
+                let _ = handle_agent_frame(&state, frame).await;
+            }
+            outbound = rx.recv() => {
+                let Some(value) = outbound else { break };
+                send_json(&mut socket, value).await;
             }
         }
+        // Dispatch command results to waiting HTTP handlers.
+        if let Some(id) = &node_id {
+            let _ = id;
+        }
     }
-    if let Some(id) = node_id { touch_node(&state.db, &id, None, None, None, None, "offline").await; }
+    if let Some(id) = node_id {
+        state.agents.remove(&id);
+        touch_node(&state.db, &id, None, None, None, None, "offline").await;
+    }
+}
+
+async fn dispatch_result(state: &AppState, value: &Value) {
+    if value.get("type").and_then(|v| v.as_str()) != Some("result") {
+        return;
+    }
+    let Some(request_id) = value.get("request_id").and_then(|v| v.as_str()) else { return };
+    if let Some((_, tx)) = state.pending.remove(request_id) {
+        let _ = tx.send(value.clone());
+    }
 }
 
 fn frame_from_bytes(buf: &[u8]) -> Option<(AgentFrame, Value)> {
@@ -196,6 +231,41 @@ async fn get_node(State(state): State<AppState>, Path(node_id): Path<String>) ->
     }
 }
 
+#[derive(serde::Deserialize)]
+struct CommandBody {
+    command: dokitier_controller::ConsoleCommand,
+}
+
+async fn post_command(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    Json(body): Json<CommandBody>,
+) -> Json<Value> {
+    let Some(tx) = state.agents.get(&node_id).map(|v| v.clone()) else {
+        return Json(json!({"ok": false, "error": "node is offline"}));
+    };
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    state.pending.insert(request_id.clone(), result_tx);
+    let frame = json!({
+        "type": "command",
+        "request_id": request_id,
+        "command": serde_json::to_value(&body.command).unwrap_or(Value::Null),
+    });
+    if tx.send(frame).await.is_err() {
+        state.pending.remove(&request_id);
+        return Json(json!({"ok": false, "error": "agent channel closed"}));
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(20), result_rx).await {
+        Ok(Ok(value)) => Json(value),
+        Ok(Err(_)) => Json(json!({"ok": false, "error": "agent result channel closed"})),
+        Err(_) => {
+            state.pending.remove(&request_id);
+            Json(json!({"ok": false, "error": "agent command timeout"}))
+        }
+    }
+}
+
 async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-console"})) }
 
 #[tokio::main]
@@ -228,7 +298,9 @@ async fn main() -> anyhow::Result<()> {
             .bind(node_id).bind(hash_token(token)).execute(&db).await?;
         tracing::info!(%node_id, "registered node");
     }
-    let state = AppState { db, webui: PathBuf::from(webui) };
+    let state = AppState { db, webui: PathBuf::from(webui),
+        agents: std::sync::Arc::new(dashmap::DashMap::new()),
+        pending: std::sync::Arc::new(dashmap::DashMap::new()) };
     let tcp_listener = TcpListener::bind(&agent_tcp).await?;
     let udp_socket = UdpSocket::bind(&agent_udp).await?;
     tracing::info!(%agent_tcp, %agent_udp, %listen, "agent listeners ready");
@@ -241,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/nodes", get(list_nodes))
         .route("/api/board/nodes/{node_id}", get(get_node))
         .route("/api/agent/ws", get(ws_agent))
+        .route("/api/board/nodes/{node_id}/command", axum::routing::post(post_command))
         .fallback_service(ServeDir::new(&state.webui).append_index_html_on_directories(true))
         .with_state(state);
     let listener = TcpListener::bind(&listen).await?;
