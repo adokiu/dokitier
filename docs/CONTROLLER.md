@@ -35,7 +35,24 @@ dokitier-core（Agent）
 
 - 控制台先创建节点记录，生成一次性展示的 `node_id` + `token`，
   数据库只存 `token_hash`（HMAC-SHA256）、启用状态、绑定信息。
-- core 配置：
+- board 模式下 core 只需要控制台连接信息，网络配置由 board 下发：
+
+```toml
+instance_name = "minimal"
+instance_id = "..."
+
+[controller]
+url = "ws://console.example.com/api/agent/ws"
+node_id = "node-xxxx"
+token = "<node-token>"
+
+[flags]
+no_tun = true
+```
+
+core 启动后以空实例连上 board，管理员在 board 里推送该节点的网络 TOML，core 原子应用。
+
+原完整配置仍兼容。core 配置：
 
 ```toml
 [controller]

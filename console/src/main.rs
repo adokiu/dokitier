@@ -752,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
     MYSQL.store(db_path.starts_with("mysql://"), Ordering::Relaxed);
     let postgres = db_path.starts_with("postgres://") || db_path.starts_with("postgresql://");
     let db = AnyPoolOptions::new().max_connections(5)
-        .connect(&format!("sqlite://{db_path}?mode=rwc")).await?;
+        .connect(&database_url(&db_path)).await?;
     init_db(&db).await?;
     for (node_id, token) in &add_nodes {
         let upsert = if is_mysql() {
@@ -760,7 +760,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             "INSERT INTO nodes (node_id, token_hash, token) VALUES (?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET token_hash = excluded.token_hash, token = excluded.token"
         };
-        sqlx::query(upsert)
+        sqlx::query(&q(upsert))
             .bind(node_id).bind(hash_token(token)).bind(token).execute(&db).await?;
         tracing::info!(%node_id, "registered node");
     }
