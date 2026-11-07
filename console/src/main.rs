@@ -226,11 +226,11 @@ async fn merge_snapshot(state: &AppState, node_id: &str, data: &Value) -> Value 
             }
         }
     };
+    add(data.get("instances").and_then(|v| v.as_array()));
     if let Some((snap,)) = existing {
         let old: Value = serde_json::from_str(&snap).unwrap_or(Value::Null);
         add(old.get("instances").and_then(|v| v.as_array()));
     }
-    add(data.get("instances").and_then(|v| v.as_array()));
     json!({"ts": now(), "instances": merged_instances})
 }
 

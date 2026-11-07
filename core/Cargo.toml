@@ -343,7 +343,6 @@ default = [
     "linux-netlink",
     "tcp-hole-punch",
 ]
-web-console = ["dep:dokitier-web"]
 full = [
     "cli",
     "websocket",

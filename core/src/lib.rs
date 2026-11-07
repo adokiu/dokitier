@@ -27,8 +27,7 @@ pub mod utils;
 pub mod controller_agent;
 pub mod web_client;
 
-#[cfg(feature = "web-console")]
-pub mod web_console;
+
 
 #[cfg(test)]
 mod tests;
