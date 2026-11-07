@@ -31,5 +31,8 @@ export const api = {
   history: (a, b, range) => request(`/api/history?a=${a}&b=${b}&range=${range}`),
   sync: () => request('/api/sync'),
   getConfig: () => request('/api/config'),
+  boardNodes: () => request('/api/board/nodes'),
+  boardNode: (id) => request('/api/board/nodes/' + id),
+  boardCommand: (id, command, network) => request('/api/board/nodes/' + id + '/command', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(network ? { command, network } : { command }) }),
   saveConfig: (toml) => request('/api/config', { method: 'PUT', headers: jsonHeaders, body: JSON.stringify({ toml }) }),
 }

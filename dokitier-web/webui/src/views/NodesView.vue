@@ -3,159 +3,138 @@
     <div class="d-flex align-center mb-3 flex-wrap gap-3">
       <div>
         <div class="page-title">节点</div>
-        <div class="page-sub">节点信息、直连链路与本地配置文件</div>
+        <div class="page-sub">{{ mode === 'board' ? '控制台节点与网络配置' : '本机节点与配置文件' }}</div>
       </div>
       <v-spacer />
       <v-chip size="small" variant="tonal" color="primary">共 {{ nodes.length }} 个节点</v-chip>
-      <v-chip size="small" variant="tonal" color="success">本地 {{ localCount }} 个</v-chip>
       <v-btn size="small" variant="text" prepend-icon="mdi-refresh" :loading="loading" @click="load">刷新</v-btn>
     </div>
 
     <v-card>
-      <v-data-table
-        :headers="headers"
-        :items="sortedNodes"
-        :loading="loading"
-        item-value="peer_id"
-        hover
-        @click:row="(_, row) => open(row.item)"
-      >
+      <v-data-table :headers="headers" :items="nodes" :loading="loading" item-value="node_id" hover @click:row="(_, row) => open(row.item)">
         <template #item.hostname="{ item }">
           <div class="d-flex align-center gap-2">
-            <v-icon :icon="item.local ? 'mdi-lan-connect' : 'mdi-server-network'" size="16" :color="item.local ? 'primary' : 'medium-emphasis'" />
-            <span>{{ item.hostname }}</span>
-            <v-chip v-if="item.local" size="x-small" color="primary" variant="tonal">本机</v-chip>
+            <v-icon icon="mdi-server-network" size="16" color="primary" />
+            <span>{{ item.hostname || item.node_id }}</span>
           </div>
         </template>
-        <template #item.ipv4="{ item }"><span class="mono">{{ item.ipv4 || '-' }}</span></template>
-        <template #item.version="{ item }"><v-chip size="x-small" variant="tonal">{{ item.version || '-' }}</v-chip></template>
-        <template #item.instance_id="{ item }"><span class="mono text-caption">{{ item.instance_id || '-' }}</span></template>
-        <template #item.next_hop_peer_id="{ item }"><span class="mono">{{ item.next_hop_peer_id ?? '-' }}</span></template>
+        <template #item.status="{ item }">
+          <v-chip size="x-small" :color="item.status === 'online' ? 'success' : 'error'" variant="tonal">{{ item.status }}</v-chip>
+        </template>
+        <template #item.networks="{ item }">
+          <div class="d-flex flex-wrap gap-1">
+            <v-chip v-for="n in networksOf(item)" :key="n.network_name" size="x-small" variant="tonal">
+              {{ n.network_name }}<span v-if="n.p2p_group"> / {{ n.p2p_group }}</span>
+            </v-chip>
+            <span v-if="!networksOf(item).length" class="text-caption text-medium-emphasis">-</span>
+          </div>
+        </template>
+        <template #item.version="{ item }"><span class="text-caption">{{ item.version || '-' }}</span></template>
+        <template #item.last_seen="{ item }">{{ item.last_seen ? new Date(item.last_seen * 1000).toLocaleString() : '-' }}</template>
       </v-data-table>
     </v-card>
 
-    <DetailDrawer v-model="drawer" :title="detail?.hostname || ''" :subtitle="detailSubtitle" :width="560">
+    <DetailDrawer v-model="drawer" :title="detail?.hostname || detail?.node_id || ''" :subtitle="detail ? detail.node_id : ''" :width="620">
       <template v-if="detail">
-        <v-tabs v-model="tab" density="compact" color="primary" class="mb-3">
-          <v-tab value="overview">概览</v-tab>
-          <v-tab v-if="detail.local" value="config">配置文件</v-tab>
-        </v-tabs>
+        <div class="stat-label mb-2">网络 ({{ currentNetworks.length }})</div>
+        <div v-for="n in currentNetworks" :key="n.network_name" class="net-row" :class="{ active: n.network_name === network }" @click="selectNetwork(n.network_name)">
+          <div>
+            <div class="net-name">{{ n.network_name }}</div>
+            <div class="net-meta">p2p 组 {{ n.p2p_group || '未分组' }} / {{ n.ipv4 || '-' }}</div>
+          </div>
+          <v-chip size="x-small" variant="tonal" color="primary">{{ n.instance_id ? '运行中' : '-' }}</v-chip>
+        </div>
 
-        <v-window v-model="tab">
-          <v-window-item value="overview">
-            <div class="node-grid">
-              <div><div class="stat-label">Peer ID</div><div class="node-value mono">{{ detail.peer_id }}</div></div>
-              <div><div class="stat-label">IPv4</div><div class="node-value mono">{{ detail.ipv4 || '-' }}</div></div>
-              <div><div class="stat-label">IPv6</div><div class="node-value mono">{{ detail.ipv6 || '-' }}</div></div>
-              <div><div class="stat-label">版本</div><div class="node-value">{{ detail.version || '-' }}</div></div>
-              <div><div class="stat-label">实例 ID</div><div class="node-value mono">{{ detail.instance_id || '-' }}</div></div>
-              <div><div class="stat-label">角色</div><div class="node-value">{{ detail.local ? '本机节点' : '远端节点' }}</div></div>
-              <div><div class="stat-label">下一跳</div><div class="node-value mono">{{ detail.next_hop_peer_id ?? '-' }}</div></div>
-              <div><div class="stat-label">路由成本</div><div class="node-value">{{ detail.cost ?? '-' }}</div></div>
-            </div>
-
-            <div class="stat-label mt-4 mb-2">直连链路 ({{ detail.conns?.length || 0 }})</div>
-            <div v-for="c in detail.conns || []" :key="c.conn_id" class="conn-row">
-              <div class="d-flex align-center gap-2">
-                <v-chip size="x-small" variant="tonal">{{ c.tunnel?.tunnel_type || 'unknown' }}</v-chip>
-                <span class="mono text-caption">{{ c.tunnel?.remote_addr || c.conn_id }}</span>
-              </div>
-              <div class="text-caption text-medium-emphasis mt-1">
-                延迟 {{ c.stats?.latency_us ? (c.stats.latency_us / 1000).toFixed(2) + ' ms' : '-' }}
-                / 丢包 {{ c.loss_rate != null ? (c.loss_rate * 100).toFixed(2) + ' %' : '-' }}
-                / 收 {{ c.stats ? formatBytes(c.stats.rx_bytes) : '-' }}
-                / 发 {{ c.stats ? formatBytes(c.stats.tx_bytes) : '-' }}
-              </div>
-            </div>
-          </v-window-item>
-
-          <v-window-item v-if="detail.local" value="config">
-            <div class="d-flex align-center mb-2">
-              <span class="mono text-caption">{{ configPath || '配置文件' }}</span>
-              <v-spacer />
-              <v-btn size="x-small" variant="text" prepend-icon="mdi-content-copy" @click="copyConfig">复制</v-btn>
-              <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click="downloadConfig">下载</v-btn>
-            </div>
-            <v-textarea
-              v-model="configText"
-              class="config-editor mono"
-              rows="24"
-              variant="outlined"
-              density="compact"
-              spellcheck="false"
-              :loading="configLoading"
-            />
-            <v-alert v-if="configError" type="error" variant="tonal" density="compact" class="mb-2">{{ configError }}</v-alert>
-            <v-alert v-if="saved" type="success" variant="tonal" density="compact" class="mb-2">
-              已写入配置文件。重启 dokitier-core 后生效。
-            </v-alert>
-            <div class="d-flex gap-2">
-              <v-btn color="primary" :loading="saving" @click="saveConfig">保存配置</v-btn>
-              <v-btn variant="text" :loading="configLoading" @click="loadConfig">重新加载</v-btn>
-            </div>
-          </v-window-item>
-        </v-window>
+        <template v-if="network">
+          <v-divider class="my-4" />
+          <div class="d-flex align-center mb-2">
+            <span class="stat-label">配置文件 / {{ network }}</span>
+            <v-spacer />
+            <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click="downloadConfig">下载</v-btn>
+          </div>
+          <v-textarea v-model="configText" class="config-editor mono" rows="18" variant="outlined" density="compact" spellcheck="false" :loading="configLoading" />
+          <v-alert v-if="configError" type="error" variant="tonal" density="compact" class="mb-2">{{ configError }}</v-alert>
+          <v-alert v-if="saved" type="success" variant="tonal" density="compact" class="mb-2">已下发并重启该网络实例</v-alert>
+          <div class="d-flex gap-2">
+            <v-btn color="primary" :loading="saving" @click="saveConfig">保存并应用</v-btn>
+            <v-btn variant="text" :loading="configLoading" @click="loadConfig">重新加载</v-btn>
+          </div>
+        </template>
       </template>
     </DetailDrawer>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { api } from '@/api'
 import DetailDrawer from '@/components/DetailDrawer.vue'
 
 const headers = [
   { title: '节点', key: 'hostname' },
-  { title: 'IPv4', key: 'ipv4' },
+  { title: '状态', key: 'status' },
+  { title: '网络', key: 'networks', sortable: false },
   { title: '版本', key: 'version' },
-  { title: '实例 ID', key: 'instance_id' },
-  { title: '下一跳', key: 'next_hop_peer_id' },
-  { title: '成本', key: 'cost' },
+  { title: '最后上报', key: 'last_seen' },
 ]
+const mode = ref('board')
 const nodes = ref([])
-const localCount = computed(() => nodes.value.filter((n) => n.local).length)
-const sortedNodes = computed(() => [...nodes.value].sort((a, b) => {
-  if (!!a.local !== !!b.local) return a.local ? -1 : 1
-  return String(a.hostname || '').localeCompare(String(b.hostname || ''))
-}))
 const loading = ref(false)
 const drawer = ref(false)
 const detail = ref(null)
-const tab = ref('overview')
-
+const network = ref('')
 const configText = ref('')
-const configPath = ref('')
 const configLoading = ref(false)
 const configError = ref('')
 const saving = ref(false)
 const saved = ref(false)
 
-const detailSubtitle = computed(() => {
-  if (!detail.value) return ''
-  return `${detail.value.peer_id || ''}  ${detail.value.ipv4 || ''}`
-})
+function networksOf(item) {
+  return item.snapshot?.instances || item.instances || []
+}
 
-function formatBytes(v) {
-  if (v == null) return '-'
-  const units = ['B', 'KB', 'MB', 'GB']
-  let n = Number(v), i = 0
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
-  return `${n.toFixed(1)} ${units[i]}`
+const currentNetworks = computed(() => (detail.value ? networksOf(detail.value) : []))
+
+function detailSubtitle() {
+  return detail.value?.node_id || ''
 }
 
 async function load() {
   loading.value = true
-  try { nodes.value = (await api.nodes()).nodes || [] } finally { loading.value = false }
+  try {
+    try {
+      const data = await api.boardNodes()
+      mode.value = 'board'
+      nodes.value = (data.nodes || []).map((n) => ({
+        ...n,
+        hostname: n.hostname || n.snapshot?.instances?.[0]?.hostname,
+        version: n.version || n.snapshot?.instances?.[0]?.version,
+      }))
+    } catch {
+      mode.value = 'local'
+      nodes.value = (await api.nodes()).nodes || []
+    }
+  } finally {
+    loading.value = false
+  }
 }
 
 async function open(item) {
-  detail.value = await api.node(item.peer_id)
-  tab.value = 'overview'
+  detail.value = item
+  drawer.value = true
+  network.value = networksOf(item)[0]?.network_name || ''
   configText.value = ''
   configError.value = ''
   saved.value = false
-  drawer.value = true
+  if (network.value) await loadConfig()
+}
+
+async function selectNetwork(name) {
+  network.value = name
+  configText.value = ''
+  configError.value = ''
+  saved.value = false
+  await loadConfig()
 }
 
 async function loadConfig() {
@@ -163,9 +142,14 @@ async function loadConfig() {
   configError.value = ''
   saved.value = false
   try {
-    const data = await api.getConfig()
-    configText.value = data.toml || ''
-    configPath.value = data.path || ''
+    if (mode.value === 'board') {
+      const res = await api.boardCommand(detail.value.node_id, { kind: 'get_config' }, network.value)
+      if (!res.ok) throw new Error(res.error || '读取失败')
+      configText.value = res.config || ''
+    } else {
+      const data = await api.getConfig()
+      configText.value = data.toml || ''
+    }
   } catch (e) {
     configError.value = String(e.message || e)
   } finally {
@@ -178,8 +162,14 @@ async function saveConfig() {
   configError.value = ''
   saved.value = false
   try {
-    await api.saveConfig(configText.value)
+    if (mode.value === 'board') {
+      const res = await api.boardCommand(detail.value.node_id, { kind: 'apply_config', toml: configText.value }, network.value)
+      if (!res.ok) throw new Error(res.error || '应用失败')
+    } else {
+      await api.saveConfig(configText.value)
+    }
     saved.value = true
+    await load()
   } catch (e) {
     configError.value = String(e.message || e)
   } finally {
@@ -187,30 +177,24 @@ async function saveConfig() {
   }
 }
 
-async function copyConfig() {
-  try { await navigator.clipboard.writeText(configText.value) } catch {}
-}
-
 function downloadConfig() {
   const blob = new Blob([configText.value], { type: 'text/plain' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
-  a.download = 'dokitier.toml'
+  a.download = `${detail.value?.node_id || 'node'}-${network.value}.toml`
   a.click()
   URL.revokeObjectURL(a.href)
 }
-
-watch(tab, (value) => {
-  if (value === 'config' && !configText.value && !configLoading.value) loadConfig()
-})
 
 onMounted(load)
 </script>
 
 <style scoped>
 .page-sub { margin-top: 4px; font-size: 12px; color: var(--dok-muted); }
-.node-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }
-.node-value { margin-top: 3px; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conn-row { padding: 8px 0; }
+.net-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; }
+.net-row:hover { background: rgba(60, 150, 202, .05); }
+.net-row.active { background: rgba(60, 150, 202, .08); border-color: rgba(60, 150, 202, .25); }
+.net-name { font-size: 13px; font-weight: 600; }
+.net-meta { margin-top: 3px; font-size: 11px; color: var(--dok-muted); }
 .config-editor :deep(textarea) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.55; }
 </style>

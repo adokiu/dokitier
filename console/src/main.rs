@@ -300,6 +300,14 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
     }
 }
 
+async fn overview(State(state): State<AppState>) -> Json<Value> {
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM nodes").fetch_one(&state.db).await.unwrap_or((0,));
+    Json(json!({"instances": count.0, "nodes": count.0, "links": 0, "routing": {}}))
+}
+
+async fn login() -> Json<Value> { Json(json!({"ok": true})) }
+async fn logout() -> Json<Value> { Json(json!({"ok": true})) }
+
 async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-console"})) }
 
 #[tokio::main]
@@ -352,6 +360,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { quic_accept_loop(quic_state, quic_endpoint).await });
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/api/overview", get(overview))
+        .route("/api/login", axum::routing::post(login))
+        .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))
         .route("/api/board/nodes/{node_id}", get(get_node))
         .route("/api/agent/ws", get(ws_agent))
