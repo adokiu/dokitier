@@ -59,6 +59,29 @@ async fn touch_node(db: &SqlitePool, node_id: &str, hostname: Option<&str>, vers
      .bind(node_id).execute(db).await;
 }
 
+async fn merge_snapshot(state: &AppState, node_id: &str, data: &Value) -> Value {
+    let existing: Option<(String,)> = sqlx::query_as("SELECT snapshot FROM nodes WHERE node_id = ?")
+        .bind(node_id).fetch_optional(&state.db).await.ok().flatten();
+    let mut merged_instances: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |instances: Option<&Vec<Value>>| {
+        if let Some(list) = instances {
+            for inst in list {
+                let key = inst.get("instance_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if seen.insert(key) {
+                    merged_instances.push(inst.clone());
+                }
+            }
+        }
+    };
+    if let Some((snap,)) = existing {
+        let old: Value = serde_json::from_str(&snap).unwrap_or(Value::Null);
+        add(old.get("instances").and_then(|v| v.as_array()));
+    }
+    add(data.get("instances").and_then(|v| v.as_array()));
+    json!({"ts": now(), "instances": merged_instances})
+}
+
 async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), String> {
     match frame {
         AgentFrame::Hello { node_id, token, hostname, version, networks } => {
@@ -73,9 +96,10 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
             touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
         }
         AgentFrame::Snapshot { node_id, data } => {
+            let merged = merge_snapshot(state, &node_id, &data).await;
             let hostname = data.pointer("/instances/0/hostname").and_then(|v| v.as_str());
             let version = data.pointer("/instances/0/version").and_then(|v| v.as_str());
-            touch_node(&state.db, &node_id, hostname, version, None, Some(&data), "online").await; Ok(())
+            touch_node(&state.db, &node_id, hostname, version, None, Some(&merged), "online").await; Ok(())
         }
         AgentFrame::Result { node_id, .. } => {
             touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
@@ -89,6 +113,17 @@ async fn ws_agent(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl I
 
 async fn send_json(socket: &mut WebSocket, value: Value) {
     let _ = socket.send(Message::Text(value.to_string().into())).await;
+}
+
+fn frame_network(frame: &AgentFrame) -> Option<String> {
+    match frame {
+        AgentFrame::Hello { networks, .. } => networks
+            .first()
+            .and_then(|n| n.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
 }
 
 async fn ws_session(state: AppState, mut socket: WebSocket) {
@@ -113,8 +148,10 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
                         let _ = socket.send(Message::Text(json!({"type":"error","error":"unknown node or invalid token"}).to_string().into())).await;
                         break;
                     }
+                    let network = frame_network(&frame).unwrap_or_else(|| "default".to_string());
+                    let key = format!("{}:{}", id, network);
                     node_id = Some(id.clone());
-                    state.agents.insert(id.clone(), tx.clone());
+                    state.agents.insert(key, tx.clone());
                 }
                 let id_matches = node_id.is_some();
                 if !id_matches { break; }
@@ -131,7 +168,9 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
         }
     }
     if let Some(id) = node_id {
-        state.agents.remove(&id);
+        let prefix = format!("{id}:");
+        let keys: Vec<String> = state.agents.iter().filter(|e| e.key().starts_with(&prefix)).map(|e| e.key().clone()).collect();
+        for key in keys { state.agents.remove(&key); }
         touch_node(&state.db, &id, None, None, None, None, "offline").await;
     }
 }
@@ -180,6 +219,8 @@ async fn get_node(State(state): State<AppState>, Path(node_id): Path<String>) ->
 #[derive(serde::Deserialize)]
 struct CommandBody {
     command: dokitier_controller::ConsoleCommand,
+    #[serde(default)]
+    network: Option<String>,
 }
 
 async fn post_command(
@@ -187,7 +228,16 @@ async fn post_command(
     Path(node_id): Path<String>,
     Json(body): Json<CommandBody>,
 ) -> Json<Value> {
-    let Some(tx) = state.agents.get(&node_id).map(|v| v.clone()) else {
+    let key = match &body.network {
+        Some(network) => format!("{node_id}:{network}"),
+        None => state
+            .agents
+            .iter()
+            .find(|entry| entry.key().starts_with(&format!("{node_id}:")))
+            .map(|entry| entry.key().clone())
+            .unwrap_or_default(),
+    };
+    let Some(tx) = state.agents.get(&key).map(|v| v.clone()) else {
         return Json(json!({"ok": false, "error": "node is offline"}));
     };
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -227,7 +277,8 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
                 return;
             }
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
-            state.agents.insert(node_id.clone(), tx);
+            let network = networks.first().and_then(|n| n.get("name")).and_then(|v| v.as_str()).unwrap_or("default");
+            state.agents.insert(format!("{node_id}:{network}"), tx);
             touch_node(&state.db, node_id, Some(hostname), Some(version), Some(&Value::Array(networks.clone())), None, "online").await;
             let writer = tokio::spawn(async move {
                 while let Some(value) = rx.recv().await {
@@ -241,7 +292,9 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
                 }
             }
             writer.abort();
-            state.agents.remove(node_id);
+            let prefix = format!("{node_id}:");
+            let keys: Vec<String> = state.agents.iter().filter(|e| e.key().starts_with(&prefix)).map(|e| e.key().clone()).collect();
+            for key in keys { state.agents.remove(&key); }
             touch_node(&state.db, node_id, None, None, None, None, "offline").await;
         });
     }

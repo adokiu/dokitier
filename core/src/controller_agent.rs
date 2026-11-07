@@ -105,13 +105,24 @@ async fn hello(manager: &NativeInstanceManager, settings: &ControllerSettings) -
         }
         None => (String::new(), String::new()),
     };
+    let networks: Vec<serde_json::Value> = manager
+        .instances()
+        .iter()
+        .map(|instance| {
+            let identity = instance.peer_manager().network_identity();
+            json!({
+                "name": identity.network_name,
+                "p2p_group": identity.p2p_group,
+            })
+        })
+        .collect();
     json!({
         "type": "hello",
         "node_id": settings.node_id,
         "token": settings.token,
         "hostname": hostname,
         "version": version,
-        "networks": [],
+        "networks": networks,
     })
 }
 
