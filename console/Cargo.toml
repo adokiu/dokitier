@@ -1,0 +1,26 @@
+[package]
+name = "dokitier-console"
+description = "dokitier standalone board: multi-node reverse-connected console."
+version = "2.7.0"
+edition.workspace = true
+rust-version.workspace = true
+license-file = "../LICENSE"
+
+[[bin]]
+name = "dokitier-console"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = { workspace = true, features = ["ws"] }
+base64.workspace = true
+chrono.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+dokitier-controller = { version = "2.7.0", path = "../dokitier-controller" }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tower-http = { workspace = true, features = ["fs", "trace"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }

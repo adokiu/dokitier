@@ -1,0 +1,250 @@
+use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+use axum::{
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use dokitier_controller::{hash_token, AgentFrame};
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, UdpSocket}};
+use tower_http::services::ServeDir;
+
+#[derive(Clone)]
+struct AppState { db: SqlitePool, webui: PathBuf }
+
+fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
+
+async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS nodes (
+            node_id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            hostname TEXT NOT NULL DEFAULT '',
+            version TEXT NOT NULL DEFAULT '',
+            networks TEXT NOT NULL DEFAULT '[]',
+            snapshot TEXT NOT NULL DEFAULT 'null',
+            last_seen INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'offline'
+        )",
+    ).execute(db).await?;
+    Ok(())
+}
+
+async fn verify_node(db: &SqlitePool, node_id: &str, token: &str) -> bool {
+    let row: Option<(String,)> = sqlx::query_as("SELECT token_hash FROM nodes WHERE node_id = ?")
+        .bind(node_id).fetch_optional(db).await.ok().flatten();
+    row.is_some_and(|(hash,)| hash == hash_token(token))
+}
+
+async fn touch_node(db: &SqlitePool, node_id: &str, hostname: Option<&str>, version: Option<&str>,
+                    networks: Option<&Value>, snapshot: Option<&Value>, status: &str) {
+    let _ = sqlx::query(
+        "UPDATE nodes SET last_seen = ?, status = ?,
+            hostname = COALESCE(?, hostname), version = COALESCE(?, version),
+            networks = COALESCE(?, networks), snapshot = COALESCE(?, snapshot)
+         WHERE node_id = ?",
+    ).bind(now()).bind(status).bind(hostname).bind(version)
+     .bind(networks.map(|v| v.to_string())).bind(snapshot.map(|v| v.to_string()))
+     .bind(node_id).execute(db).await;
+}
+
+async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), String> {
+    match frame {
+        AgentFrame::Hello { node_id, token, hostname, version, networks } => {
+            if !verify_node(&state.db, &node_id, &token).await {
+                return Err("unknown node or invalid token".into());
+            }
+            touch_node(&state.db, &node_id, Some(&hostname), Some(&version),
+                       Some(&Value::Array(networks)), None, "online").await;
+            Ok(())
+        }
+        AgentFrame::Heartbeat { node_id, .. } => {
+            touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
+        }
+        AgentFrame::Snapshot { node_id, data } => {
+            touch_node(&state.db, &node_id, None, None, None, Some(&data), "online").await; Ok(())
+        }
+        AgentFrame::Result { node_id, .. } => {
+            touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
+        }
+    }
+}
+
+async fn ws_agent(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_session(state, socket))
+}
+
+async fn send_json(socket: &mut WebSocket, value: Value) {
+    let _ = socket.send(Message::Text(value.to_string().into())).await;
+}
+
+async fn ws_session(state: AppState, mut socket: WebSocket) {
+    let mut node_id: Option<String> = None;
+    loop {
+        let msg = match socket.recv().await {
+            Some(Ok(Message::Text(text))) => text.to_string(),
+            Some(Ok(Message::Binary(bin))) => String::from_utf8_lossy(&bin).to_string(),
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => break,
+        };
+        let frame: AgentFrame = match serde_json::from_str(&msg) {
+            Ok(frame) => frame,
+            Err(err) => { send_json(&mut socket, json!({"type":"error","error":err.to_string()})).await; continue; }
+        };
+        if let AgentFrame::Hello { node_id: id, .. } = &frame { node_id = Some(id.clone()); }
+        match handle_agent_frame(&state, frame).await {
+            Ok(()) => send_json(&mut socket, json!({"type":"ack"})).await,
+            Err(err) => {
+                send_json(&mut socket, json!({"type":"error","error":err})).await;
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+        }
+    }
+    if let Some(id) = node_id { touch_node(&state.db, &id, None, None, None, None, "offline").await; }
+}
+
+fn frame_from_bytes(buf: &[u8]) -> Option<(AgentFrame, Value)> {
+    let value: Value = serde_json::from_slice(buf).ok()?;
+    let frame: AgentFrame = serde_json::from_value(value.clone()).ok()?;
+    Some((frame, value))
+}
+
+async fn tcp_agent_listener(state: AppState, listener: TcpListener) {
+    loop {
+        let Ok((mut stream, peer)) = listener.accept().await else { continue };
+        let state = state.clone();
+        tokio::spawn(async move {
+            tracing::info!(%peer, "tcp agent connected");
+            let mut authenticated = false;
+            loop {
+                let mut len = [0u8; 4];
+                if stream.read_exact(&mut len).await.is_err() { break; }
+                let len = u32::from_be_bytes(len) as usize;
+                if len == 0 || len > 8 * 1024 * 1024 { break; }
+                let mut buf = vec![0u8; len];
+                if stream.read_exact(&mut buf).await.is_err() { break; }
+                let Some((frame, value)) = frame_from_bytes(&buf) else { break };
+                if !authenticated {
+                    match &frame {
+                        AgentFrame::Hello { node_id, token, .. } => {
+                            if verify_node(&state.db, node_id, token).await { authenticated = true; }
+                            else { let _ = stream.write_all(b"{\"type\":\"error\",\"error\":\"unauthorized\"}\n").await; break; }
+                        }
+                        _ => break,
+                    }
+                }
+                if let Err(err) = handle_agent_frame(&state, frame).await {
+                    let _ = stream.write_all(format!("{{\"type\":\"error\",\"error\":{:?}}}\n", err).as_bytes()).await;
+                    break;
+                }
+                let ack = json!({"type":"ack","echo":value.get("type")}).to_string();
+                let _ = stream.write_all(format!("{ack}\n").as_bytes()).await;
+            }
+        });
+    }
+}
+
+async fn udp_agent_listener(state: AppState, socket: UdpSocket) {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let Ok((n, peer)) = socket.recv_from(&mut buf).await else { continue };
+        let Ok(value) = serde_json::from_slice::<Value>(&buf[..n]) else { continue };
+        let node_id = value.get("node_id").and_then(|v| v.as_str()).unwrap_or_default();
+        let token = value.get("token").and_then(|v| v.as_str()).unwrap_or_default();
+        if node_id.is_empty() || !verify_node(&state.db, node_id, token).await { continue; }
+        touch_node(&state.db, node_id, None, None, None, None, "online").await;
+        let _ = socket.send_to(br#"{"type":"ack"}"#, peer).await;
+    }
+}
+
+#[derive(Serialize)]
+struct NodeView { node_id: String, hostname: String, version: String, networks: Value, snapshot: Value, last_seen: i64, status: String }
+
+async fn list_nodes(State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(String, String, String, String, String, i64, String)> = sqlx::query_as(
+        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status FROM nodes ORDER BY node_id",
+    ).fetch_all(&state.db).await.unwrap_or_default();
+    let nodes: Vec<NodeView> = rows.into_iter().map(|(node_id, hostname, version, networks, snapshot, last_seen, status)| NodeView {
+        node_id, hostname, version,
+        networks: serde_json::from_str(&networks).unwrap_or(Value::Null),
+        snapshot: serde_json::from_str(&snapshot).unwrap_or(Value::Null),
+        last_seen, status,
+    }).collect();
+    Json(json!({"nodes": nodes}))
+}
+
+async fn get_node(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
+    let row: Option<(String, String, String, String, String, i64, String)> = sqlx::query_as(
+        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status FROM nodes WHERE node_id = ?",
+    ).bind(&node_id).fetch_optional(&state.db).await.ok().flatten();
+    match row {
+        Some((node_id, hostname, version, networks, snapshot, last_seen, status)) => Json(json!({
+            "node_id": node_id, "hostname": hostname, "version": version,
+            "networks": serde_json::from_str::<Value>(&networks).unwrap_or(Value::Null),
+            "snapshot": serde_json::from_str::<Value>(&snapshot).unwrap_or(Value::Null),
+            "last_seen": last_seen, "status": status,
+        })),
+        None => Json(json!({"error": "not found"})),
+    }
+}
+
+async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-console"})) }
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().init();
+    let mut listen = "127.0.0.1:12800".to_string();
+    let mut agent_tcp = "127.0.0.1:12801".to_string();
+    let mut agent_udp = "127.0.0.1:12802".to_string();
+    let mut db_path = "board.db".to_string();
+    let mut webui = "../dokitier-web/webui/dist".to_string();
+    let mut add_nodes: Vec<(String, String)> = Vec::new();
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--listen" => { listen = args[i + 1].clone(); i += 2; }
+            "--agent-tcp" => { agent_tcp = args[i + 1].clone(); i += 2; }
+            "--agent-udp" => { agent_udp = args[i + 1].clone(); i += 2; }
+            "--db" => { db_path = args[i + 1].clone(); i += 2; }
+            "--webui" => { webui = args[i + 1].clone(); i += 2; }
+            "--add-node" => { add_nodes.push((args[i + 1].clone(), args[i + 2].clone())); i += 3; }
+            other => { eprintln!("unknown argument: {other}"); std::process::exit(2); }
+        }
+    }
+    let db = SqlitePoolOptions::new().max_connections(5)
+        .connect(&format!("sqlite://{db_path}?mode=rwc")).await?;
+    init_db(&db).await?;
+    for (node_id, token) in &add_nodes {
+        sqlx::query("INSERT INTO nodes (node_id, token_hash) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET token_hash = excluded.token_hash")
+            .bind(node_id).bind(hash_token(token)).execute(&db).await?;
+        tracing::info!(%node_id, "registered node");
+    }
+    let state = AppState { db, webui: PathBuf::from(webui) };
+    let tcp_listener = TcpListener::bind(&agent_tcp).await?;
+    let udp_socket = UdpSocket::bind(&agent_udp).await?;
+    tracing::info!(%agent_tcp, %agent_udp, %listen, "agent listeners ready");
+    let tcp_state = state.clone();
+    tokio::spawn(async move { tcp_agent_listener(tcp_state, tcp_listener).await });
+    let udp_state = state.clone();
+    tokio::spawn(async move { udp_agent_listener(udp_state, udp_socket).await });
+    let app = Router::new()
+        .route("/healthz", get(health))
+        .route("/api/board/nodes", get(list_nodes))
+        .route("/api/board/nodes/{node_id}", get(get_node))
+        .route("/api/agent/ws", get(ws_agent))
+        .fallback_service(ServeDir::new(&state.webui).append_index_html_on_directories(true))
+        .with_state(state);
+    let listener = TcpListener::bind(&listen).await?;
+    tracing::info!("console listening on http://{listen}");
+    axum::serve(listener, app).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
+    Ok(())
+}
