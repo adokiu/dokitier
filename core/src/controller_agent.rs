@@ -174,6 +174,9 @@ async fn session(
     .await
     .map_err(|_| anyhow::anyhow!("controller connect timeout"))??;
 
+    if settings.url.starts_with("quic://") {
+        transport.send(&serde_json::json!({"type":"start"})).await?;
+    }
     tracing::info!("waiting for controller challenge");
     let challenge = transport.recv().await?;
     tracing::info!(?challenge, "controller challenge received");

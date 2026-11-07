@@ -12,7 +12,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 
 pub enum AgentTransport {
     Ws(WebSocketStream<MaybeTlsStream<TcpStream>>),
-    Quic { send: quinn::SendStream, recv: quinn::RecvStream },
+    Quic { endpoint: quinn::Endpoint, send: quinn::SendStream, recv: quinn::RecvStream },
 }
 
 #[derive(Debug)]
@@ -66,15 +66,25 @@ impl AgentTransport {
                 )))
                 .with_no_client_auth();
             crypto.alpn_protocols = vec![b"dokitier".to_vec()];
-            let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+            let mut client_config = quinn::ClientConfig::new(std::sync::Arc::new(
                 quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
             ));
+            let mut transport = quinn::TransportConfig::default();
+            transport.max_concurrent_bidi_streams(100u32.into());
+            client_config.transport_config(std::sync::Arc::new(transport));
             let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
             endpoint.set_default_client_config(client_config);
-            let conn = endpoint.connect(addr, "localhost")?.await?;
-            let (send, recv) = conn.open_bi().await?;
+            let conn = match endpoint.connect(addr, "localhost")?.await {
+                Ok(conn) => conn,
+                Err(err) => { eprintln!("dokitier controller: quic connect failed: {err}"); return Err(err.into()); }
+            };
+            let (send, recv) = match conn.open_bi().await {
+                Ok(streams) => streams,
+                Err(err) => { eprintln!("dokitier controller: quic open_bi failed: {err}"); return Err(err.into()); }
+            };
+            eprintln!("dokitier controller: quic transport connected to {addr}");
             tracing::info!(%addr, "quic transport connected");
-            return Ok(Self::Quic { send, recv });
+            return Ok(Self::Quic { endpoint, send, recv });
         }
         if url.starts_with("ws://") || url.starts_with("wss://") {
             let (ws, _) = connect_async(url).await?;

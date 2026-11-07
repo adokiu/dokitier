@@ -485,7 +485,9 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
             tracing::info!(remote = ?conn.remote_address(), "quic agent connected");
-            let Ok((mut send, mut recv)) = conn.accept_bi().await else { tracing::warn!("quic stream open failed"); return };
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else { eprintln!("quic stream open failed"); return };
+            eprintln!("quic stream accepted");
+            let Ok(_start) = read_frame(&mut recv).await else { eprintln!("quic start frame missing"); return; };
             let nonce = uuid::Uuid::new_v4().to_string();
             let ts = now();
             if write_frame(&mut send, &json!({"type":"challenge","nonce":nonce,"ts":ts})).await.is_err() { return; }
@@ -493,9 +495,11 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
             let Ok(frame) = serde_json::from_value::<AgentFrame>(hello) else { return };
             let AgentFrame::Hello { node_id, proof: client_proof, hostname, version, networks, .. } = &frame else { return };
             let Some(token) = verify_proof(&state.db, node_id, &nonce, ts, client_proof).await else {
+                eprintln!("quic proof invalid for {node_id}");
                 let _ = write_frame(&mut send, &json!({"type":"error","error":"invalid node proof"})).await;
                 return;
             };
+            eprintln!("quic proof ok for {node_id}");
             let server_proof = proof(&token, "server", node_id, &nonce, ts);
             if write_frame(&mut send, &json!({"type":"challenge_ok","proof":server_proof})).await.is_err() { return; }
             let cipher = SessionCipher::new(&token, &nonce, ts);
@@ -773,9 +777,12 @@ async fn main() -> anyhow::Result<()> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;
     tls.alpn_protocols = vec![b"dokitier".to_vec()];
-    let quic_cfg = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+    let mut quic_cfg = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
     ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(100u32.into());
+    quic_cfg.transport_config(std::sync::Arc::new(transport));
     let quic_endpoint = quinn::Endpoint::server(quic_cfg, agent_quic.parse()?)?;
     tracing::info!(%listen, %agent_quic, "console listeners ready (websocket + quic agent endpoints)");
     let quic_state = state.clone();
