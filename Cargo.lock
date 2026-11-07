@@ -1780,11 +1780,13 @@ dependencies = [
 name = "dokitier-controller"
 version = "2.7.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "base64 0.22.1",
  "futures-util",
  "hmac 0.12.1",
  "quinn",
+ "rand 0.8.8",
  "rustls",
  "serde",
  "serde_json",

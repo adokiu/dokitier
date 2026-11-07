@@ -13,6 +13,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 hmac.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
