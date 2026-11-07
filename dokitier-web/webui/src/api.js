@@ -35,6 +35,7 @@ export const api = {
   boardTopology: () => request('/api/board/topology'),
   boardLinks: () => request('/api/board/links'),
   boardRoutes: () => request('/api/board/routes'),
+  boardHistory: (network, a, b, range) => request(`/api/board/history?network=${encodeURIComponent(network)}&a=${a}&b=${b}&range=${range}`),
   boardNodes: () => request('/api/board/nodes'),
   boardNode: (id) => request('/api/board/nodes/' + id),
   boardCommand: (id, command, network) => request('/api/board/nodes/' + id + '/command', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(network ? { command, network } : { command }) }),

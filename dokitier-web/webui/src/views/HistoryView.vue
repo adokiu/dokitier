@@ -49,8 +49,10 @@ function baseOption() {
 function render() {
   if (!latencyChart || !bwChart) return
   const ts = points.value.map((p) => p.ts * 1000)
+  const axis = ts.length ? { min: ts[0] - 300000, max: ts[ts.length - 1] + 300000 } : {}
   latencyChart.setOption({
     ...baseOption(),
+    xAxis: { type: 'time', ...axis },
     yAxis: [
       { type: 'value', name: 'ms' },
       { type: 'value', name: '%', position: 'right' },
@@ -75,6 +77,7 @@ function render() {
   })
   bwChart.setOption({
     ...baseOption(),
+    xAxis: { type: 'time', ...axis },
     yAxis: { type: 'value', name: 'Mbps' },
     series: [
       {
@@ -99,6 +102,16 @@ function render() {
 
 async function load() {
   if (!selected.value) return
+  if (selected.value.includes('|')) {
+    const [network, pair] = selected.value.split('|')
+    const [a, b] = pair.split(':').map(Number)
+    const data = await api.boardHistory(network, a, b, range.value)
+    points.value = (data.points || []).map((p) => ({
+      ts: p.ts, latency_ms: p.latency_ms, loss_pct: p.loss_pct, rx_bps: 0, tx_bps: 0,
+    }))
+    render()
+    return
+  }
   const [a, b] = selected.value.split(':').map(Number)
   const data = await api.history(a, b, range.value)
   points.value = data.points || []
@@ -116,6 +129,19 @@ onMounted(async () => {
   latencyChart = echarts.init(latencyEl.value)
   bwChart = echarts.init(bwEl.value)
   render()
+  try {
+    const board = await api.boardLinks()
+    if (board && (board.links || []).length) {
+      const names = board.names || {}
+      linkOptions.value = board.links.map((l) => ({
+        label: `${l.network} / ${names[l.a] || l.a} ↔ ${names[l.b] || l.b}`,
+        value: `${l.network}|${l.a}:${l.b}`,
+      }))
+      if (linkOptions.value.length) selected.value = linkOptions.value[0].value
+      window.addEventListener('resize', resize)
+      return
+    }
+  } catch {}
   const data = await api.topology()
   const names = Object.fromEntries((data.graph?.nodes || []).map((n) => [n.peer_id, n.hostname || n.peer_id]))
   linkOptions.value = (data.graph?.edges || []).map((e) => ({

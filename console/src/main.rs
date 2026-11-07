@@ -116,6 +116,38 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
         )"
     };
     sqlx::query(versions_ddl).execute(db).await?;
+    let metrics_ddl = if is_mysql() {
+        "CREATE TABLE IF NOT EXISTS link_metrics (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            network VARCHAR(255) NOT NULL,
+            a BIGINT NOT NULL,
+            b BIGINT NOT NULL,
+            ts BIGINT NOT NULL,
+            latency_ms DOUBLE,
+            loss_pct DOUBLE
+        )"
+    } else if POSTGRES.load(Ordering::Relaxed) {
+        "CREATE TABLE IF NOT EXISTS link_metrics (
+            id BIGSERIAL PRIMARY KEY,
+            network TEXT NOT NULL,
+            a BIGINT NOT NULL,
+            b BIGINT NOT NULL,
+            ts BIGINT NOT NULL,
+            latency_ms DOUBLE PRECISION,
+            loss_pct DOUBLE PRECISION
+        )"
+    } else {
+        "CREATE TABLE IF NOT EXISTS link_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            network TEXT NOT NULL,
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            ts INTEGER NOT NULL,
+            latency_ms REAL,
+            loss_pct REAL
+        )"
+    };
+    sqlx::query(metrics_ddl).execute(db).await?;
     Ok(())
 }
 
@@ -173,6 +205,22 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
         }
         AgentFrame::Snapshot { node_id, data } => {
             let merged = merge_snapshot(state, &node_id, &data).await;
+            if let Some(instances) = data.get("instances").and_then(|v| v.as_array()) {
+                for inst in instances {
+                    let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+                    let Some(topo) = inst.get("topology") else { continue };
+                    for e in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
+                        let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
+                        let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
+                        let tunnels = e.get("tunnels").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                        let latency = tunnels.iter().filter_map(|t| t.get("latency_ms").and_then(|v| v.as_f64())).reduce(f64::min);
+                        let loss = tunnels.iter().filter_map(|t| t.get("loss_pct").and_then(|v| v.as_f64())).reduce(|x, y| x + y).map(|v| v / tunnels.len().max(1) as f64);
+                        let _ = sqlx::query(&q("INSERT INTO link_metrics (network, a, b, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?)"))
+                            .bind(network).bind(a).bind(b).bind(now()).bind(latency).bind(loss)
+                            .execute(&state.db).await;
+                    }
+                }
+            }
             let hostname = data.pointer("/instances/0/hostname").and_then(|v| v.as_str());
             let version = data.pointer("/instances/0/version").and_then(|v| v.as_str());
             touch_node(&state.db, &node_id, hostname, version, None, Some(&merged), "online").await; Ok(())
@@ -429,6 +477,34 @@ async fn board_topology(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges}}))
 }
 
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    network: String,
+    a: i64,
+    b: i64,
+    #[serde(default = "default_range")]
+    range: String,
+}
+
+fn default_range() -> String { "24h".to_string() }
+
+async fn board_history(State(state): State<AppState>, axum::extract::Query(query): axum::extract::Query<HistoryQuery>) -> Json<Value> {
+    let (step, since) = match query.range.as_str() {
+        "1h" => (300, now() - 3600),
+        "7d" => (3600, now() - 7 * 24 * 3600),
+        _ => (600, now() - 24 * 3600),
+    };
+    let rows: Result<Vec<(i64, Option<f64>, Option<f64>)>, sqlx::Error> = sqlx::query_as(&q(
+        "SELECT (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) FROM link_metrics WHERE network = ? AND a = ? AND b = ? AND ts > ? GROUP BY bucket ORDER BY bucket",
+    )).bind(step).bind(step).bind(&query.network).bind(query.a).bind(query.b).bind(since)
+      .fetch_all(&state.db).await;
+    if let Err(err) = &rows { tracing::warn!(?err, "history query failed"); }
+    let rows = rows.unwrap_or_default();
+    Json(json!({"points": rows.into_iter().map(|(ts, latency, loss)| json!({
+        "ts": ts, "latency_ms": latency, "loss_pct": loss,
+    })).collect::<Vec<_>>()}))
+}
+
 async fn board_routes(State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
         .fetch_all(&state.db).await.unwrap_or_default();
@@ -619,6 +695,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/topology", get(board_topology))
         .route("/api/board/links", get(board_links))
         .route("/api/board/routes", get(board_routes))
+        .route("/api/board/history", get(board_history))
         .route("/api/login", axum::routing::post(login))
         .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))
