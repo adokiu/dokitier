@@ -396,6 +396,38 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
     }
 }
 
+async fn board_overview(State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT status, snapshot FROM nodes")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let total = rows.len();
+    let online = rows.iter().filter(|(status, _)| status == "online").count();
+    let mut networks: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for (_, snapshot) in &rows {
+        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
+        for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            let name = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+            if name.is_empty() { continue; }
+            let entry = networks.entry(name.to_string()).or_insert_with(|| json!({
+                "network_name": name, "nodes": 0, "p2p_groups": [],
+            }));
+            entry["nodes"] = json!(entry["nodes"].as_i64().unwrap_or(0) + 1);
+            if let Some(group) = inst.get("p2p_group").and_then(|v| v.as_str()) {
+                let groups = entry["p2p_groups"].as_array().cloned().unwrap_or_default();
+                if !groups.iter().any(|g| g.as_str() == Some(group)) {
+                    entry["p2p_groups"] = json!(groups.into_iter().chain(std::iter::once(json!(group))).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+    Json(json!({
+        "nodes": total,
+        "online": online,
+        "networks": networks.values().cloned().collect::<Vec<_>>(),
+    }))
+}
+
 async fn overview(State(state): State<AppState>) -> Json<Value> {
     let count: (i64,) = sqlx::query_as(&q("SELECT COUNT(*) FROM nodes")).fetch_one(&state.db).await.unwrap_or((0,));
     Json(json!({"instances": count.0, "nodes": count.0, "links": 0, "routing": {}}))
@@ -493,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/api/overview", get(overview))
+        .route("/api/board/overview", get(board_overview))
         .route("/api/login", axum::routing::post(login))
         .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))
