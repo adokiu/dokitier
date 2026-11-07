@@ -713,6 +713,35 @@ function connectWs() {
 }
 
 async function load() {
+  try {
+    const board = await api.boardTopology()
+    if (board && board.graph && (board.graph.nodes || []).length) {
+      graph = board.graph
+      metrics = {}
+      for (const e of graph.edges || []) {
+        const tunnels = (e.tunnels || []).map((t) => ({
+          id: t.remote_addr || t.type,
+          tunnel_type: t.type || 'tcp',
+          remote_addr: t.remote_addr,
+          latency_ms: t.latency_ms,
+          loss_pct: t.loss_pct,
+          rx_bps: 0,
+          tx_bps: 0,
+        }))
+        const lat = tunnels.map((t) => t.latency_ms).filter((v) => v != null)
+        metrics[keyOf(e.a, e.b)] = {
+          latency_ms: lat.length ? Math.min(...lat) : null,
+          loss_pct: tunnels.length ? tunnels.reduce((s, t) => s + (t.loss_pct || 0), 0) / tunnels.length : null,
+          tunnels,
+          rx_bps: 0,
+          tx_bps: 0,
+        }
+      }
+      computeLayout()
+      apply()
+      return
+    }
+  } catch {}
   const data = await api.topology()
   graph = data.graph || { nodes: [], edges: [] }
   metrics = {}

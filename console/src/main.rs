@@ -396,6 +396,39 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
     }
 }
 
+async fn board_topology(State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let mut nodes: std::collections::BTreeMap<u32, Value> = std::collections::BTreeMap::new();
+    let mut edges: Vec<Value> = Vec::new();
+    for (node_id, snapshot) in &rows {
+        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
+        for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(topo) = inst.get("topology") else { continue };
+            for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
+                if let Some(peer_id) = n.get("peer_id").and_then(|v| v.as_u64()) {
+                    let mut node = n.clone();
+                    node["network_name"] = json!(network);
+                    node["agent_node_id"] = json!(node_id);
+                    nodes.entry(peer_id as u32).or_insert(node);
+                }
+            }
+            for e in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
+                let mut edge = e.clone();
+                edge["network_name"] = json!(network);
+                let tunnel_types: Vec<Value> = e.get("tunnels").and_then(|v| v.as_array()).into_iter().flatten()
+                    .filter_map(|t| t.get("type").cloned()).collect();
+                edge["tunnel_types"] = json!(tunnel_types);
+                edges.push(edge);
+            }
+        }
+    }
+    Json(json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges}}))
+}
+
 async fn board_overview(State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT status, snapshot FROM nodes")
         .fetch_all(&state.db)
@@ -526,6 +559,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(health))
         .route("/api/overview", get(overview))
         .route("/api/board/overview", get(board_overview))
+        .route("/api/board/topology", get(board_topology))
         .route("/api/login", axum::routing::post(login))
         .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))

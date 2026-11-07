@@ -35,15 +35,51 @@ async fn snapshot(manager: &NativeInstanceManager) -> Value {
     for instance in manager.instances() {
         let node = instance.node_snapshot().await;
         let identity = instance.peer_manager().network_identity();
+        let me = instance.peer_id();
+        let mut topo_nodes = vec![json!({
+            "peer_id": me,
+            "hostname": node.hostname,
+            "ipv4": node.ipv4_addr.map(|x| x.to_string()),
+            "version": node.version,
+            "local": true,
+        })];
+        for route in instance.route_snapshots().await {
+            topo_nodes.push(json!({
+                "peer_id": route.peer_id,
+                "hostname": route.hostname,
+                "ipv4": route.ipv4_addr.map(|x| x.to_string()),
+                "version": route.version,
+                "next_hop_peer_id": route.next_hop_peer_id,
+                "cost": route.cost,
+                "local": false,
+            }));
+        }
+        let mut topo_edges = Vec::new();
+        for peer in instance.peer_snapshots().await {
+            if peer.conns.is_empty() { continue; }
+            let tunnels: Vec<serde_json::Value> = peer.conns.iter().map(|conn| {
+                let stats = conn.stats.clone().unwrap_or_default();
+                json!({
+                    "type": conn.tunnel.as_ref().map(|t| t.tunnel_type.clone()).unwrap_or_default(),
+                    "remote_addr": conn.tunnel.as_ref().and_then(|t| t.remote_addr.as_ref()).map(|u| u.to_string()),
+                    "latency_ms": (stats.latency_us > 0).then(|| stats.latency_us as f64 / 1000.0),
+                    "loss_pct": conn.loss_rate as f64 * 100.0,
+                    "rx_bytes": stats.rx_bytes,
+                    "tx_bytes": stats.tx_bytes,
+                })
+            }).collect();
+            topo_edges.push(json!({"a": me, "b": peer.peer_id, "tunnels": tunnels}));
+        }
         instances.push(json!({
             "instance_id": node.instance_id.to_string(),
-            "peer_id": instance.peer_id(),
+            "peer_id": me,
             "hostname": node.hostname,
             "version": node.version,
             "network_name": identity.network_name,
             "p2p_group": identity.p2p_group,
             "ipv4": node.ipv4_addr.map(|x| x.to_string()),
             "ipv6": node.ipv6_addr.map(|x| x.to_string()),
+            "topology": {"nodes": topo_nodes, "edges": topo_edges},
         }));
     }
     json!({ "ts": chrono::Utc::now().timestamp(), "instances": instances })
