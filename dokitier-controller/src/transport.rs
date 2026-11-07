@@ -3,6 +3,8 @@
 use anyhow::{anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+
+use crate::{read_frame, write_frame};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
@@ -10,10 +12,69 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 
 pub enum AgentTransport {
     Ws(WebSocketStream<MaybeTlsStream<TcpStream>>),
+    Quic { send: quinn::SendStream, recv: quinn::RecvStream },
+}
+
+#[derive(Debug)]
+struct SkipServerVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 impl AgentTransport {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
+        if let Some(rest) = url.strip_prefix("quic://") {
+            let addr = tokio::net::lookup_host(rest).await?.next().ok_or_else(|| anyhow!("no address for {rest}"))?;
+            let provider = rustls::crypto::ring::default_provider();
+            let mut crypto = rustls::ClientConfig::builder_with_provider(provider.into())
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification(
+                    rustls::crypto::ring::default_provider().into(),
+                )))
+                .with_no_client_auth();
+            crypto.alpn_protocols = vec![b"dokitier".to_vec()];
+            let client_config = quinn::ClientConfig::new(std::sync::Arc::new(
+                quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+            ));
+            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+            endpoint.set_default_client_config(client_config);
+            let conn = endpoint.connect(addr, "localhost")?.await?;
+            let (send, recv) = conn.open_bi().await?;
+            return Ok(Self::Quic { send, recv });
+        }
         if url.starts_with("ws://") || url.starts_with("wss://") {
             let (ws, _) = connect_async(url).await?;
             return Ok(Self::Ws(ws));
@@ -28,12 +89,14 @@ impl AgentTransport {
                 ws.send(Message::Text(text.into())).await?;
                 Ok(())
             }
+            Self::Quic { send, .. } => write_frame(send, value).await,
         }
     }
 
     /// Receive one frame (WS text/binary JSON, or a UDP datagram).
     pub async fn recv(&mut self) -> anyhow::Result<Value> {
         match self {
+            Self::Quic { recv, .. } => read_frame(recv).await,
             Self::Ws(ws) => loop {
                 match ws.next().await {
                     Some(Ok(Message::Text(text))) => {

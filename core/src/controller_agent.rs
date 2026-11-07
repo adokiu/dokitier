@@ -120,7 +120,12 @@ async fn session(
     settings: &ControllerSettings,
     config_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let mut transport = AgentTransport::connect(&settings.url).await?;
+    let mut transport = tokio::time::timeout(
+        Duration::from_secs(10),
+        AgentTransport::connect(&settings.url),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("controller connect timeout"))??;
     transport.send(&hello(manager, settings).await).await?;
     tracing::info!(endpoint = %settings.url, node_id = %settings.node_id, "controller agent connected");
 

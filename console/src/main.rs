@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use dokitier_controller::{hash_token, AgentFrame};
+use dokitier_controller::{hash_token, read_frame, write_frame, AgentFrame};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -212,12 +212,48 @@ async fn post_command(
     }
 }
 
+async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
+    while let Some(incoming) = endpoint.accept().await {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let Ok(conn) = incoming.await else { return };
+            tracing::info!(remote = ?conn.remote_address(), "quic agent connected");
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else { tracing::warn!("quic stream open failed"); return };
+            let Ok(hello) = read_frame(&mut recv).await else { return };
+            let Ok(frame) = serde_json::from_value::<AgentFrame>(hello) else { return };
+            let AgentFrame::Hello { node_id, token, hostname, version, networks } = &frame else { return };
+            if !verify_node(&state.db, node_id, token).await {
+                let _ = write_frame(&mut send, &json!({"type":"error","error":"unauthorized"})).await;
+                return;
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
+            state.agents.insert(node_id.clone(), tx);
+            touch_node(&state.db, node_id, Some(hostname), Some(version), Some(&Value::Array(networks.clone())), None, "online").await;
+            let writer = tokio::spawn(async move {
+                while let Some(value) = rx.recv().await {
+                    if write_frame(&mut send, &value).await.is_err() { break; }
+                }
+            });
+            while let Ok(value) = read_frame(&mut recv).await {
+                dispatch_result(&state, &value).await;
+                if let Ok(frame) = serde_json::from_value::<AgentFrame>(value) {
+                    let _ = handle_agent_frame(&state, frame).await;
+                }
+            }
+            writer.abort();
+            state.agents.remove(node_id);
+            touch_node(&state.db, node_id, None, None, None, None, "offline").await;
+        });
+    }
+}
+
 async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-console"})) }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
     let mut listen = "127.0.0.1:12800".to_string();
+    let mut agent_quic = "127.0.0.1:12803".to_string();
     let mut db_path = "board.db".to_string();
     let mut webui = "../dokitier-web/webui/dist".to_string();
     let mut add_nodes: Vec<(String, String)> = Vec::new();
@@ -226,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--listen" => { listen = args[i + 1].clone(); i += 2; }
+            "--agent-quic" => { agent_quic = args[i + 1].clone(); i += 2; }
             "--db" => { db_path = args[i + 1].clone(); i += 2; }
             "--webui" => { webui = args[i + 1].clone(); i += 2; }
             "--add-node" => { add_nodes.push((args[i + 1].clone(), args[i + 2].clone())); i += 3; }
@@ -243,7 +280,23 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { db, webui: PathBuf::from(webui),
         agents: std::sync::Arc::new(dashmap::DashMap::new()),
         pending: std::sync::Arc::new(dashmap::DashMap::new()) };
-    tracing::info!(%listen, "console listeners ready (websocket agent endpoint)");
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+    );
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)?;
+    tls.alpn_protocols = vec![b"dokitier".to_vec()];
+    let quic_cfg = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
+    ));
+    let quic_endpoint = quinn::Endpoint::server(quic_cfg, agent_quic.parse()?)?;
+    tracing::info!(%listen, %agent_quic, "console listeners ready (websocket + quic agent endpoints)");
+    let quic_state = state.clone();
+    tokio::spawn(async move { quic_accept_loop(quic_state, quic_endpoint).await });
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/api/board/nodes", get(list_nodes))
