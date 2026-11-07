@@ -8,10 +8,10 @@ export default defineConfig({
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
   server: {
-    port: 5173,
+    port: Number(process.env.PORT) || 5173,
     proxy: {
-      '/api': 'http://127.0.0.1:11211',
-      '/api/events': { target: 'ws://127.0.0.1:11211', ws: true }
+      '/api': process.env.DOK_CONSOLE_URL || 'http://127.0.0.1:13110',
+      '/api/events': { target: process.env.DOK_CONSOLE_URL || 'ws://127.0.0.1:13110', ws: true }
     }
   },
   build: { outDir: 'dist' }
