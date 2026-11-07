@@ -36,8 +36,8 @@ harness = false
 
 [dependencies]
 dokitier-core.workspace = true
-dokitier-web = { path = "../dokitier-web", optional = true }
-dokitier-controller = { path = "../dokitier-controller" }
+dokitier-web = { path = "../web", optional = true }
+dokitier-controller = { path = "../controller" }
 dokitier-proto = { workspace = true, features = ["api", "core"] }
 git-version = "0.3.9"
 

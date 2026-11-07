@@ -7,10 +7,10 @@
 ```
 core/                 dokitier-core 二进制（Agent，仅上报/执行控制台配置）
 console/              独立控制台 dokitier-console（Web UI + Agent 接入 + 数据库）
-dokitier-controller/  core 与 console 共用的连接/协议代码
-dokitier-core/        网络核心库
-dokitier-proto/       protobuf 定义
-dokitier-web/         控制台前端（Vue 3 + Vuetify + ECharts）
+controller/           core 与 console 共用的连接/协议代码
+crates/dokitier-core/ 网络核心库
+crates/dokitier-proto/ protobuf 定义
+web/                  控制台前端（Vue 3 + Vuetify + ECharts）
 ```
 
 # dokitier

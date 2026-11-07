@@ -1,0 +1,16 @@
+'Log files:
+/Users/chuyao/Documents/Code/dokitier-src/dokitier-web/webui/.npm-cache/_logs/2026-11-06T14_10_13_976Z-debug-0.log
+
+# npm resolution error report
+
+While resolving: dokitier-webui@0.1.0
+Found: apexcharts@3.54.1
+node_modules/apexcharts
+  apexcharts@"^3.54.1" from the root project
+
+Could not resolve dependency:
+peer apexcharts@">=5.10.0" from vue3-apexcharts@1.11.3
+node_modules/vue3-apexcharts
+  vue3-apexcharts@"^1.8.0" from the root project
+
+Fix the upstream dependency conflict, or retry this command with --force or --legacy-peer-deps to accept an incorrect (and potentially broken) dependency resolution.

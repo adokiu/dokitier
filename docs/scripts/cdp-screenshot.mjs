@@ -4,6 +4,7 @@ import { writeFileSync } from 'node:fs'
 
 const base = process.env.DOK_BASE || 'http://127.0.0.1:11211'
 const password = process.env.DOK_PASSWORD || 'testpass'
+const username = process.env.DOK_USER || 'admin'
 const outDir = process.env.DOK_OUT || '/tmp'
 const pages = (process.env.DOK_PAGES || 'dashboard,topology,settings,links,nodes,routes,history').split(',')
 const bust = Date.now()
@@ -68,7 +69,7 @@ async function main() {
   await send('Page.navigate', { url: `${base}/?v=${bust}#/login` })
   await sleep(1500)
   await send('Runtime.evaluate', {
-    expression: `fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:${JSON.stringify(password)}})}).then(r=>r.status)`,
+    expression: `fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:${JSON.stringify(username)},password:${JSON.stringify(password)}})}).then(r=>r.status)`,
     awaitPromise: true,
   })
   await sleep(500)

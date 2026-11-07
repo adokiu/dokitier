@@ -564,7 +564,7 @@ async fn board_topology(State(state): State<AppState>) -> Json<Value> {
         .await
         .unwrap_or_default();
     let mut nodes: std::collections::BTreeMap<u32, Value> = std::collections::BTreeMap::new();
-    let mut edges: Vec<Value> = Vec::new();
+    let mut edges: std::collections::BTreeMap<(u32, u32, String), Value> = std::collections::BTreeMap::new();
     for (node_id, snapshot) in &rows {
         let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
         for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
@@ -579,16 +579,20 @@ async fn board_topology(State(state): State<AppState>) -> Json<Value> {
                 }
             }
             for e in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
+                let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let key = (a.min(b), a.max(b), network.to_string());
+                if edges.contains_key(&key) { continue; }
                 let mut edge = e.clone();
                 edge["network_name"] = json!(network);
                 let tunnel_types: Vec<Value> = e.get("tunnels").and_then(|v| v.as_array()).into_iter().flatten()
                     .filter_map(|t| t.get("type").cloned()).collect();
                 edge["tunnel_types"] = json!(tunnel_types);
-                edges.push(edge);
+                edges.insert(key, edge);
             }
         }
     }
-    Json(json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges}}))
+    Json(json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges.values().cloned().collect::<Vec<_>>()}}))
 }
 
 #[derive(serde::Deserialize)]
@@ -648,7 +652,7 @@ async fn board_links(State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
         .fetch_all(&state.db).await.unwrap_or_default();
     let mut names: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
-    let mut links = Vec::new();
+    let mut links_map: std::collections::BTreeMap<(u32, u32, String), Value> = std::collections::BTreeMap::new();
     for (_, snapshot) in &rows {
         let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
         for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
@@ -663,7 +667,10 @@ async fn board_links(State(state): State<AppState>) -> Json<Value> {
                 let tunnels = e.get("tunnels").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                 let latency = tunnels.iter().filter_map(|t| t.get("latency_ms").and_then(|v| v.as_f64())).reduce(f64::min);
                 let loss = tunnels.iter().filter_map(|t| t.get("loss_pct").and_then(|v| v.as_f64())).reduce(|a, b| a + b).map(|v| v / tunnels.len().max(1) as f64);
-                links.push(json!({
+                let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let key = (a.min(b), a.max(b), network.to_string());
+                links_map.entry(key).or_insert(json!({
                     "network": network,
                     "a": e.get("a"), "b": e.get("b"),
                     "tunnel_types": tunnels.iter().filter_map(|t| t.get("type").cloned()).collect::<Vec<_>>(),
@@ -673,7 +680,7 @@ async fn board_links(State(state): State<AppState>) -> Json<Value> {
             }
         }
     }
-    Json(json!({"links": links, "names": names}))
+    Json(json!({"links": links_map.values().cloned().collect::<Vec<_>>(), "names": names}))
 }
 
 async fn board_overview(State(state): State<AppState>) -> Json<Value> {
@@ -845,7 +852,7 @@ async fn main() -> anyhow::Result<()> {
     let mut listen = "127.0.0.1:12800".to_string();
     let mut agent_quic = "127.0.0.1:12803".to_string();
     let mut db_path = "board.db".to_string();
-    let mut webui = "../dokitier-web/webui/dist".to_string();
+    let mut webui = "../web/webui/dist".to_string();
     let mut add_nodes: Vec<(String, String)> = Vec::new();
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
