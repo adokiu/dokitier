@@ -26,6 +26,7 @@
           <strong>{{ pageTitle }}</strong>
         </div>
         <v-spacer />
+        <v-btn size="small" variant="text" @click="toggleLang">{{ locale === 'zh' ? 'EN' : '中' }}</v-btn>
         <v-btn icon variant="text" size="small" @click="toggleTheme">
           <Sun v-if="isDark" :size="18" />
           <Moon v-else :size="18" />
@@ -57,19 +58,19 @@
 
     <aside class="admin-sidebar">
       <div class="admin-nav">
-        <div class="admin-nav__label">{{ isRail ? '' : '系统' }}</div>
+        <div class="admin-nav__label">{{ isRail ? '' : t('nav.system') }}</div>
         <v-list nav density="compact" class="py-0">
           <v-list-item
             v-for="item in navItems"
             :key="item.to"
             :to="item.to"
-            :title="isRail ? undefined : item.title"
+            :title="isRail ? undefined : t(item.titleKey)"
             rounded="lg"
           >
             <template #prepend>
               <component :is="item.icon" :size="18" class="admin-nav-icon" />
             </template>
-            <v-tooltip v-if="isRail" activator="parent" location="right">{{ item.title }}</v-tooltip>
+            <v-tooltip v-if="isRail" activator="parent" location="right">{{ t(item.titleKey) }}</v-tooltip>
           </v-list-item>
         </v-list>
       </div>
@@ -94,6 +95,8 @@
 <script setup>
 import { computed, markRaw, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
+import { setLocale } from '@/i18n'
 import { useDisplay, useTheme } from 'vuetify'
 import {
   Activity,
@@ -114,6 +117,7 @@ import {
 import { api } from '@/api'
 
 const route = useRoute()
+const { t, locale } = useI18n()
 const router = useRouter()
 const theme = useTheme()
 const { smAndDown } = useDisplay()
@@ -122,13 +126,13 @@ const rail = ref(localStorage.getItem('dokitier-sidebar-rail') === '1')
 const mobileOpen = ref(false)
 
 const navItems = [
-  { title: '仪表盘', icon: markRaw(LayoutDashboard), to: '/dashboard' },
-  { title: '拓扑', icon: markRaw(Compass), to: '/topology' },
-  { title: '节点', icon: markRaw(Server), to: '/nodes' },
-  { title: '链路', icon: markRaw(Link2), to: '/links' },
-  { title: '路由', icon: markRaw(Route), to: '/routes' },
-  { title: '历史指标', icon: markRaw(Activity), to: '/history' },
-  { title: '设置', icon: markRaw(Settings), to: '/settings' },
+  { titleKey: 'nav.dashboard', icon: markRaw(LayoutDashboard), to: '/dashboard' },
+  { titleKey: 'nav.topology', icon: markRaw(Compass), to: '/topology' },
+  { titleKey: 'nav.nodes', icon: markRaw(Server), to: '/nodes' },
+  { titleKey: 'nav.links', icon: markRaw(Link2), to: '/links' },
+  { titleKey: 'nav.routes', icon: markRaw(Route), to: '/routes' },
+  { titleKey: 'nav.history', icon: markRaw(Activity), to: '/history' },
+  { titleKey: 'nav.settings', icon: markRaw(Settings), to: '/settings' },
 ]
 
 const pageTitle = computed(() => route.meta.title || '控制台')
@@ -142,6 +146,10 @@ watch(rail, (value) => localStorage.setItem('dokitier-sidebar-rail', value ? '1'
 function toggleRail() {
   if (smAndDown.value) mobileOpen.value = !mobileOpen.value
   else rail.value = !rail.value
+}
+
+function toggleLang() {
+  setLocale(locale.value === 'zh' ? 'en' : 'zh')
 }
 
 function toggleTheme() {

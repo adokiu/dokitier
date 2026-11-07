@@ -51,6 +51,10 @@ pub enum AgentFrame {
         version: String,
         #[serde(default)]
         networks: Vec<serde_json::Value>,
+        #[serde(default)]
+        public_ipv4: Option<String>,
+        #[serde(default)]
+        public_ipv6: Option<String>,
     },
     Heartbeat {
         node_id: String,

@@ -38,6 +38,7 @@ harness = false
 dokitier-core.workspace = true
 dokitier-web = { path = "../web", optional = true }
 dokitier-controller = { path = "../controller" }
+reqwest = { workspace = true, features = ["rustls", "json"] }
 dokitier-proto = { workspace = true, features = ["api", "core"] }
 git-version = "0.3.9"
 

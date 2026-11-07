@@ -30,7 +30,7 @@ pub fn spawn(manager: std::sync::Arc<NativeInstanceManager>, settings: Controlle
     });
 }
 
-async fn snapshot(manager: &NativeInstanceManager) -> Value {
+async fn snapshot(manager: &NativeInstanceManager, public_ipv4: Option<&str>, public_ipv6: Option<&str>) -> Value {
     let mut instances = Vec::new();
     for instance in manager.instances() {
         let node = instance.node_snapshot().await;
@@ -82,7 +82,12 @@ async fn snapshot(manager: &NativeInstanceManager) -> Value {
             "topology": {"nodes": topo_nodes, "edges": topo_edges},
         }));
     }
-    json!({ "ts": chrono::Utc::now().timestamp(), "instances": instances })
+    json!({
+        "ts": chrono::Utc::now().timestamp(),
+        "public_ipv4": public_ipv4,
+        "public_ipv6": public_ipv6,
+        "instances": instances,
+    })
 }
 
 async fn handle_command(
@@ -133,7 +138,29 @@ async fn handle_command(
     }
 }
 
+async fn detect_ip(url: &str, version: u8) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let text = client.get(url).send().await.ok()?.text().await.ok()?;
+    let ip: std::net::IpAddr = text.trim().parse().ok()?;
+    match (version, ip) {
+        (4, std::net::IpAddr::V4(_)) | (6, std::net::IpAddr::V6(_)) => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
+async fn detect_public_ips() -> (Option<String>, Option<String>) {
+    let (v4, v6) = tokio::join!(
+        detect_ip("https://api.ipify.org", 4),
+        detect_ip("https://api6.ipify.org", 6),
+    );
+    (v4, v6)
+}
+
 async fn hello(manager: &NativeInstanceManager, settings: &ControllerSettings) -> Value {
+    let public_ips = detect_public_ips().await;
     let (hostname, version) = match manager.instances().first() {
         Some(instance) => {
             let n = instance.node_snapshot().await;
@@ -159,6 +186,8 @@ async fn hello(manager: &NativeInstanceManager, settings: &ControllerSettings) -
         "hostname": hostname,
         "version": version,
         "networks": networks,
+        "public_ipv4": public_ips.0,
+        "public_ipv6": public_ips.1,
     })
 }
 
@@ -167,6 +196,7 @@ async fn session(
     settings: &ControllerSettings,
     config_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
+    let (public_ipv4, public_ipv6) = detect_public_ips().await;
     let mut transport = tokio::time::timeout(
         Duration::from_secs(10),
         AgentTransport::connect(&settings.url),
@@ -244,7 +274,7 @@ async fn session(
         let snap = serde_json::json!({
             "type": "snapshot",
             "node_id": settings.node_id,
-            "data": snapshot(manager).await,
+            "data": snapshot(manager, public_ipv4.as_deref(), public_ipv6.as_deref()).await,
         });
         transport.send(&cipher.encrypt(&snap)).await?;
     }

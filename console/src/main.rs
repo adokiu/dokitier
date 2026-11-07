@@ -23,6 +23,7 @@ struct AppState {
     webui: PathBuf,
     agents: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<Value>>>,
     pending: std::sync::Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<Value>>>,
+    last_traffic: std::sync::Arc<dashmap::DashMap<String, (i64, u64, u64)>>,
 }
 
 static POSTGRES: AtomicBool = AtomicBool::new(false);
@@ -74,7 +75,12 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
             networks LONGTEXT,
             snapshot LONGTEXT,
             last_seen BIGINT NOT NULL DEFAULT 0,
-            status VARCHAR(32) NOT NULL DEFAULT 'offline'
+            status VARCHAR(32) NOT NULL DEFAULT 'offline',
+            public_ipv4 VARCHAR(64),
+            public_ipv6 VARCHAR(128),
+            country_code VARCHAR(8),
+            rx_bps DOUBLE,
+            tx_bps DOUBLE
         )"
     } else {
         "CREATE TABLE IF NOT EXISTS nodes (
@@ -86,11 +92,19 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
             networks TEXT NOT NULL DEFAULT '[]',
             snapshot TEXT NOT NULL DEFAULT 'null',
             last_seen INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'offline'
+            status TEXT NOT NULL DEFAULT 'offline',
+            public_ipv4 TEXT,
+            public_ipv6 TEXT,
+            country_code TEXT,
+            rx_bps REAL,
+            tx_bps REAL
         )"
     };
     sqlx::query(nodes_ddl).execute(db).await?;
     let _ = sqlx::query("ALTER TABLE nodes ADD COLUMN token TEXT").execute(db).await;
+    for column in ["public_ipv4 TEXT", "public_ipv6 TEXT", "country_code TEXT", "rx_bps REAL", "tx_bps REAL"] {
+        let _ = sqlx::query(&format!("ALTER TABLE nodes ADD COLUMN {column}")).execute(db).await;
+    }
     let versions_ddl = if is_mysql() {
         "CREATE TABLE IF NOT EXISTS config_versions (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -261,20 +275,76 @@ async fn merge_snapshot(state: &AppState, node_id: &str, data: &Value) -> Value 
     json!({"ts": now(), "instances": merged_instances})
 }
 
+async fn update_public_ip(db: &AnyPool, node_id: &str, v4: Option<&str>, v6: Option<&str>) {
+    if v4.is_none() && v6.is_none() { return; }
+    let _ = sqlx::query(&q("UPDATE nodes SET public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6) WHERE node_id = ?"))
+        .bind(v4).bind(v6).bind(node_id).execute(db).await;
+}
+
+async fn lookup_and_store_country(db: AnyPool, node_id: String, ip: String) {
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(6)).build() {
+        Ok(client) => client,
+        Err(_) => return,
+    };
+    let Ok(response) = client.get(format!("https://ipwho.is/{ip}")).send().await else { return };
+    let Ok(value) = response.json::<Value>().await else { return };
+    let Some(code) = value.get("country_code").and_then(|v| v.as_str()) else { return };
+    let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
+        .bind(code.to_lowercase()).bind(&node_id).execute(&db).await;
+}
+
+async fn update_traffic(state: &AppState, node_id: &str, data: &Value) {
+    let mut rx_total = 0u64;
+    let mut tx_total = 0u64;
+    if let Some(instances) = data.get("instances").and_then(|v| v.as_array()) {
+        for inst in instances {
+            let Some(topo) = inst.get("topology") else { continue };
+            for edge in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
+                for tunnel in edge.get("tunnels").and_then(|v| v.as_array()).into_iter().flatten() {
+                    rx_total += tunnel.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    tx_total += tunnel.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    let now = now();
+    let mut rx_bps = 0.0;
+    let mut tx_bps = 0.0;
+    if let Some(prev) = state.last_traffic.get(node_id) {
+        let (prev_ts, prev_rx, prev_tx) = *prev;
+        let elapsed = (now - prev_ts).max(1) as f64;
+        rx_bps = rx_total.saturating_sub(prev_rx) as f64 / elapsed;
+        tx_bps = tx_total.saturating_sub(prev_tx) as f64 / elapsed;
+    }
+    state.last_traffic.insert(node_id.to_string(), (now, rx_total, tx_total));
+    let _ = sqlx::query(&q("UPDATE nodes SET rx_bps = ?, tx_bps = ? WHERE node_id = ?"))
+        .bind(rx_bps).bind(tx_bps).bind(node_id).execute(&state.db).await;
+}
+
 async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), String> {
     match frame {
-        AgentFrame::Hello { node_id, token, hostname, version, networks, .. } => {
+        AgentFrame::Hello { node_id, token, hostname, version, networks, public_ipv4, public_ipv6, .. } => {
             if !verify_node(&state.db, &node_id, &token).await {
                 return Err("unknown node or invalid token".into());
             }
             touch_node(&state.db, &node_id, Some(&hostname), Some(&version),
                        Some(&Value::Array(networks)), None, "online").await;
+            update_public_ip(&state.db, &node_id, public_ipv4.as_deref(), public_ipv6.as_deref()).await;
+            if let Some(ip) = public_ipv4.clone().or(public_ipv6.clone()) {
+                let db = state.db.clone();
+                let id = node_id.clone();
+                tokio::spawn(async move { lookup_and_store_country(db, id, ip).await });
+            }
             Ok(())
         }
         AgentFrame::Heartbeat { node_id, .. } => {
             touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
         }
         AgentFrame::Snapshot { node_id, data } => {
+            let v4 = data.get("public_ipv4").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let v6 = data.get("public_ipv6").and_then(|v| v.as_str()).map(|s| s.to_string());
+            update_public_ip(&state.db, &node_id, v4.as_deref(), v6.as_deref()).await;
+            update_traffic(state, &node_id, &data).await;
             let merged = merge_snapshot(state, &node_id, &data).await;
             if let Some(instances) = data.get("instances").and_then(|v| v.as_array()) {
                 for inst in instances {
@@ -402,27 +472,40 @@ async fn dispatch_result(state: &AppState, value: &Value) {
 }
 
 #[derive(Serialize)]
-struct NodeView { node_id: String, hostname: String, version: String, networks: Value, snapshot: Value, last_seen: i64, status: String }
+struct NodeView {
+    node_id: String,
+    hostname: String,
+    version: String,
+    networks: Value,
+    snapshot: Value,
+    last_seen: i64,
+    status: String,
+    public_ipv4: Option<String>,
+    public_ipv6: Option<String>,
+    country_code: Option<String>,
+    rx_bps: Option<f32>,
+    tx_bps: Option<f32>,
+}
 
 async fn list_nodes(State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String, String, String, String, i64, String)> = sqlx::query_as(&q(
-        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status FROM nodes ORDER BY node_id",
+    let rows: Vec<(String, String, String, String, String, i64, String, Option<String>, Option<String>, Option<String>, Option<f32>, Option<f32>)> = sqlx::query_as(&q(
+        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps FROM nodes ORDER BY node_id",
     )).fetch_all(&state.db).await.unwrap_or_default();
-    let nodes: Vec<NodeView> = rows.into_iter().map(|(node_id, hostname, version, networks, snapshot, last_seen, status)| NodeView {
+    let nodes: Vec<NodeView> = rows.into_iter().map(|(node_id, hostname, version, networks, snapshot, last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps)| NodeView {
         node_id, hostname, version,
         networks: serde_json::from_str(&networks).unwrap_or(Value::Null),
         snapshot: serde_json::from_str(&snapshot).unwrap_or(Value::Null),
-        last_seen, status,
+        last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps,
     }).collect();
     Json(json!({"nodes": nodes}))
 }
 
 async fn get_node(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
-    let row: Option<(String, String, String, String, String, i64, String)> = sqlx::query_as(&q(
-        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status FROM nodes WHERE node_id = ?",
+    let row: Option<(String, String, String, String, String, i64, String, Option<String>, Option<String>, Option<String>, Option<f32>, Option<f32>)> = sqlx::query_as(&q(
+        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps FROM nodes WHERE node_id = ?",
     )).bind(&node_id).fetch_optional(&state.db).await.ok().flatten();
     match row {
-        Some((node_id, hostname, version, networks, snapshot, last_seen, status)) => Json(json!({
+        Some((node_id, hostname, version, networks, snapshot, last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps)) => Json(json!({
             "node_id": node_id, "hostname": hostname, "version": version,
             "networks": serde_json::from_str::<Value>(&networks).unwrap_or(Value::Null),
             "snapshot": serde_json::from_str::<Value>(&snapshot).unwrap_or(Value::Null),
@@ -887,7 +970,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { db, postgres, webui: PathBuf::from(webui),
         sessions: std::sync::Arc::new(dashmap::DashMap::new()),
         agents: std::sync::Arc::new(dashmap::DashMap::new()),
-        pending: std::sync::Arc::new(dashmap::DashMap::new()) };
+        pending: std::sync::Arc::new(dashmap::DashMap::new()),
+        last_traffic: std::sync::Arc::new(dashmap::DashMap::new()) };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
