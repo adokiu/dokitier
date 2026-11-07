@@ -342,7 +342,6 @@ default = [
     "extended-services",
     "linux-netlink",
     "tcp-hole-punch",
-    "web-console",
 ]
 web-console = ["dep:dokitier-web"]
 full = [

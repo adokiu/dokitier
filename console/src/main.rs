@@ -38,6 +38,16 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             status TEXT NOT NULL DEFAULT 'offline'
         )",
     ).execute(db).await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS config_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            network TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            toml TEXT NOT NULL,
+            created INTEGER NOT NULL
+        )",
+    ).execute(db).await?;
     Ok(())
 }
 
@@ -252,8 +262,28 @@ async fn post_command(
         state.pending.remove(&request_id);
         return Json(json!({"ok": false, "error": "agent channel closed"}));
     }
+    let apply_toml = match &body.command {
+        dokitier_controller::ConsoleCommand::ApplyConfig { toml } => Some(toml.clone()),
+        _ => None,
+    };
     match tokio::time::timeout(std::time::Duration::from_secs(20), result_rx).await {
-        Ok(Ok(value)) => Json(value),
+        Ok(Ok(value)) => {
+            if value.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                if let Some(toml) = apply_toml {
+                    let _ = sqlx::query(
+                        "INSERT INTO config_versions (node_id, network, hash, toml, created) VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(&node_id)
+                    .bind(body.network.clone().unwrap_or_default())
+                    .bind(hash_token(&toml))
+                    .bind(&toml)
+                    .bind(now())
+                    .execute(&state.db)
+                    .await;
+                }
+            }
+            Json(value)
+        }
         Ok(Err(_)) => Json(json!({"ok": false, "error": "agent result channel closed"})),
         Err(_) => {
             state.pending.remove(&request_id);
@@ -307,6 +337,18 @@ async fn overview(State(state): State<AppState>) -> Json<Value> {
 
 async fn login() -> Json<Value> { Json(json!({"ok": true})) }
 async fn logout() -> Json<Value> { Json(json!({"ok": true})) }
+
+async fn list_versions(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Json<Value> {
+    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT id, network, hash, created FROM config_versions WHERE node_id = ? ORDER BY id DESC LIMIT 50",
+    ).bind(&node_id).fetch_all(&state.db).await.unwrap_or_default();
+    Json(json!({"versions": rows.into_iter().map(|(id, network, hash, created)| json!({
+        "id": id, "network": network, "hash": hash, "created": created,
+    })).collect::<Vec<_>>()}))
+}
 
 async fn health() -> Json<Value> { Json(json!({"ok": true, "service": "dokitier-console"})) }
 
@@ -366,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/nodes", get(list_nodes))
         .route("/api/board/nodes/{node_id}", get(get_node))
         .route("/api/agent/ws", get(ws_agent))
+        .route("/api/board/nodes/{node_id}/versions", get(list_versions))
         .route("/api/board/nodes/{node_id}/command", axum::routing::post(post_command))
         .fallback_service(ServeDir::new(&state.webui).append_index_html_on_directories(true))
         .with_state(state);
