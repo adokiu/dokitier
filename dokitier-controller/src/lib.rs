@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod transport;
+
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

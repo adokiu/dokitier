@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use dokitier_controller::write_frame;
+use dokitier_controller::{transport::AgentTransport, ConsoleFrame};
 use serde_json::{json, Value};
 use tokio::{io::AsyncReadExt, net::TcpStream, time::interval};
 
@@ -68,31 +68,38 @@ async fn session(
     manager: &std::sync::Arc<NativeInstanceManager>,
     settings: &ControllerSettings,
 ) -> anyhow::Result<()> {
-    let Some(rest) = settings.url.strip_prefix("tcp://") else {
-        anyhow::bail!("only tcp:// controller endpoints are implemented so far: {}", settings.url);
-    };
-    let mut stream = TcpStream::connect(rest).await?;
-    write_frame(&mut stream, &hello(manager, settings).await).await?;
+    let mut transport = AgentTransport::connect(&settings.url).await?;
+    transport.send(&hello(manager, settings).await).await?;
     tracing::info!(endpoint = %settings.url, node_id = %settings.node_id, "controller agent connected");
 
-    let mut ticker = interval(Duration::from_secs(settings.interval_secs.max(1)));
-    let mut buf = [0u8; 4096];
+    let interval = Duration::from_secs(settings.interval_secs.max(1));
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                let snap = json!({
-                    "type": "snapshot",
-                    "node_id": settings.node_id,
-                    "data": snapshot(manager).await,
-                });
-                write_frame(&mut stream, &snap).await?;
-            }
-            n = stream.read(&mut buf) => {
-                let n = n?;
-                if n == 0 {
-                    anyhow::bail!("controller closed the connection");
+        match tokio::time::timeout(interval, transport.recv()).await {
+            Ok(Ok(value)) => {
+                if let Ok(frame) = serde_json::from_value::<ConsoleFrame>(value) {
+                    match frame {
+                        ConsoleFrame::Command { request_id, .. } => {
+                            let reply = serde_json::json!({
+                                "type": "result",
+                                "node_id": settings.node_id,
+                                "request_id": request_id,
+                                "ok": false,
+                                "error": "config commands are not implemented by this core yet",
+                            });
+                            transport.send(&reply).await?;
+                        }
+                        _ => {}
+                    }
                 }
             }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {}
         }
+        let snap = serde_json::json!({
+            "type": "snapshot",
+            "node_id": settings.node_id,
+            "data": snapshot(manager).await,
+        });
+        transport.send(&snap).await?;
     }
 }
