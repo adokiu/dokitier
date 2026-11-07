@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dokitier_core::config::{ConfigFileControl, RoutingWeights, TomlConfigLoader, WebConsoleSettings};
+use dokitier_core::config::{RoutingWeights, WebConsoleSettings};
+use crate::common::config::{ConfigFileControl, TomlConfigLoader};
 use dokitier_web::metrics::{LinkKey, MetricPoint};
 use dokitier_web::{DataSource, MetricsHub, WebConsoleConfig};
 use serde_json::json;
