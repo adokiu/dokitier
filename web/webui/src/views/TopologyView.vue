@@ -3,9 +3,9 @@
     <div class="d-flex align-center mb-3">
       <div class="page-title">{{ t('nav.topology') }}</div>
       <v-spacer />
-      <v-chip size="small" variant="tonal" color="primary" class="mr-2">本机</v-chip>
-      <v-chip size="small" variant="tonal" color="info" class="mr-3">远端</v-chip>
-      <v-chip size="small" variant="tonal" color="success" class="mr-2">实时（1s）</v-chip>
+      <v-chip size="small" variant="text" class="mr-2">本机</v-chip>
+      <v-chip size="small" variant="text" class="mr-3">远端</v-chip>
+      <v-chip size="small" variant="text" class="mr-2">实时（1s）</v-chip>
       <v-btn size="small" variant="text" icon="mdi-magnify-plus-outline" @click="zoomBy(1.2)" />
       <v-btn size="small" variant="text" icon="mdi-magnify-minus-outline" @click="zoomBy(1 / 1.2)" />
       <v-btn size="small" variant="text" icon="mdi-fit-to-page-outline" @click="resetView" />
@@ -43,7 +43,7 @@
           <div v-for="t in nb.tunnels" :key="t.id" class="tunnel-row tunnel-row--nested">
             <div class="tunnel-row__top">
               <span class="tunnel-row__type">{{ t.tunnel_type }}</span>
-              <span class="tunnel-row__addr">{{ t.remote_addr || t.id }}</span>
+              <span class="tunnel-row__addr">{{ tunnelPath(t) }}</span>
             </div>
             <div class="tunnel-row__stats">
               <span>延迟 {{ t.latency_ms != null ? t.latency_ms.toFixed(2) + ' ms' : '-' }}</span>
@@ -63,23 +63,26 @@
         </v-row>
 
         <div class="d-flex align-center mt-2 mb-1">
-          <div class="stat-label">延迟趋势</div>
+          <div class="stat-label">链路质量</div>
           <v-spacer />
-          <v-btn-toggle v-model="historyRange" mandatory density="compact" variant="text" divided>
+          <v-btn-toggle v-model="historyRange" mandatory density="compact" variant="text" divided class="range-toggle">
+            <v-btn value="live" size="x-small">实时</v-btn>
             <v-btn value="1h" size="x-small">1h</v-btn>
             <v-btn value="24h" size="x-small">24h</v-btn>
             <v-btn value="7d" size="x-small">7d</v-btn>
             <v-btn value="30d" size="x-small">30d</v-btn>
           </v-btn-toggle>
         </div>
-        <div ref="histEl" style="width: 100%; height: 180px"></div>
+        <div class="hist-wrap">
+          <div ref="histEl" style="width: 100%; height: 180px"></div>
+          <div v-if="histLine.visible" class="hist-pointer" :style="{ left: `${histLine.x}px` }"></div>
+        </div>
 
-        <v-divider class="my-3" />
         <div class="stat-label mt-3 mb-1">物理链路 ({{ (selected.tunnels || []).length || 1 }})</div>
         <div v-for="t in (selected.tunnels || [])" :key="t.id" class="tunnel-row">
           <div class="tunnel-row__top">
             <span class="tunnel-row__type">{{ t.tunnel_type }}</span>
-            <span class="tunnel-row__addr">{{ t.remote_addr || t.id }}</span>
+            <span class="tunnel-row__addr">{{ tunnelPath(t) }}</span>
           </div>
           <div class="tunnel-row__stats">
             <span>延迟 {{ t.latency_ms != null ? t.latency_ms.toFixed(2) + ' ms' : '-' }}</span>
@@ -88,17 +91,23 @@
           </div>
         </div>
 
-        <v-divider class="my-4" />
-        <div class="page-title mb-3" style="font-size: 14px">链路策略</div>
-        <v-text-field v-model.number="form.bandwidth_mbps" label="带宽 (Mbps)" type="number" density="compact" />
-        <v-text-field v-model="form.latency_weight" label="延迟权重（空=全局）" type="number" density="compact" />
-        <v-text-field v-model="form.loss_weight" label="丢包权重（空=全局）" type="number" density="compact" />
-        <v-text-field v-model="form.bandwidth_weight" label="带宽权重（空=全局）" type="number" density="compact" />
-        <v-text-field v-model="form.note" label="备注" density="compact" />
+        <div class="stat-label mt-3 mb-1">链路策略</div>
+        <v-text-field v-model.number="form.bandwidth_mbps" label="带宽 (Mbps)" type="number" density="compact" variant="outlined" hide-details class="mb-4" />
+        <v-text-field v-model="form.latency_weight" label="延迟权重（空=全局）" type="number" density="compact" variant="outlined" hide-details class="mb-4" />
+        <v-text-field v-model="form.loss_weight" label="丢包权重（空=全局）" type="number" density="compact" variant="outlined" hide-details class="mb-4" />
+        <v-text-field v-model="form.bandwidth_weight" label="带宽权重（空=全局）" type="number" density="compact" variant="outlined" hide-details class="mb-4" />
+        <v-text-field v-model="form.note" label="备注" density="compact" variant="outlined" hide-details class="mb-4" />
         <v-switch v-model="form.disabled" label="禁用此链路" color="error" density="compact" />
         <v-btn color="primary" block :loading="saving" @click="save">保存</v-btn>
       </template>
     </DetailDrawer>
+
+    <HoverCard :visible="hover.visible" :x="hover.x" :y="hover.y">
+      <template #title>{{ hover.title }}</template>
+      <div v-for="row in hover.rows" :key="row.label" class="dok-hover-card__row">
+        <span>{{ row.label }}</span><b>{{ row.value }}</b>
+      </div>
+    </HoverCard>
   </div>
 </template>
 
@@ -108,6 +117,7 @@ import { useI18n } from 'vue-i18n'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { api } from '@/api'
+import HoverCard from '@/components/HoverCard.vue'
 import DetailDrawer from '@/components/DetailDrawer.vue'
 
 const { t } = useI18n()
@@ -118,6 +128,7 @@ let ws = null
 let graph = { nodes: [], edges: [] }
 let metrics = {}
 let layout = {}
+let edgeHitCache = []
 let width = 1200
 let height = 640
 let drag = null
@@ -125,8 +136,17 @@ let pan = null
 let resizeObserver = null
 let histChart = null
 const histEl = ref(null)
-const historyRange = ref('24h')
+let eventSource = null
+let sseRetry = null
+let pollTimer = null
+let flowTimer = null
+let flowOffset = 0
+let lastSampleTs = 0
+const prevTraffic = new Map()
+const edgeSamples = {}
+const historyRange = ref('live')
 const historyPoints = ref([])
+const histLine = ref({ visible: false, x: 0 })
 const view = { scale: 1, tx: 0, ty: 0 }
 
 function toScreen(p) {
@@ -159,6 +179,7 @@ const saving = ref(false)
 const selected = ref(null)
 const form = ref({ bandwidth_mbps: null, latency_weight: '', loss_weight: '', bandwidth_weight: '', note: '', disabled: false })
 const nodeSelected = ref(null)
+const hover = ref({ visible: false, x: 0, y: 0, title: '', rows: [] })
 
 const drawerTitle = computed(() => {
   if (!selected.value) return ''
@@ -219,6 +240,19 @@ const SIZE = { local: { w: 170, h: 56 }, remote: { w: 150, h: 48 } }
 
 function keyOf(a, b) {
   return a <= b ? `${a}:${b}` : `${b}:${a}`
+}
+
+function endpoint(addr) {
+  if (!addr) return '-'
+  const text = String(addr)
+  const match = text.match(/^[a-z0-9+.-]+:\/\/(.*)$/i)
+  return match ? match[1] : text
+}
+
+function tunnelPath(t) {
+  const local = t.local_addr ? endpoint(t.local_addr) : '-'
+  const remote = endpoint(t.remote_addr || t.id)
+  return `本机 ${local} → 对端 ${remote}`
 }
 
 function bps(v) {
@@ -333,6 +367,25 @@ function bezierPoint(p0, c1, c2, p1, t) {
   return { x, y }
 }
 
+let dotPatternLight = null
+let dotPatternDark = null
+function dotPattern(dark) {
+  if (dark && dotPatternDark) return dotPatternDark
+  if (!dark && dotPatternLight) return dotPatternLight
+  const canvas = document.createElement('canvas')
+  canvas.width = 6
+  canvas.height = 6
+  const ctx = canvas.getContext('2d')
+  ctx.fillStyle = dark ? 'rgba(255,255,255,0.14)' : 'rgba(15,35,50,0.12)'
+  ctx.beginPath()
+  ctx.arc(3, 3, 0.7, 0, Math.PI * 2)
+  ctx.fill()
+  const pattern = ctx.createPattern(canvas, 'repeat')
+  if (dark) dotPatternDark = pattern
+  else dotPatternLight = pattern
+  return pattern
+}
+
 function buildOption() {
   const nodes = graph.nodes || []
   const edges = graph.edges || []
@@ -376,7 +429,7 @@ function buildOption() {
     const bw = (m.rx_bps || 0) + (m.tx_bps || 0)
     const active = bw >= 1024
     const lineWidth = active
-      ? Math.min(6, 1.3 + Math.log10(1 + bw / 1024) * 1.3)
+      ? Math.min(5, 1 + Math.log10(1 + bw / 1024) * 1.4)
       : 1
     const label = `${latency != null ? latency.toFixed(1) + 'ms' : '--'} / ${bps(bw)}`
     edgeData.push({
@@ -391,37 +444,42 @@ function buildOption() {
       rx: m.rx_bps,
       tx: m.tx_bps,
       bw,
-      color: latency == null ? '#b0bec5' : latency < 50 ? '#43a047' : latency < 150 ? '#fb8c00' : '#e53935',
+      color: '#94a3b8',
+      network_name: e.network_name || '',
       active,
       lineWidth,
     })
   }
 
+  edgeHitCache = edgeData
   const nodeData = nodes.map((n) => ({
     ...n,
     p: toScreen(layout[n.peer_id] || { x: width / 2, y: height / 2 }),
   }))
 
+  const dark = document.querySelector('.v-application')?.classList.contains('v-theme--PurpleThemeDark')
+  const axisLine = dark ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.12)'
   return {
     animation: false,
     tooltip: {
-      trigger: 'item',
+      trigger: 'axis',
+      confine: true,
+      backgroundColor: dark ? 'rgba(36,36,36,0.96)' : 'rgba(255,255,255,0.98)',
+      borderColor: dark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.1)',
+      borderWidth: 1,
+      padding: 0,
+      textStyle: { color: dark ? '#e8eaed' : '#1f2a30', fontSize: 12 },
+      extraCssText: 'border-radius:12px;box-shadow:0 10px 28px rgba(16,24,40,.16);padding:10px 12px;',
+      axisPointer: { type: 'line', lineStyle: { color: axisLine } },
       formatter: (params) => {
-        if (params.seriesId === 'nodes') {
-          const d = params.data
-          return `<b>${d.hostname || d.peer_id}</b><br/>IPv4: ${d.ipv4 || '-'}<br/>版本: ${d.version || '-'}`
-        }
-        if (params.seriesId === 'edges') {
-          const d = params.data
-          return [
-            `<b>${d.a} ↔ ${d.b}</b>`,
-            `链路: ${(d.tunnels || []).length || 1} 条`,
-            `协议: ${[...new Set((d.tunnels || []).map((t) => t.tunnel_type))].join(', ') || '-'}`,
-            `延迟: ${d.latency != null ? d.latency.toFixed(2) + ' ms' : '-'}`,
-            `实时带宽: ${bps(d.bw)}`,
-          ].join('<br/>')
-        }
-        return ''
+        const p = params?.[0]
+        if (!p) return ''
+        const item = historyPoints.value[p.dataIndex]
+        if (!item) return ''
+        const time = new Date(item.ts * 1000).toLocaleString()
+        const lat = item.latency_ms != null ? Number(item.latency_ms).toFixed(2) + ' ms' : '-'
+        const loss = item.loss_pct != null ? Number(item.loss_pct).toFixed(2) + ' %' : '-'
+        return `<div style="font-weight:600;margin-bottom:5px">${time}</div><div>延迟&nbsp;&nbsp;${lat}</div><div>丢包&nbsp;&nbsp;${loss}</div>`
       },
     },
     series: [
@@ -458,22 +516,27 @@ function buildOption() {
                   stroke: d.color,
                   lineWidth: d.lineWidth,
                   fill: 'none',
-                  lineDash: d.active ? [7, 5] : undefined,
+                  lineDash: d.active ? [8, 6] : undefined,
+                  lineDashOffset: d.active ? -flowOffset : 0,
+                  opacity: .9,
                 },
               },
               {
                 type: 'text',
-                style: {
-                  text: d.label,
-                  x: d.mid.x,
-                  y: d.mid.y - 10 * Math.max(0.8, Math.min(1.6, view.scale)),
-                  fill: '#455a64',
-                  fontSize: Math.max(9, 11 * Math.max(0.8, Math.min(1.6, view.scale))),
-                  align: 'center',
-                  backgroundColor: 'rgba(255,255,255,0.92)',
-                  padding: [2, 6],
-                  borderRadius: 4,
-                },
+                style: (() => {
+                  const dark = document.querySelector('.v-application')?.classList.contains('v-theme--PurpleThemeDark')
+                  return {
+                    text: d.label,
+                    x: d.mid.x,
+                    y: d.mid.y - 10 * Math.max(0.8, Math.min(1.6, view.scale)),
+                    fill: dark ? '#e8eaed' : '#455a64',
+                    fontSize: Math.max(9, 11 * Math.max(0.8, Math.min(1.6, view.scale))),
+                    align: 'center',
+                    backgroundColor: dark ? 'transparent' : 'rgba(255,255,255,0.92)',
+                    padding: dark ? 0 : [2, 6],
+                    borderRadius: dark ? 0 : 4,
+                  }
+                })(),
               },
             ],
           }
@@ -490,7 +553,8 @@ function buildOption() {
           const first = d.local
           const w = (first ? 170 : 150) * view.scale
           const h = (first ? 56 : 48) * view.scale
-          const r = 14 * view.scale
+          const r = 12 * view.scale
+          const dark = document.querySelector('.v-application')?.classList.contains('v-theme--PurpleThemeDark')
           return {
             type: 'group',
             children: [
@@ -498,9 +562,17 @@ function buildOption() {
                 type: 'rect',
                 shape: { x: d.p.x - w / 2, y: d.p.y - h / 2, width: w, height: h, r },
                 style: {
-                  fill: first ? '#3c96ca' : '#7cb8d8',
-                  shadowBlur: 0,
+                  fill: dark ? 'rgba(42,47,52,0.72)' : 'rgba(255,255,255,0.72)',
+                  stroke: dark ? 'rgba(255,255,255,0.18)' : 'rgba(15,35,50,0.16)',
+                  lineWidth: 1,
+                  shadowBlur: 18,
+                  shadowColor: dark ? 'rgba(0,0,0,0.35)' : 'rgba(15,35,50,0.10)',
                 },
+              },
+              {
+                type: 'rect',
+                shape: { x: d.p.x - w / 2, y: d.p.y - h / 2, width: w, height: h, r },
+                style: { fill: dotPattern(dark), stroke: 'none' },
               },
               {
                 type: 'text',
@@ -508,8 +580,9 @@ function buildOption() {
                   text: d.hostname || String(d.peer_id),
                   x: d.p.x,
                   y: d.p.y,
-                  fill: '#fff',
+                  fill: dark ? '#e8eaed' : '#1f2a30',
                   fontSize: Math.max(9, 12 * view.scale),
+                  fontWeight: 500,
                   align: 'center',
                   verticalAlign: 'middle',
                 },
@@ -542,27 +615,102 @@ function hitNode(x, y) {
   return null
 }
 
+function onHistMove(e) {
+  if (!histEl.value) return
+  const rect = histEl.value.getBoundingClientRect()
+  histLine.value = { visible: true, x: e.offsetX }
+}
+
+function onHistOut() {
+  histLine.value.visible = false
+}
+
 function renderHistory() {
   if (!histEl.value) return
   if (!histChart) histChart = echarts.init(histEl.value, null, { renderer: 'canvas' })
   const points = historyPoints.value
   const ts = points.map((p) => p.ts * 1000)
+  const rangeSeconds = { live: 60, '1h': 3600, '24h': 86400, '7d': 7 * 86400, '30d': 30 * 86400 }
+  const span = rangeSeconds[historyRange.value] || 60
+  const end = Date.now() / 1000
+  const start = end - span
+  const dark = document.querySelector('.v-application')?.classList.contains('v-theme--PurpleThemeDark')
+  const axisLine = dark ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.12)'
+  const labelColor = dark ? 'rgba(255,255,255,0.55)' : 'rgba(0,0,0,0.45)'
+  const splitLine = dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)'
   histChart.setOption({
     animation: false,
+    axisPointer: { show: false, type: 'none' },
     grid: { left: 40, right: 40, top: 24, bottom: 22 },
-    tooltip: { trigger: 'axis', valueFormatter: (v) => (v == null ? '-' : Number(v).toFixed(2)) },
-    legend: { top: 0, left: 'center', itemWidth: 8, itemHeight: 8, textStyle: { fontSize: 10 } },
-    xAxis: { type: 'time', axisLabel: { fontSize: 9 }, axisLine: { lineStyle: { color: '#d0d0d0' } } },
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      backgroundColor: dark ? 'rgba(36,36,36,0.96)' : 'rgba(255,255,255,0.98)',
+      borderColor: dark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.1)',
+      borderWidth: 1,
+      padding: 10,
+      textStyle: { color: dark ? '#e8eaed' : '#1f2a30', fontSize: 12 },
+      extraCssText: 'border-radius:12px;box-shadow:0 10px 28px rgba(16,24,40,.16);',
+      axisPointer: { show: false, type: 'none' },
+      formatter: (params) => {
+        const p = params?.[0]
+        if (!p) return ''
+        const item = historyPoints.value[p.dataIndex]
+        if (!item) return ''
+        const time = new Date(item.ts * 1000).toLocaleString()
+        const lat = item.latency_ms != null ? Number(item.latency_ms).toFixed(2) + ' ms' : '-'
+        const loss = item.loss_pct != null ? Number(item.loss_pct).toFixed(2) + ' %' : '-'
+        return `<div style="font-weight:600;margin-bottom:5px">${time}</div><div>延迟&nbsp;&nbsp;${lat}</div><div>丢包&nbsp;&nbsp;${loss}</div>`
+      },
+    },
+    xAxis: {
+      type: 'time',
+      min: start * 1000,
+      max: end * 1000,
+      axisLabel: { fontSize: 9, color: labelColor, hideOverlap: true },
+      axisLine: { lineStyle: { color: axisLine } },
+      axisTick: { lineStyle: { color: axisLine } },
+    },
     yAxis: [
-      { type: 'value', name: 'ms', nameTextStyle: { fontSize: 9 }, axisLabel: { fontSize: 9 }, splitLine: { lineStyle: { color: '#f0f0f0' } } },
-      { type: 'value', name: '%', position: 'right', nameTextStyle: { fontSize: 9 }, axisLabel: { fontSize: 9 }, splitLine: { show: false } },
+      { type: 'value', name: 'ms', nameTextStyle: { fontSize: 9, color: labelColor }, axisLabel: { fontSize: 9, color: labelColor }, axisLine: { lineStyle: { color: axisLine } }, splitLine: { lineStyle: { color: splitLine } } },
+      { type: 'value', name: '%', position: 'right', nameTextStyle: { fontSize: 9, color: labelColor }, axisLabel: { fontSize: 9, color: labelColor }, axisLine: { lineStyle: { color: axisLine } }, splitLine: { show: false } },
     ],
     series: [
       { name: '延迟', type: 'line', smooth: 0.8, showSymbol: false, data: ts.map((t, i) => [t, points[i].latency_ms]), lineStyle: { width: 1.5 }, color: '#3c96ca' },
       { name: '丢包', type: 'line', smooth: 0.8, showSymbol: false, yAxisIndex: 1, data: ts.map((t, i) => [t, points[i].loss_pct]), lineStyle: { width: 1 }, color: '#fb8c00' },
     ],
-  }, true)
+  }, { notMerge: false, replaceMerge: ['series'] })
   histChart.resize()
+  const zr = histChart.getZr()
+  zr.off('mousemove', onHistMove)
+  zr.off('globalout', onHistOut)
+  zr.on('mousemove', onHistMove)
+  zr.on('globalout', onHistOut)
+}
+
+function updateHistHover(clientX, clientY) {
+  const points = historyPoints.value
+  if (!points.length || !histEl.value) { hover.value.visible = false; return }
+  const rect = histEl.value.getBoundingClientRect()
+  const x = clientX == null ? histLine.value.x : clientX - rect.left
+  const y = clientY == null ? rect.height / 2 : clientY - rect.top
+  const [time] = histChart.convertFromPixel({ xAxisIndex: 0 }, [x, y])
+  let best = points[0]
+  let bestDiff = Infinity
+  for (const p of points) {
+    const diff = Math.abs(p.ts * 1000 - time)
+    if (diff < bestDiff) { bestDiff = diff; best = p }
+  }
+  hover.value = {
+    visible: true,
+    x: rect.left + x,
+    y: rect.top + y,
+    title: new Date(best.ts * 1000).toLocaleString(),
+    rows: [
+      { label: '延迟', value: best.latency_ms != null ? `${Number(best.latency_ms).toFixed(2)} ms` : '-' },
+      { label: '丢包', value: best.loss_pct != null ? `${Number(best.loss_pct).toFixed(2)} %` : '-' },
+    ],
+  }
 }
 
 function mergePoints(base, extra) {
@@ -572,11 +720,28 @@ function mergePoints(base, extra) {
   return [...map.values()].sort((a, b) => a.ts - b.ts)
 }
 
-async function loadHistory() {
+async function loadLiveBackfill() {
   const item = selected.value
   if (!item || item.kind !== 'edge') return
   try {
-    const data = await api.history(item.a, item.b, historyRange.value)
+    const network = item.network_name || (graph.edges || []).find((e) => keyOf(e.a, e.b) === keyOf(item.a, item.b))?.network_name || ''
+    const data = await api.boardHistory(network, item.a, item.b, '60s')
+    const key = keyOf(item.a, item.b)
+    const map = new Map()
+    for (const p of edgeSamples[key] || []) map.set(p.ts, p)
+    for (const p of data.points || []) map.set(p.ts, p)
+    edgeSamples[key] = [...map.values()].sort((a, b) => a.ts - b.ts).slice(-60)
+    if (historyRange.value === 'live') syncLive()
+  } catch {}
+}
+
+async function loadHistory() {
+  const item = selected.value
+  if (!item || item.kind !== 'edge') return
+  if (historyRange.value === 'live') { syncLive(); return }
+  try {
+    const network = item.network_name || (graph.edges || []).find((e) => keyOf(e.a, e.b) === keyOf(item.a, item.b))?.network_name || ''
+    const data = await api.boardHistory(network, item.a, item.b, historyRange.value)
     historyPoints.value = mergePoints(data.points || [], item.samples || [])
     renderHistory()
   } catch {
@@ -585,7 +750,18 @@ async function loadHistory() {
   }
 }
 
-watch(historyRange, loadHistory)
+function syncLive() {
+  const item = selected.value
+  if (!item || item.kind !== 'edge') return
+  const points = (edgeSamples[keyOf(item.a, item.b)] || item.samples || []).slice(-60)
+  historyPoints.value = points
+  renderHistory()
+}
+
+watch(historyRange, (range) => {
+  if (range === 'live') syncLive()
+  else loadHistory()
+})
 
 async function openEdge(item) {
   selected.value = {
@@ -595,7 +771,7 @@ async function openEdge(item) {
     nameB: nodeName(item.b),
   }
   try {
-    const data = await api.links()
+    const data = await api.boardLinks()
     const pair = data.links || []
     const found = pair.find((l) => {
       const m = l.metrics
@@ -614,11 +790,11 @@ async function openEdge(item) {
     form.value = { bandwidth_mbps: null, latency_weight: '', loss_weight: '', bandwidth_weight: '', note: '', disabled: false }
   }
   drawer.value = true
-  historyRange.value = '24h'
-  historyPoints.value = mergePoints([], item.samples || [])
+  historyRange.value = 'live'
+  historyPoints.value = (edgeSamples[keyOf(item.a, item.b)] || item.samples || []).slice(-60)
   await nextTick()
   renderHistory()
-  loadHistory()
+  loadLiveBackfill()
 }
 
 async function save() {
@@ -640,12 +816,61 @@ async function save() {
   }
 }
 
+function showHoverAt(x, y) {
+  const nodeId = hitNode(x, y)
+  if (nodeId != null) {
+    const d = (graph.nodes || []).find((n) => n.peer_id === nodeId)
+    if (d) {
+      const rect = chartEl.value.getBoundingClientRect()
+      hover.value = {
+        visible: true,
+        x: rect.left + x,
+        y: rect.top + y,
+        title: d.hostname || String(d.peer_id),
+        rows: [
+          { label: 'Peer ID', value: String(d.peer_id) },
+          { label: 'IPv4', value: d.ipv4 || '-' },
+          { label: '版本', value: d.version || '-' },
+        ],
+      }
+      return
+    }
+  }
+  let best = null
+  let bestDist = 14
+  for (const e of edgeHitCache) {
+    const labelDist = Math.hypot(e.mid.x - x, e.mid.y - y)
+    if (labelDist < 20) { best = e; bestDist = labelDist; continue }
+    for (let t = 0; t <= 1.001; t += 0.05) {
+      const p = bezierPoint(e.p0, e.c1, e.c2, e.p1, t)
+      const d = Math.hypot(p.x - x, p.y - y)
+      if (d < bestDist) { bestDist = d; best = e }
+    }
+  }
+  if (!best) { hover.value.visible = false; return }
+  const rect = chartEl.value.getBoundingClientRect()
+  hover.value = {
+    visible: true,
+    x: rect.left + x,
+    y: rect.top + y,
+    title: `${nodeName(best.a)} ↔ ${nodeName(best.b)}`,
+    rows: [
+      { label: '延迟', value: best.latency != null ? `${best.latency.toFixed(2)} ms` : '-' },
+      { label: '丢包', value: best.loss != null ? `${best.loss.toFixed(2)} %` : '-' },
+      { label: '接收', value: bps(best.rx) },
+      { label: '发送', value: bps(best.tx) },
+      { label: '协议', value: [...new Set((best.tunnels || []).map((t) => t.tunnel_type))].join(', ') || '-' },
+    ],
+  }
+}
+
 function setupDrag() {
   const zr = chart.getZr()
 
   function endDrag() {
     drag = null
     pan = null
+    hover.value.visible = false
     zr.setCursorStyle('default')
   }
 
@@ -679,6 +904,7 @@ function setupDrag() {
       apply()
       return
     }
+    showHoverAt(e.offsetX, e.offsetY)
     zr.setCursorStyle('grab')
   })
 
@@ -716,42 +942,135 @@ function connectWs() {
   ws.onclose = () => setTimeout(connectWs, 3000)
 }
 
-async function load() {
+function computeTunnelBps(key, tunnels, now, dt) {
+  let rx = 0, tx = 0
+  for (const t of tunnels) {
+    const id = `${key}:${t.remote_addr || t.type || t.id || 't'}`
+    const prev = prevTraffic.get(id)
+    const r = Number(t.rx_bytes || 0)
+    const x = Number(t.tx_bytes || 0)
+    const tRx = prev ? Math.max(0, (r - prev.rx) / dt) : 0
+    const tTx = prev ? Math.max(0, (x - prev.tx) / dt) : 0
+    prevTraffic.set(id, { rx: r, tx: x, ts: now })
+    t.rx_bps = tRx
+    t.tx_bps = tTx
+    rx += tRx
+    tx += tTx
+  }
+  return { rx, tx }
+}
+
+function ingestBoard(board) {
+  const now = Math.floor(Date.now() / 1000)
+  const dt = lastSampleTs ? Math.max(0.5, now - lastSampleTs) : 1
+  graph = board.graph
+  metrics = {}
+  for (const e of graph.edges || []) {
+    const key = keyOf(e.a, e.b)
+    const tunnels = (e.tunnels || []).map((t) => ({
+      id: t.remote_addr || t.type,
+      tunnel_type: t.type || 'tcp',
+      local_addr: t.local_addr,
+      remote_addr: t.remote_addr,
+      latency_ms: t.latency_ms,
+      loss_pct: t.loss_pct,
+      rx_bytes: t.rx_bytes,
+      tx_bytes: t.tx_bytes,
+      rx_bps: 0,
+      tx_bps: 0,
+    }))
+    const { rx, tx } = computeTunnelBps(`${key}:${e.network_name || ''}`, tunnels, now, dt)
+    const lat = tunnels.map((t) => t.latency_ms).filter((v) => v != null)
+    const loss = tunnels.length ? tunnels.reduce((sum, t) => sum + (t.loss_pct || 0), 0) / tunnels.length : null
+    const sample = { ts: now, latency_ms: lat.length ? Math.min(...lat) : null, loss_pct: loss, bandwidth_bps: rx + tx }
+    const arr = edgeSamples[key] || (edgeSamples[key] = [])
+    arr.push(sample)
+    if (arr.length > 60) arr.shift()
+    metrics[key] = {
+      latency_ms: sample.latency_ms,
+      loss_pct: loss,
+      tunnels,
+      rx_bps: rx,
+      tx_bps: tx,
+      samples: arr.slice(),
+      network_name: e.network_name || '',
+    }
+  }
+  lastSampleTs = now
+}
+
+async function load(silent = false) {
   try {
     const board = await api.boardTopology()
     if (board && board.graph && (board.graph.nodes || []).length) {
-      graph = board.graph
-      metrics = {}
-      for (const e of graph.edges || []) {
-        const tunnels = (e.tunnels || []).map((t) => ({
-          id: t.remote_addr || t.type,
-          tunnel_type: t.type || 'tcp',
-          remote_addr: t.remote_addr,
-          latency_ms: t.latency_ms,
-          loss_pct: t.loss_pct,
-          rx_bps: 0,
-          tx_bps: 0,
-        }))
-        const lat = tunnels.map((t) => t.latency_ms).filter((v) => v != null)
-        metrics[keyOf(e.a, e.b)] = {
-          latency_ms: lat.length ? Math.min(...lat) : null,
-          loss_pct: tunnels.length ? tunnels.reduce((s, t) => s + (t.loss_pct || 0), 0) / tunnels.length : null,
-          tunnels,
-          rx_bps: 0,
-          tx_bps: 0,
+      const wasEmpty = !(graph.nodes || []).length
+      ingestBoard(board)
+      if (!silent || wasEmpty) computeLayout()
+      apply()
+      if (selected.value && selected.value.kind === 'edge') {
+        const m = metrics[keyOf(selected.value.a, selected.value.b)]
+        if (m) {
+          selected.value = { ...selected.value, ...m }
+          if (historyRange.value === 'live') syncLive()
         }
       }
-      computeLayout()
-      apply()
       return
     }
   } catch {}
-  const data = await api.topology()
-  graph = data.graph || { nodes: [], edges: [] }
-  metrics = {}
-  for (const m of data.metrics || []) metrics[keyOf(m.a_peer_id, m.b_peer_id)] = m
-  computeLayout()
-  apply()
+  if (silent) return
+  try {
+    const data = await api.topology()
+    graph = data.graph || { nodes: [], edges: [] }
+    metrics = {}
+    for (const m of data.metrics || []) metrics[keyOf(m.a_peer_id, m.b_peer_id)] = m
+    computeLayout()
+    apply()
+  } catch {}
+}
+
+function stopPolling() {
+  if (pollTimer) clearInterval(pollTimer)
+  pollTimer = null
+}
+
+function startPolling() {
+  if (pollTimer) return
+  pollTimer = setInterval(() => load(true), 2000)
+}
+
+function connectBoardEvents() {
+  if (eventSource) return
+  if (typeof EventSource === 'undefined') {
+    startPolling()
+    return
+  }
+  eventSource = new EventSource('/api/board/events')
+  eventSource.addEventListener('topology', (ev) => {
+    try {
+      stopPolling()
+      const data = JSON.parse(ev.data)
+      if (!data.graph || !(data.graph.nodes || []).length) return
+      const wasEmpty = !(graph.nodes || []).length
+      ingestBoard({ graph: data.graph })
+      if (wasEmpty) computeLayout()
+      apply()
+      if (selected.value && selected.value.kind === 'edge') {
+        const m = metrics[keyOf(selected.value.a, selected.value.b)]
+        if (m) {
+          selected.value = { ...selected.value, ...m }
+          if (historyRange.value === 'live') syncLive()
+        }
+      }
+    } catch {}
+  })
+  eventSource.onopen = () => stopPolling()
+  eventSource.onerror = () => {
+    startPolling()
+    eventSource?.close()
+    eventSource = null
+    if (sseRetry) clearTimeout(sseRetry)
+    sseRetry = setTimeout(connectBoardEvents, 5000)
+  }
 }
 
 function resize() {
@@ -769,30 +1088,76 @@ onMounted(async () => {
   width = chartEl.value.clientWidth || width
   height = chartEl.value.clientHeight || height
   chart = echarts.init(chartEl.value)
+  const seriesOf = (params) => params.seriesId || (params.seriesIndex === 0 ? 'edges' : params.seriesIndex === 1 ? 'nodes' : null)
   chart.on('click', (params) => {
-    if (params.seriesId === 'edges') openEdge(params.data)
-    else if (params.seriesId === 'nodes') openNode(params.data)
+    const series = seriesOf(params)
+    if (series === 'edges') openEdge(params.data)
+    else if (series === 'nodes') openNode(params.data)
   })
+
+  chartEl.value.addEventListener('mousemove', (e) => {
+    const rect = chartEl.value.getBoundingClientRect()
+    showHoverAt(e.clientX - rect.left, e.clientY - rect.top)
+  })
+  chartEl.value.addEventListener('mouseleave', () => { hover.value.visible = false })
   setupDrag()
   const ro = new ResizeObserver(() => resize())
   ro.observe(chartEl.value)
   resizeObserver = ro
   await load()
-  connectWs()
+  connectBoardEvents()
+  flowTimer = setInterval(() => {
+    flowOffset = (flowOffset + 1.5) % 14
+    if (chart) chart.setOption(buildOption(), true)
+  }, 200)
   window.addEventListener('resize', resize)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resize)
   if (resizeObserver) resizeObserver.disconnect()
+  if (eventSource) eventSource.close()
+  if (sseRetry) clearTimeout(sseRetry)
+  stopPolling()
+  if (flowTimer) clearInterval(flowTimer)
   if (ws) ws.close()
   if (chart) chart.dispose()
 })
 </script>
 
 <style scoped>
-.tunnel-row { padding: 10px 0; border-bottom: 1px dashed var(--dok-border); }
-.tunnel-row:last-child { border-bottom: 0; }
+.range-toggle {
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.14);
+  border-radius: 8px;
+  overflow: hidden;
+  background: transparent;
+}
+.range-toggle :deep(.v-btn) {
+  min-width: 46px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: rgba(var(--v-theme-on-surface), 0.62);
+  border-radius: 0 !important;
+}
+.range-toggle :deep(.v-btn.v-btn--active) {
+  background: rgba(var(--v-theme-primary), 0.1) !important;
+  color: rgb(var(--v-theme-primary)) !important;
+}
+.range-toggle :deep(.v-divider) { display: none; }
+.hist-wrap { position: relative; width: 100%; height: 180px; }
+.hist-pointer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(var(--v-theme-on-surface), 0.22);
+  pointer-events: none;
+}
+.tunnel-row { padding: 8px 0; }
+.tunnel-row + .tunnel-row { border-top: 1px dashed var(--dok-border); }
 .tunnel-row__top { display: flex; align-items: center; gap: 8px; }
 .tunnel-row__type {
   flex: 0 0 auto; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
@@ -804,7 +1169,7 @@ onBeforeUnmount(() => {
 </style>
 
 <style scoped>
-.topology-page { height: calc(100vh - 102px); display: flex; flex-direction: column; }
+.topology-page { height: calc(100dvh - 40px - 6px - 16px); min-height: 560px; display: flex; flex-direction: column; }
 .topology-card { flex: 1 1 auto; min-height: 0; overflow: hidden; }
 .topology-chart { width: 100%; height: 100%; }
 .node-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }

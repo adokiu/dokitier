@@ -3,13 +3,6 @@
     <v-btn v-if="smAndDown" class="header-menu-btn ml-2" icon variant="text" @click="$emit('toggle-drawer')">
       <Menu :size="20" />
     </v-btn>
-    <div class="app-header-context">
-      <div class="appbar-title">
-        <span class="appbar-title__crumb">dokitier</span>
-        <ChevronRight :size="13" class="appbar-title__chevron" />
-        <strong>{{ pageTitle }}</strong>
-      </div>
-    </div>
     <v-spacer />
     <div class="header-actions">
       <v-btn size="small" variant="text" @click="toggleLang">{{ locale === 'zh' ? 'EN' : '中' }}</v-btn>
@@ -39,20 +32,18 @@
 
 <script setup>
 import { computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRouter } from 'vue-router'
 import { useTheme } from 'vuetify'
 import { useI18n } from 'vue-i18n'
-import { ChevronDown, ChevronRight, Menu, Moon, Sun } from '@lucide/vue'
+import { ChevronDown, Menu, Moon, Sun } from '@lucide/vue'
 import { setLocale } from '@/i18n'
 import { api } from '@/api'
 
 defineEmits(['toggle-drawer'])
-const route = useRoute()
 const router = useRouter()
 const theme = useTheme()
 const { t, locale } = useI18n()
 const isDark = computed(() => theme.global.current.value.dark)
-const pageTitle = computed(() => (route.meta.titleKey ? t(route.meta.titleKey) : route.meta.title) || '')
 const smAndDown = computed(() => window.innerWidth < 960)
 
 function toggleLang() { setLocale(locale.value === 'zh' ? 'en' : 'zh') }

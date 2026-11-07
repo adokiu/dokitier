@@ -21,6 +21,7 @@ serde_json.workspace = true
 sha2.workspace = true
 dokitier-controller = { version = "2.7.0", path = "../controller" }
 reqwest = { workspace = true, features = ["rustls", "json"] }
+futures = { workspace = true, features = ["std"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "any", "sqlite", "postgres", "mysql", "tls-rustls"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 tower-http = { workspace = true, features = ["fs", "trace"] }

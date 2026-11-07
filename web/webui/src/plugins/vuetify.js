@@ -12,9 +12,8 @@ export default createVuetify({
   },
   defaults: {
     VCard: { rounded: 'lg' },
-    VBtn: { rounded: 'lg' },
-    VTextField: { rounded: 'lg', variant: 'outlined', density: 'comfortable' },
-    VSelect: { rounded: 'lg', variant: 'outlined', density: 'comfortable' },
-    VSnackbar: { rounded: 'lg', elevation: 6 },
+    VSnackbar: { elevation: 6, rounded: 'lg' },
+    VTextField: { rounded: 'lg' },
+    VTooltip: { location: 'top' },
   },
 })

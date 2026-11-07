@@ -1,12 +1,13 @@
-use std::{path::PathBuf, sync::atomic::{AtomicBool, Ordering}, time::{SystemTime, UNIX_EPOCH}};
+use std::{convert::Infallible, path::PathBuf, sync::atomic::{AtomicBool, Ordering}, time::{SystemTime, UNIX_EPOCH}};
 
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
-    response::IntoResponse,
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
     routing::get,
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use futures::Stream;
 use dokitier_controller::{hash_token, proof, read_frame, write_frame, AgentFrame, ConsoleFrame, SessionCipher};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -641,7 +642,7 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
     }
 }
 
-async fn board_topology(State(state): State<AppState>) -> Json<Value> {
+async fn topology_payload(state: &AppState) -> Value {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
         .fetch_all(&state.db)
         .await
@@ -675,7 +676,21 @@ async fn board_topology(State(state): State<AppState>) -> Json<Value> {
             }
         }
     }
-    Json(json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges.values().cloned().collect::<Vec<_>>()}}))
+    json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges.values().cloned().collect::<Vec<_>>()}})
+}
+
+async fn board_topology(State(state): State<AppState>) -> Json<Value> {
+    Json(topology_payload(&state).await)
+}
+
+async fn board_events(State(state): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = futures::stream::unfold(state, |state| async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let payload = topology_payload(&state).await;
+        let data = json!({"type": "topology", "graph": payload.get("graph").cloned().unwrap_or(Value::Null)}).to_string();
+        Some((Ok(Event::default().event("topology").data(data)), state))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 #[derive(serde::Deserialize)]
@@ -691,8 +706,10 @@ fn default_range() -> String { "24h".to_string() }
 
 async fn board_history(State(state): State<AppState>, axum::extract::Query(query): axum::extract::Query<HistoryQuery>) -> Json<Value> {
     let (step, since) = match query.range.as_str() {
+        "60s" => (1, now() - 60),
         "1h" => (300, now() - 3600),
         "7d" => (3600, now() - 7 * 24 * 3600),
+        "30d" => (7200, now() - 30 * 24 * 3600),
         _ => (600, now() - 24 * 3600),
     };
     let rows: Result<Vec<(i64, Option<f64>, Option<f64>)>, sqlx::Error> = sqlx::query_as(&q(
@@ -996,6 +1013,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/overview", get(overview))
         .route("/api/board/overview", get(board_overview))
         .route("/api/board/topology", get(board_topology))
+        .route("/api/board/events", get(board_events))
         .route("/api/board/links", get(board_links))
         .route("/api/board/routes", get(board_routes))
         .route("/api/board/history", get(board_history))

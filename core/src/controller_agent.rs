@@ -62,6 +62,7 @@ async fn snapshot(manager: &NativeInstanceManager, public_ipv4: Option<&str>, pu
                 json!({
                     "type": conn.tunnel.as_ref().map(|t| t.tunnel_type.clone()).unwrap_or_default(),
                     "remote_addr": conn.tunnel.as_ref().and_then(|t| t.remote_addr.as_ref()).map(|u| u.to_string()),
+                    "local_addr": conn.tunnel.as_ref().and_then(|t| t.local_addr.as_ref()).map(|u| u.to_string()),
                     "latency_ms": (stats.latency_us > 0).then(|| stats.latency_us as f64 / 1000.0),
                     "loss_pct": conn.loss_rate as f64 * 100.0,
                     "rx_bytes": stats.rx_bytes,

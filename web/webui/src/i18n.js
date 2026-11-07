@@ -10,11 +10,11 @@ const messages = {
     settings: { title: '设置' },
     nav: {
       dashboard: '仪表盘', topology: '拓扑', nodes: '节点', links: '链路',
-      routes: '路由', history: '历史指标', settings: '设置', system: '系统',
+      routes: '路由', history: '历史指标', settings: '系统设置', system: '系统',
     },
     login: {
-      title: '登录 dokitier', subtitle: '节点控制台，请输入管理员账号',
-      username: '管理员用户名', password: '密码', submit: '登录',
+      title: 'DokiTier Console', subtitle: '欢迎使用',
+      username: '用户名', password: '密码', submit: '登录', hint: '如果这是首次登录，请在日志中查看默认密码。',
       missing: '请输入用户名和密码', wrong: '用户名或密码错误',
     },
     nodes: {
@@ -36,11 +36,11 @@ const messages = {
     settings: { title: 'Settings' },
     nav: {
       dashboard: 'Dashboard', topology: 'Topology', nodes: 'Nodes', links: 'Links',
-      routes: 'Routes', history: 'History', settings: 'Settings', system: 'System',
+      routes: 'Routes', history: 'History', settings: 'System settings', system: 'System',
     },
     login: {
-      title: 'Sign in to dokitier', subtitle: 'Node console. Use the admin account.',
-      username: 'Username', password: 'Password', submit: 'Sign in',
+      title: 'DokiTier Console', subtitle: 'Welcome',
+      username: 'Username', password: 'Password', submit: 'Login', hint: 'If this is your first login, check the logs for the default password.',
       missing: 'Enter username and password', wrong: 'Invalid username or password',
     },
     nodes: {

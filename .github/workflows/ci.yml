@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: web build
+        working-directory: web/webui
+        run: npm ci && npm run build
+      - name: rust build
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          cargo build --release -p dokitier-console -p dokitier
+
+  integration-10-core:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: run 10 core container test
+        run: ./ci/run-10-core.sh

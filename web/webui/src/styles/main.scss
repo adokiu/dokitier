@@ -1,13 +1,7 @@
 @use 'vuetify/styles';
 @import '@mdi/font/css/materialdesignicons.css';
 
-@font-face {
-  font-family: 'Outfit';
-  src: url('../assets/fonts/outfit-latin.woff2') format('woff2');
-  font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
-}
+
 
 :root {
   --dok-font-cjk: 'Noto Sans CJK SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC';
@@ -20,6 +14,7 @@
 }
 
 * { box-sizing: border-box; }
+a { color: inherit; text-decoration: none; }
 html, body, #app { min-height: 100%; }
 body {
   margin: 0;
@@ -146,10 +141,6 @@ body {
   .admin-main { grid-column: 1; grid-row: 2; }
 }
 
-/* spacing */
-.page-content > .v-card + .v-card { margin-top: 16px; }
-.v-card-title { padding-bottom: 10px; }
-.v-row { row-gap: 16px; }
 
 /* ---------- login (AstrBot) ---------- */
 .login-page {
@@ -254,3 +245,77 @@ body {
 .admin-shell.is-rail .admin-nav { padding-top: 4px !important; }
 .admin-chrome__context { margin-left: 0; }
 .admin-main { border-top-left-radius: 0; }
+
+
+
+/* ---------- AstrBot global settings ---------- */
+html { font-size: 16px; }
+body {
+  font-family: 'Outfit', 'Noto Sans', 'Noto Sans CJK SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+}
+.v-application { font-family: inherit; }
+
+h1, .text-h1 { font-size: 2.125rem; font-weight: 700; line-height: 3.5rem; }
+h2, .text-h2 { font-size: 1.5rem; font-weight: 700; line-height: 2.5rem; }
+h3, .text-h3 { font-size: 1.25rem; font-weight: 600; line-height: 2rem; }
+h4, .text-h4 { font-size: 1rem; font-weight: 600; line-height: 1.5rem; }
+h5, .text-h5 { font-size: .875rem; font-weight: 500; line-height: 1.2rem; }
+h6, .text-h6 { font-size: .75rem; font-weight: 500; }
+
+.v-btn {
+  text-transform: capitalize;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+.v-btn--icon.v-btn--density-default {
+  width: calc(var(--v-btn-height) + 6px);
+  height: calc(var(--v-btn-height) + 6px);
+}
+
+.v-card {
+  width: 100%;
+  overflow: visible;
+  border-radius: 16px !important;
+}
+.v-card--variant-outlined { border-color: rgba(var(--v-theme-borderLight), .36); }
+.v-card-text { padding: 16px; }
+.v-card-item { padding: 16px; }
+
+.v-field--variant-outlined .v-field__outline__start { border-radius: 8px 0 0 8px; }
+.v-field--variant-outlined .v-field__outline__end { border-radius: 0 8px 8px 0; }
+.v-label { font-size: .975rem; }
+.v-text-field input { font-size: .8rem; }
+.v-switch .v-label, .v-checkbox .v-label { opacity: 1; }
+
+.v-divider { opacity: 1; border-color: rgba(var(--v-theme-borderLight), .36); }
+
+.v-snackbar__wrapper {
+  min-height: 52px;
+  border-radius: 8px !important;
+  box-shadow: 0 10px 24px rgba(16, 24, 40, .16) !important;
+}
+.v-snackbar__content { padding: 14px 18px; line-height: 1.35; font-weight: 600; }
+.v-snackbar__actions { margin-inline-end: 6px; }
+.theme-tab.v-tabs .v-tab { border-radius: 8px !important; min-width: auto !important; }
+.theme-tab.v-tabs .v-tab.v-slide-group-item--active { background: rgb(var(--v-theme-primary)); }
+
+/* login card must not inherit global .v-card { width: 100% } */
+.login-page .login-card {
+  width: 400px !important;
+  max-width: 100% !important;
+}
+
+/* no document scrollbar: only .page-content scrolls */
+html, body { height: 100%; overflow: hidden; }
+
+/* AstrBot rounded outlined fields */
+.v-text-field .v-field,
+.v-select .v-field { border-radius: 8px; }
+.v-text-field.v-text-field--outlined .v-field__outline__start { border-radius: 8px 0 0 8px; }
+.v-text-field.v-text-field--outlined .v-field__outline__end { border-radius: 0 8px 8px 0; }
+
+/* dim input outlines in dark mode */
+.v-theme--PurpleThemeDark .v-field__outline { color: rgba(255, 255, 255, 0.16); }
+.v-theme--PurpleThemeDark .v-field--focused .v-field__outline { color: rgb(var(--v-theme-primary)); }
+.v-theme--PurpleThemeDark .v-field__outline__start,
+.v-theme--PurpleThemeDark .v-field__outline__end { border-color: rgba(255, 255, 255, 0.16); }
