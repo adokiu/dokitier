@@ -6,6 +6,7 @@
           <div class="login-card__logo">
             <v-icon icon="mdi-lan-connect" size="64" color="primary" />
           </div>
+          <v-btn size="small" variant="text" @click="setLocale(locale === 'zh' ? 'en' : 'zh')">{{ locale === 'zh' ? 'EN' : '中' }}</v-btn>
           <v-btn icon variant="text" size="small" @click="toggleTheme">
             <Sun v-if="isDark" :size="18" />
             <Moon v-else :size="18" />
@@ -66,6 +67,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useTheme } from 'vuetify'
 import { useI18n } from 'vue-i18n'
+import { setLocale } from '@/i18n'
 import { Moon, Sun } from '@lucide/vue'
 import { api } from '@/api'
 
@@ -77,13 +79,14 @@ const visible = ref(false)
 const showPassword = ref(false)
 const router = useRouter()
 const theme = useTheme()
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const isDark = computed(() => theme.global.current.value.dark)
 
 onMounted(() => setTimeout(() => { visible.value = true }, 80))
 
 function toggleTheme() {
   theme.global.name.value = isDark.value ? 'PurpleTheme' : 'PurpleThemeDark'
+  localStorage.setItem('dokitier_theme', theme.global.name.value)
 }
 
 async function submit() {

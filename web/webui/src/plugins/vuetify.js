@@ -7,7 +7,7 @@ export default createVuetify({
   components,
   directives,
   theme: {
-    defaultTheme: 'PurpleTheme',
+    defaultTheme: localStorage.getItem('dokitier_theme') || 'PurpleTheme',
     themes: { PurpleTheme, PurpleThemeDark },
   },
   defaults: {

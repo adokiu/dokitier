@@ -2,7 +2,12 @@ import { createI18n } from 'vue-i18n'
 
 const messages = {
   zh: {
-    common: { refresh: '刷新', save: '保存', cancel: '取消', close: '关闭' },
+    common: { refresh: '刷新', save: '保存', cancel: '取消', close: '关闭', edit: '编辑', all: '全部', none: '暂无数据' },
+    dashboard: { networks: '网络', routingWeights: '路由权重', nodesUnit: '{n} 节点', empty: '暂无网络', console: '控制台', online: '在线', nodeDistribution: '节点分布', viewAll: '查看全部' },
+    links: { title: '链路', columns: { link: '链路', protocol: '协议', latency: '延迟', loss: '丢包', rx: '接收', tx: '发送', bandwidth: '带宽', actions: '操作' }, localOnly: '通过节点配置修改' },
+    routes: { title: '路由', static: '静态路由', ospf: 'OSPF 路由', add: '新增静态路由', dest: '目标网段', nextHop: '下一跳', metric: 'Metric', note: '备注', enabled: '启用', disabled: '停用', actions: '操作' },
+    history: { title: '历史指标', selectLink: '选择链路', latencyLoss: '延迟 / 丢包', bandwidth: '带宽使用', range24h: '24 小时', range7d: '7 天' },
+    settings: { title: '设置' },
     nav: {
       dashboard: '仪表盘', topology: '拓扑', nodes: '节点', links: '链路',
       routes: '路由', history: '历史指标', settings: '设置', system: '系统',
@@ -23,7 +28,12 @@ const messages = {
     },
   },
   en: {
-    common: { refresh: 'Refresh', save: 'Save', cancel: 'Cancel', close: 'Close' },
+    common: { refresh: 'Refresh', save: 'Save', cancel: 'Cancel', close: 'Close', edit: 'Edit', all: 'All', none: 'No data' },
+    dashboard: { networks: 'Networks', routingWeights: 'Routing weights', nodesUnit: '{n} nodes', empty: 'No networks', console: 'Console', online: 'Online', nodeDistribution: 'Nodes', viewAll: 'View all' },
+    links: { title: 'Links', columns: { link: 'Link', protocol: 'Protocol', latency: 'Latency', loss: 'Loss', rx: 'RX', tx: 'TX', bandwidth: 'Bandwidth', actions: 'Actions' }, localOnly: 'Edit via node config' },
+    routes: { title: 'Routes', static: 'Static routes', ospf: 'OSPF routes', add: 'Add static route', dest: 'Destination CIDR', nextHop: 'Next hop', metric: 'Metric', note: 'Note', enabled: 'Enabled', disabled: 'Disabled', actions: 'Actions' },
+    history: { title: 'History', selectLink: 'Select link', latencyLoss: 'Latency / loss', bandwidth: 'Bandwidth', range24h: '24 hours', range7d: '7 days' },
+    settings: { title: 'Settings' },
     nav: {
       dashboard: 'Dashboard', topology: 'Topology', nodes: 'Nodes', links: 'Links',
       routes: 'Routes', history: 'History', settings: 'Settings', system: 'System',

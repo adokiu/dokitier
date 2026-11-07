@@ -158,6 +158,7 @@ function toggleLang() {
 
 function toggleTheme() {
   theme.global.name.value = isDark.value ? 'PurpleTheme' : 'PurpleThemeDark'
+  localStorage.setItem('dokitier_theme', theme.global.name.value)
 }
 
 async function logout() {

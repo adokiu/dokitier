@@ -35,7 +35,12 @@ body {
 }
 .v-application .text-body-1, .v-application .text-body-2, .v-application .text-caption { font-family: inherit !important; }
 .v-btn { text-transform: none !important; letter-spacing: 0 !important; font-weight: 400; }
-.v-card { border-radius: 16px !important; box-shadow: none !important; background: rgb(var(--v-theme-surface)); }
+.v-card {
+  border-radius: 16px !important;
+  box-shadow: none !important;
+  background: rgb(var(--v-theme-surface));
+  border: 1px solid rgba(var(--v-theme-borderLight), .28);
+}
 .v-field { font-size: .875rem; }
 .v-text-field input { font-size: .8rem; }
 .v-label { font-size: .975rem; }
