@@ -409,6 +409,16 @@ impl std::fmt::Debug for ManagedCredentialConfig {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[cfg_attr(feature = "config-write", derive(Serialize))]
+struct ControllerToml {
+    url: Option<String>,
+    node_id: Option<String>,
+    token: Option<String>,
+    #[serde(default)]
+    interval_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[cfg_attr(feature = "config-write", derive(Serialize))]
 struct WebConsoleToml {
     enabled: Option<bool>,
     listen: Option<String>,
@@ -482,6 +492,7 @@ struct Config {
     source: Option<ConfigSourceConfig>,
 
     web_console: Option<WebConsoleToml>,
+    controller: Option<ControllerToml>,
     routing: Option<RoutingToml>,
 }
 
@@ -538,6 +549,19 @@ impl Default for TomlConfig {
 impl TomlConfig {
     pub fn get_p2p_group(&self) -> Option<String> {
         self.config.lock().unwrap().p2p_group.clone()
+    }
+
+    /// Standalone console/agent settings.
+    pub fn controller_settings(&self) -> Option<crate::config::ControllerSettings> {
+        let config = self.config.lock().unwrap();
+        let controller = config.controller.as_ref()?;
+        let url = controller.url.clone()?;
+        Some(crate::config::ControllerSettings {
+            url,
+            node_id: controller.node_id.clone().unwrap_or_default(),
+            token: controller.token.clone().unwrap_or_default(),
+            interval_secs: controller.interval_secs.unwrap_or(2).max(1),
+        })
     }
 
     /// Web console settings. Missing section keeps the console disabled.

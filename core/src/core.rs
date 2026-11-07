@@ -1328,6 +1328,7 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
         dokitier_core::config::WebConsoleSettings,
         dokitier_core::config::RoutingWeights,
     )> = None;
+    let mut controller_settings: Option<dokitier_core::config::ControllerSettings> = None;
     #[cfg(feature = "web-console")]
     let mut web_config_path: Option<std::path::PathBuf> = None;
     let mut toml_routing: Option<dokitier_core::config::RoutingWeights> = None;
@@ -1349,6 +1350,9 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
         )
         .await?;
 
+        if controller_settings.is_none() {
+            controller_settings = cfg.controller_settings();
+        }
         if let Some(group) = cfg.get_p2p_group() {
             dokitier_core::peers::p2p_group::set_group(Some(group));
         }
@@ -1421,6 +1425,9 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
             // Console disabled: still honor [routing] weights for OSPF costs.
             dokitier_core::peers::link_policy::set_routing_weights(routing);
             log::info!("web console disabled (web_console.enabled = false)");
+        }
+        if let Some(settings) = controller_settings.take() {
+            crate::controller_agent::spawn(manager.clone(), settings);
         }
         if let Some((settings, routing)) = web_settings {
             if let Err(err) = crate::web_console::maybe_start(settings, routing, manager.clone(), web_config_path.clone()).await

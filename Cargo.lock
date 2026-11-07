@@ -1659,6 +1659,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "derive_builder",
  "derive_more",
+ "dokitier-controller",
  "dokitier-core",
  "dokitier-proto",
  "dokitier-web",

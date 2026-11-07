@@ -865,3 +865,12 @@ mod tests {
         assert_eq!(IpPrefix::try_from(pb).unwrap(), prefix);
     }
 }
+
+/// Connection settings for the standalone dokitier console (core acts as an agent).
+#[derive(Debug, Clone, Default)]
+pub struct ControllerSettings {
+    pub url: String,
+    pub node_id: String,
+    pub token: String,
+    pub interval_secs: u64,
+}

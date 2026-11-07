@@ -24,6 +24,7 @@ pub mod socket_protector;
 pub mod tunnel;
 pub mod utils;
 #[cfg(feature = "web-client")]
+pub mod controller_agent;
 pub mod web_client;
 
 #[cfg(feature = "web-console")]
