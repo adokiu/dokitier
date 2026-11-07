@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{path::PathBuf, sync::atomic::{AtomicBool, Ordering}, time::{SystemTime, UNIX_EPOCH}};
 
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
@@ -11,22 +11,70 @@ use dokitier_controller::{hash_token, read_frame, write_frame, AgentFrame};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{any::AnyPoolOptions, AnyPool};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
 struct AppState {
-    db: SqlitePool,
+    db: AnyPool,
+    postgres: bool,
     webui: PathBuf,
     agents: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<Value>>>,
     pending: std::sync::Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<Value>>>,
 }
 
+static POSTGRES: AtomicBool = AtomicBool::new(false);
+static MYSQL: AtomicBool = AtomicBool::new(false);
+
+fn is_mysql() -> bool { MYSQL.load(Ordering::Relaxed) }
+
+fn q(sql: &str) -> String {
+    sql_for(POSTGRES.load(Ordering::Relaxed), sql)
+}
+
+fn database_url(input: &str) -> String {
+    if input.contains("://") {
+        input.to_string()
+    } else {
+        format!("sqlite://{input}?mode=rwc")
+    }
+}
+
+/// PostgreSQL uses $1 placeholders, SQLite/MySQL use ?.
+fn sql_for(postgres: bool, sql: &str) -> String {
+    if !postgres {
+        return sql.to_string();
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut n = 0;
+    for ch in sql.chars() {
+        if ch == '?' {
+            n += 1;
+            out.push('$');
+            out.push_str(&n.to_string());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
 
-async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
-    sqlx::query(
+async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
+    let nodes_ddl = if is_mysql() {
+        "CREATE TABLE IF NOT EXISTS nodes (
+            node_id VARCHAR(128) PRIMARY KEY,
+            token_hash VARCHAR(128) NOT NULL,
+            hostname VARCHAR(255) NOT NULL DEFAULT '',
+            version VARCHAR(64) NOT NULL DEFAULT '',
+            networks LONGTEXT,
+            snapshot LONGTEXT,
+            last_seen BIGINT NOT NULL DEFAULT 0,
+            status VARCHAR(32) NOT NULL DEFAULT 'offline'
+        )"
+    } else {
         "CREATE TABLE IF NOT EXISTS nodes (
             node_id TEXT PRIMARY KEY,
             token_hash TEXT NOT NULL,
@@ -36,9 +84,28 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             snapshot TEXT NOT NULL DEFAULT 'null',
             last_seen INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'offline'
-        )",
-    ).execute(db).await?;
-    sqlx::query(
+        )"
+    };
+    sqlx::query(nodes_ddl).execute(db).await?;
+    let versions_ddl = if is_mysql() {
+        "CREATE TABLE IF NOT EXISTS config_versions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            node_id VARCHAR(128) NOT NULL,
+            network VARCHAR(255) NOT NULL,
+            hash VARCHAR(128) NOT NULL,
+            toml LONGTEXT NOT NULL,
+            created BIGINT NOT NULL
+        )"
+    } else if POSTGRES.load(Ordering::Relaxed) {
+        "CREATE TABLE IF NOT EXISTS config_versions (
+            id BIGSERIAL PRIMARY KEY,
+            node_id TEXT NOT NULL,
+            network TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            toml TEXT NOT NULL,
+            created BIGINT NOT NULL
+        )"
+    } else {
         "CREATE TABLE IF NOT EXISTS config_versions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_id TEXT NOT NULL,
@@ -46,31 +113,30 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             hash TEXT NOT NULL,
             toml TEXT NOT NULL,
             created INTEGER NOT NULL
-        )",
-    ).execute(db).await?;
+        )"
+    };
+    sqlx::query(versions_ddl).execute(db).await?;
     Ok(())
 }
 
-async fn verify_node(db: &SqlitePool, node_id: &str, token: &str) -> bool {
-    let row: Option<(String,)> = sqlx::query_as("SELECT token_hash FROM nodes WHERE node_id = ?")
+async fn verify_node(db: &AnyPool, node_id: &str, token: &str) -> bool {
+    let row: Option<(String,)> = sqlx::query_as(&q("SELECT token_hash FROM nodes WHERE node_id = ?"))
         .bind(node_id).fetch_optional(db).await.ok().flatten();
     row.is_some_and(|(hash,)| hash == hash_token(token))
 }
 
-async fn touch_node(db: &SqlitePool, node_id: &str, hostname: Option<&str>, version: Option<&str>,
+async fn touch_node(db: &AnyPool, node_id: &str, hostname: Option<&str>, version: Option<&str>,
                     networks: Option<&Value>, snapshot: Option<&Value>, status: &str) {
-    let _ = sqlx::query(
-        "UPDATE nodes SET last_seen = ?, status = ?,
+    let _ = sqlx::query(&q("UPDATE nodes SET last_seen = ?, status = ?,
             hostname = COALESCE(?, hostname), version = COALESCE(?, version),
             networks = COALESCE(?, networks), snapshot = COALESCE(?, snapshot)
-         WHERE node_id = ?",
-    ).bind(now()).bind(status).bind(hostname).bind(version)
+         WHERE node_id = ?")).bind(now()).bind(status).bind(hostname).bind(version)
      .bind(networks.map(|v| v.to_string())).bind(snapshot.map(|v| v.to_string()))
      .bind(node_id).execute(db).await;
 }
 
 async fn merge_snapshot(state: &AppState, node_id: &str, data: &Value) -> Value {
-    let existing: Option<(String,)> = sqlx::query_as("SELECT snapshot FROM nodes WHERE node_id = ?")
+    let existing: Option<(String,)> = sqlx::query_as(&q("SELECT snapshot FROM nodes WHERE node_id = ?"))
         .bind(node_id).fetch_optional(&state.db).await.ok().flatten();
     let mut merged_instances: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -199,9 +265,9 @@ async fn dispatch_result(state: &AppState, value: &Value) {
 struct NodeView { node_id: String, hostname: String, version: String, networks: Value, snapshot: Value, last_seen: i64, status: String }
 
 async fn list_nodes(State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String, String, String, String, i64, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, String, String, i64, String)> = sqlx::query_as(&q(
         "SELECT node_id, hostname, version, networks, snapshot, last_seen, status FROM nodes ORDER BY node_id",
-    ).fetch_all(&state.db).await.unwrap_or_default();
+    )).fetch_all(&state.db).await.unwrap_or_default();
     let nodes: Vec<NodeView> = rows.into_iter().map(|(node_id, hostname, version, networks, snapshot, last_seen, status)| NodeView {
         node_id, hostname, version,
         networks: serde_json::from_str(&networks).unwrap_or(Value::Null),
@@ -212,9 +278,9 @@ async fn list_nodes(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn get_node(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
-    let row: Option<(String, String, String, String, String, i64, String)> = sqlx::query_as(
+    let row: Option<(String, String, String, String, String, i64, String)> = sqlx::query_as(&q(
         "SELECT node_id, hostname, version, networks, snapshot, last_seen, status FROM nodes WHERE node_id = ?",
-    ).bind(&node_id).fetch_optional(&state.db).await.ok().flatten();
+    )).bind(&node_id).fetch_optional(&state.db).await.ok().flatten();
     match row {
         Some((node_id, hostname, version, networks, snapshot, last_seen, status)) => Json(json!({
             "node_id": node_id, "hostname": hostname, "version": version,
@@ -270,9 +336,9 @@ async fn post_command(
         Ok(Ok(value)) => {
             if value.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                 if let Some(toml) = apply_toml {
-                    let _ = sqlx::query(
+                    let _ = sqlx::query(&q(
                         "INSERT INTO config_versions (node_id, network, hash, toml, created) VALUES (?, ?, ?, ?, ?)",
-                    )
+                    ))
                     .bind(&node_id)
                     .bind(body.network.clone().unwrap_or_default())
                     .bind(hash_token(&toml))
@@ -331,7 +397,7 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
 }
 
 async fn overview(State(state): State<AppState>) -> Json<Value> {
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM nodes").fetch_one(&state.db).await.unwrap_or((0,));
+    let count: (i64,) = sqlx::query_as(&q("SELECT COUNT(*) FROM nodes")).fetch_one(&state.db).await.unwrap_or((0,));
     Json(json!({"instances": count.0, "nodes": count.0, "links": 0, "routing": {}}))
 }
 
@@ -342,9 +408,9 @@ async fn list_versions(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
 ) -> Json<Value> {
-    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(&q(
         "SELECT id, network, hash, created FROM config_versions WHERE node_id = ? ORDER BY id DESC LIMIT 50",
-    ).bind(&node_id).fetch_all(&state.db).await.unwrap_or_default();
+    )).bind(&node_id).fetch_all(&state.db).await.unwrap_or_default();
     Json(json!({"versions": rows.into_iter().map(|(id, network, hash, created)| json!({
         "id": id, "network": network, "hash": hash, "created": created,
     })).collect::<Vec<_>>()}))
@@ -372,15 +438,24 @@ async fn main() -> anyhow::Result<()> {
             other => { eprintln!("unknown argument: {other}"); std::process::exit(2); }
         }
     }
-    let db = SqlitePoolOptions::new().max_connections(5)
+    sqlx::any::install_default_drivers();
+    POSTGRES.store(db_path.starts_with("postgres://") || db_path.starts_with("postgresql://"), Ordering::Relaxed);
+    MYSQL.store(db_path.starts_with("mysql://"), Ordering::Relaxed);
+    let postgres = db_path.starts_with("postgres://") || db_path.starts_with("postgresql://");
+    let db = AnyPoolOptions::new().max_connections(5)
         .connect(&format!("sqlite://{db_path}?mode=rwc")).await?;
     init_db(&db).await?;
     for (node_id, token) in &add_nodes {
-        sqlx::query("INSERT INTO nodes (node_id, token_hash) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET token_hash = excluded.token_hash")
+        let upsert = if is_mysql() {
+            "INSERT INTO nodes (node_id, token_hash) VALUES (?, ?) ON DUPLICATE KEY UPDATE token_hash = VALUES(token_hash)"
+        } else {
+            "INSERT INTO nodes (node_id, token_hash) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET token_hash = excluded.token_hash"
+        };
+        sqlx::query(upsert)
             .bind(node_id).bind(hash_token(token)).execute(&db).await?;
         tracing::info!(%node_id, "registered node");
     }
-    let state = AppState { db, webui: PathBuf::from(webui),
+    let state = AppState { db, postgres, webui: PathBuf::from(webui),
         agents: std::sync::Arc::new(dashmap::DashMap::new()),
         pending: std::sync::Arc::new(dashmap::DashMap::new()) };
     let _ = rustls::crypto::ring::default_provider().install_default();

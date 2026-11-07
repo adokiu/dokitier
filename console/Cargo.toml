@@ -20,7 +20,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 dokitier-controller = { version = "2.7.0", path = "../dokitier-controller" }
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "any", "sqlite", "postgres", "mysql", "tls-rustls"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 tower-http = { workspace = true, features = ["fs", "trace"] }
 tracing.workspace = true
