@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use dokitier_controller::{transport::AgentTransport, ConsoleCommand, ConsoleFrame};
+use dokitier_controller::{transport::AgentTransport, ConsoleCommand, ConsoleFrame, SessionCipher};
 use serde_json::{json, Value};
 use tokio::{io::AsyncReadExt, net::TcpStream, time::interval};
 
@@ -195,6 +195,7 @@ async fn session(
         }
         other => anyhow::bail!("expected challenge_ok, got {other:?}"),
     }
+    let cipher = SessionCipher::new(&settings.token, &nonce, ts);
     tracing::info!(endpoint = %settings.url, node_id = %settings.node_id, "controller agent connected");
 
     let interval = Duration::from_secs(settings.interval_secs.max(1));
@@ -203,6 +204,11 @@ async fn session(
     loop {
         match tokio::time::timeout(interval, transport.recv()).await {
             Ok(Ok(value)) => {
+                let value = if value.get("type").and_then(|v| v.as_str()) == Some("enc") {
+                    cipher.decrypt(&value).unwrap_or(serde_json::Value::Null)
+                } else {
+                    value
+                };
                 if let Ok(frame) = serde_json::from_value::<ConsoleFrame>(value) {
                     if let ConsoleFrame::Command { request_id, command } = frame {
                         let (ok, error, config) = handle_command(manager, config_path.as_deref(), command).await;
@@ -214,7 +220,7 @@ async fn session(
                             "error": error,
                             "config": config,
                         });
-                        transport.send(&reply).await?;
+                        transport.send(&cipher.encrypt(&reply)).await?;
                     }
                 }
             }
@@ -235,6 +241,6 @@ async fn session(
             "node_id": settings.node_id,
             "data": snapshot(manager).await,
         });
-        transport.send(&snap).await?;
+        transport.send(&cipher.encrypt(&snap)).await?;
     }
 }

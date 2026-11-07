@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use dokitier_controller::{hash_token, proof, read_frame, write_frame, AgentFrame, ConsoleFrame};
+use dokitier_controller::{hash_token, proof, read_frame, write_frame, AgentFrame, ConsoleFrame, SessionCipher};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -300,6 +300,7 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
     let challenge = serde_json::json!({"type":"challenge","nonce":nonce,"ts":ts});
     send_json(&mut socket, challenge).await;
     let mut node_id: Option<String> = None;
+    let mut cipher: Option<SessionCipher> = None;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
     loop {
         tokio::select! {
@@ -314,6 +315,18 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
                     dispatch_result(&state, &value).await;
                 }
+                let mut text = text;
+                if let Some(c) = &cipher {
+                    if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+                        if value.get("type").and_then(|v| v.as_str()) == Some("enc") {
+                            value = c.decrypt(&value).unwrap_or(Value::Null);
+                            text = value.to_string();
+                        }
+                    }
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    dispatch_result(&state, &value).await;
+                }
                 let Ok(frame) = serde_json::from_str::<AgentFrame>(&text) else { continue };
                 if let AgentFrame::Hello { node_id: id, proof: client_proof, .. } = &frame {
                     let Some(token) = verify_proof(&state.db, id, &nonce, ts, client_proof).await else {
@@ -322,6 +335,7 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
                     };
                     let server_proof = proof(&token, "server", id, &nonce, ts);
                     send_json(&mut socket, json!({"type":"challenge_ok","proof":server_proof})).await;
+                    cipher = Some(SessionCipher::new(&token, &nonce, ts));
                     let network = frame_network(&frame).unwrap_or_else(|| "default".to_string());
                     let key = format!("{}:{}", id, network);
                     node_id = Some(id.clone());
@@ -333,7 +347,8 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
             }
             outbound = rx.recv() => {
                 let Some(value) = outbound else { break };
-                send_json(&mut socket, value).await;
+                let payload = match &cipher { Some(c) => c.encrypt(&value), None => value };
+                send_json(&mut socket, payload).await;
             }
         }
         // Dispatch command results to waiting HTTP handlers.
@@ -483,16 +498,21 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
             };
             let server_proof = proof(&token, "server", node_id, &nonce, ts);
             if write_frame(&mut send, &json!({"type":"challenge_ok","proof":server_proof})).await.is_err() { return; }
+            let cipher = SessionCipher::new(&token, &nonce, ts);
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
             let network = networks.first().and_then(|n| n.get("name")).and_then(|v| v.as_str()).unwrap_or("default");
             state.agents.insert(format!("{node_id}:{network}"), tx);
             touch_node(&state.db, node_id, Some(hostname), Some(version), Some(&Value::Array(networks.clone())), None, "online").await;
+            let writer_cipher = SessionCipher::new(&token, &nonce, ts);
             let writer = tokio::spawn(async move {
                 while let Some(value) = rx.recv().await {
-                    if write_frame(&mut send, &value).await.is_err() { break; }
+                    if write_frame(&mut send, &writer_cipher.encrypt(&value)).await.is_err() { break; }
                 }
             });
             while let Ok(value) = read_frame(&mut recv).await {
+                let value = if value.get("type").and_then(|v| v.as_str()) == Some("enc") {
+                    cipher.decrypt(&value).unwrap_or(Value::Null)
+                } else { value };
                 dispatch_result(&state, &value).await;
                 if let Ok(frame) = serde_json::from_value::<AgentFrame>(value) {
                     let _ = handle_agent_frame(&state, frame).await;
