@@ -120,28 +120,18 @@ async function save() {
 async function load() {
   loading.value = true
   try {
-    const topo = await api.topology()
-    names.value = Object.fromEntries(
-      (topo.graph?.nodes || []).map((n) => [n.peer_id, n.hostname || String(n.peer_id)]),
-    )
-    const data = await api.links()
-    rows.value = (data.links || []).map(({ metrics: m, config: c }) => ({
-      id: `${m.a_peer_id}:${m.b_peer_id}`,
-      a: m.a_peer_id,
-      b: m.b_peer_id,
-      tunnel_types: [...new Set(m.tunnel_types || [])],
-      latency_ms: m.latency_ms,
-      loss_pct: m.loss_pct,
-      rx_bps: m.rx_bps,
-      tx_bps: m.tx_bps,
-      bandwidth_mbps: c?.bandwidth_mbps ?? m.bandwidth_mbps,
-      latency_weight: c?.latency_weight,
-      loss_weight: c?.loss_weight,
-      bandwidth_weight: c?.bandwidth_weight,
-      disabled: c?.disabled,
-      note: c?.note,
-    }))
-  } finally { loading.value = false }
+    try {
+      const data = await api.boardLinks()
+      rows.value = (data.links || []).map((l) => ({ ...l, id: `${l.a}-${l.b}` }))
+      names.value = data.names || {}
+    } catch {
+      const data = await api.links()
+      rows.value = (data.links || []).map((l) => ({ ...l.metrics, id: `${l.metrics.a_peer_id}-${l.metrics.b_peer_id}` }))
+      names.value = Object.fromEntries((data.nodes || []).map((n) => [n.peer_id, n.hostname]))
+    }
+  } finally {
+    loading.value = false
+  }
 }
 
 onMounted(load)

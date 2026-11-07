@@ -429,6 +429,38 @@ async fn board_topology(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges}}))
 }
 
+async fn board_links(State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
+        .fetch_all(&state.db).await.unwrap_or_default();
+    let mut names: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+    let mut links = Vec::new();
+    for (_, snapshot) in &rows {
+        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
+        for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(topo) = inst.get("topology") else { continue };
+            for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
+                if let (Some(id), Some(host)) = (n.get("peer_id").and_then(|v| v.as_u64()), n.get("hostname").and_then(|v| v.as_str())) {
+                    names.entry(id as u32).or_insert_with(|| host.to_string());
+                }
+            }
+            for e in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
+                let tunnels = e.get("tunnels").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let latency = tunnels.iter().filter_map(|t| t.get("latency_ms").and_then(|v| v.as_f64())).reduce(f64::min);
+                let loss = tunnels.iter().filter_map(|t| t.get("loss_pct").and_then(|v| v.as_f64())).reduce(|a, b| a + b).map(|v| v / tunnels.len().max(1) as f64);
+                links.push(json!({
+                    "network": network,
+                    "a": e.get("a"), "b": e.get("b"),
+                    "tunnel_types": tunnels.iter().filter_map(|t| t.get("type").cloned()).collect::<Vec<_>>(),
+                    "latency_ms": latency, "loss_pct": loss,
+                    "rx_bps": 0, "tx_bps": 0, "bandwidth_mbps": null,
+                }));
+            }
+        }
+    }
+    Json(json!({"links": links, "names": names}))
+}
+
 async fn board_overview(State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT status, snapshot FROM nodes")
         .fetch_all(&state.db)
@@ -560,6 +592,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/overview", get(overview))
         .route("/api/board/overview", get(board_overview))
         .route("/api/board/topology", get(board_topology))
+        .route("/api/board/links", get(board_links))
         .route("/api/login", axum::routing::post(login))
         .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))

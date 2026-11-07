@@ -33,6 +33,7 @@ export const api = {
   getConfig: () => request('/api/config'),
   boardOverview: () => request('/api/board/overview'),
   boardTopology: () => request('/api/board/topology'),
+  boardLinks: () => request('/api/board/links'),
   boardNodes: () => request('/api/board/nodes'),
   boardNode: (id) => request('/api/board/nodes/' + id),
   boardCommand: (id, command, network) => request('/api/board/nodes/' + id + '/command', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(network ? { command, network } : { command }) }),
