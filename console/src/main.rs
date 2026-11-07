@@ -429,6 +429,31 @@ async fn board_topology(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"graph": {"nodes": nodes.values().cloned().collect::<Vec<_>>(), "edges": edges}}))
 }
 
+async fn board_routes(State(state): State<AppState>) -> Json<Value> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
+        .fetch_all(&state.db).await.unwrap_or_default();
+    let mut routes = Vec::new();
+    for (_, snapshot) in &rows {
+        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
+        for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(topo) = inst.get("topology") else { continue };
+            for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
+                if n.get("local").and_then(|v| v.as_bool()) == Some(true) { continue; }
+                routes.push(json!({
+                    "network": network,
+                    "peer_id": n.get("peer_id"),
+                    "hostname": n.get("hostname"),
+                    "ipv4": n.get("ipv4"),
+                    "next_hop_peer_id": n.get("next_hop_peer_id"),
+                    "cost": n.get("cost"),
+                }));
+            }
+        }
+    }
+    Json(json!({"routes": routes}))
+}
+
 async fn board_links(State(state): State<AppState>) -> Json<Value> {
     let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
         .fetch_all(&state.db).await.unwrap_or_default();
@@ -593,6 +618,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/overview", get(board_overview))
         .route("/api/board/topology", get(board_topology))
         .route("/api/board/links", get(board_links))
+        .route("/api/board/routes", get(board_routes))
         .route("/api/login", axum::routing::post(login))
         .route("/api/logout", axum::routing::post(logout))
         .route("/api/board/nodes", get(list_nodes))

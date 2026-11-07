@@ -3,11 +3,11 @@
     <div class="d-flex align-center mb-4">
       <div class="page-title">路由</div>
       <v-spacer />
-      <v-btn color="primary" size="small" prepend-icon="mdi-plus" @click="openAdd">新增静态路由</v-btn>
+      <v-btn v-if="!boardMode" color="primary" size="small" prepend-icon="mdi-plus" @click="openAdd">新增静态路由</v-btn>
     </div>
 
     <v-card class="pa-1">
-      <v-card-title>静态路由</v-card-title>
+      <v-card-title v-if="!boardMode">静态路由</v-card-title>
       <v-data-table :headers="staticHeaders" :items="staticRoutes" item-value="id" density="comfortable">
         <template #item.dest_cidr="{ item }"><span class="mono">{{ item.dest_cidr }}</span></template>
         <template #item.enabled="{ item }"><v-chip size="x-small" :color="item.enabled ? 'success' : 'default'">{{ item.enabled ? '启用' : '停用' }}</v-chip></template>
@@ -64,12 +64,23 @@ const ospfHeaders = [
   { title: 'IPv4', key: 'ipv4' },
 ]
 
+const boardMode = ref(false)
 const staticRoutes = ref([])
 const ospfRows = ref([])
 const dialog = ref(false)
 const form = ref({ dest_cidr: '', next_hop_peer_id: null, metric: 100, note: '' })
 
 async function load() {
+  try {
+    const board = await api.boardRoutes()
+    if (board && Array.isArray(board.routes) && board.routes.length) {
+      boardMode.value = true
+      staticRoutes.value = []
+      ospfRows.value = board.routes
+      return
+    }
+  } catch {}
+  boardMode.value = false
   const data = await api.routes()
   staticRoutes.value = data.static || []
   ospfRows.value = (data.ospf?.instances || []).flatMap((i) => i.routes || [])
