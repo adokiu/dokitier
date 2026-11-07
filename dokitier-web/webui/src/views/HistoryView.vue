@@ -139,6 +139,7 @@ onMounted(async () => {
       }))
       if (linkOptions.value.length) selected.value = linkOptions.value[0].value
       window.addEventListener('resize', resize)
+      await load()
       return
     }
   } catch {}
