@@ -73,6 +73,7 @@ impl AgentTransport {
             endpoint.set_default_client_config(client_config);
             let conn = endpoint.connect(addr, "localhost")?.await?;
             let (send, recv) = conn.open_bi().await?;
+            tracing::info!(%addr, "quic transport connected");
             return Ok(Self::Quic { send, recv });
         }
         if url.starts_with("ws://") || url.starts_with("wss://") {

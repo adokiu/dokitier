@@ -174,7 +174,9 @@ async fn session(
     .await
     .map_err(|_| anyhow::anyhow!("controller connect timeout"))??;
 
+    tracing::info!("waiting for controller challenge");
     let challenge = transport.recv().await?;
+    tracing::info!(?challenge, "controller challenge received");
     let (nonce, ts) = match serde_json::from_value::<ConsoleFrame>(challenge)? {
         ConsoleFrame::Challenge { nonce, ts } => (nonce, ts),
         other => anyhow::bail!("expected challenge, got {other:?}"),
