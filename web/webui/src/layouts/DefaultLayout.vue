@@ -139,7 +139,7 @@ const navItems = [
   { titleKey: 'nav.settings', icon: markRaw(Settings), to: '/settings' },
 ]
 
-const pageTitle = computed(() => route.meta.title || '控制台')
+const pageTitle = computed(() => (route.meta.titleKey ? t(route.meta.titleKey) : route.meta.title) || '控制台')
 const isRail = computed(() => rail.value && !smAndDown.value)
 const isDark = computed(() => theme.global.current.value.dark)
 

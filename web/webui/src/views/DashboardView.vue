@@ -1,7 +1,7 @@
 <template>
   <div>
     <div class="d-flex align-center mb-4">
-      <div class="page-title">概览</div>
+      <div class="page-title">' + t('nav.dashboard') + '</div>
       <v-spacer />
       <v-btn size="small" variant="text" prepend-icon="mdi-refresh" :loading="loading" @click="load">刷新</v-btn>
     </div>
@@ -60,7 +60,10 @@
 </template>
 
 <script setup>
+const { t } = useI18n()
+
 import { computed, onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { api } from '@/api'
 
 const overview = ref({})

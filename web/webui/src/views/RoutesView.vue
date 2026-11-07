@@ -1,7 +1,7 @@
 <template>
   <div>
     <div class="d-flex align-center mb-4">
-      <div class="page-title">路由</div>
+      <div class="page-title">' + t('nav.routes') + '</div>
       <v-spacer />
       <v-btn v-if="!boardMode" color="primary" size="small" prepend-icon="mdi-plus" @click="openAdd">新增静态路由</v-btn>
     </div>
@@ -44,7 +44,10 @@
 </template>
 
 <script setup>
+const { t } = useI18n()
+
 import { onMounted, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { api } from '@/api'
 
 const staticHeaders = [

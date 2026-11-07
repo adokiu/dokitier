@@ -1,7 +1,7 @@
 <template>
   <div class="topology-page">
     <div class="d-flex align-center mb-3">
-      <div class="page-title">全链路拓扑</div>
+      <div class="page-title">' + t('nav.topology') + '</div>
       <v-spacer />
       <v-chip size="small" variant="tonal" color="primary" class="mr-2">本机</v-chip>
       <v-chip size="small" variant="tonal" color="info" class="mr-3">远端</v-chip>
@@ -103,6 +103,8 @@
 </template>
 
 <script setup>
+const { t } = useI18n()
+
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { api } from '@/api'

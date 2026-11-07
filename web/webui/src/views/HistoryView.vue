@@ -1,7 +1,7 @@
 <template>
   <div>
     <div class="d-flex align-center mb-4 flex-wrap gap-3">
-      <div class="page-title">历史指标</div>
+      <div class="page-title">' + t('nav.history') + '</div>
       <v-spacer />
       <v-select v-model="selected" :items="linkOptions" item-title="label" item-value="value" density="compact" style="max-width: 360px" label="选择链路" />
       <v-btn-toggle v-model="range" mandatory density="compact" variant="outlined">
@@ -23,6 +23,8 @@
 </template>
 
 <script setup>
+const { t } = useI18n()
+
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { api } from '@/api'
