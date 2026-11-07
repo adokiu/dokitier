@@ -65,3 +65,12 @@ go.sum
 dokitier-web/webui/dist/
 dokitier-web/webui/node_modules/
 console/board.db*
+
+# build artifacts / caches
+/.npm-cache/
+/dokitier-web/webui/.npm-cache/
+/dist/
+*.log
+*.db
+*.db-shm
+*.db-wal
