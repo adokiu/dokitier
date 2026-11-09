@@ -26,6 +26,8 @@ use tower_http::services::ServeDir;
 
 /// The web UI is embedded into the console binary at build time, so a single
 /// `dokitier-console` executable is enough to deploy (no external dist dir).
+const INSTALL_SH: &str = include_str!("../../scripts/install.sh");
+
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../web/webui/dist"]
 struct WebAssets;
@@ -2657,16 +2659,146 @@ async fn nodes_payload_lite(state: &AppState) -> Value {
     full
 }
 
+
+#[derive(serde::Deserialize)]
+struct AddNodeBody {
+    node_id: String,
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+fn valid_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn random_token() -> String {
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect::<String>()
+        .to_lowercase()
+}
+
+async fn add_node(State(state): State<AppState>, Json(body): Json<AddNodeBody>) -> Json<Value> {
+    let node_id = body.node_id.trim().to_string();
+    if !valid_node_id(&node_id) {
+        return Json(json!({"ok": false, "error": "节点 ID 只能包含字母、数字、- _ .，长度 1-64"}));
+    }
+    let exists: Option<(String,)> = sqlx::query_as(&q("SELECT node_id FROM nodes WHERE node_id = ?"))
+        .bind(&node_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    if exists.is_some() {
+        return Json(json!({"ok": false, "error": "节点 ID 已存在"}));
+    }
+    let token = random_token();
+    let alias = body.alias.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let res = sqlx::query(&q(
+        "INSERT INTO nodes (node_id, token_hash, token, alias, status) VALUES (?, ?, ?, ?, 'offline')",
+    ))
+    .bind(&node_id)
+    .bind(hash_token(&token))
+    .bind(&token)
+    .bind(alias)
+    .execute(&state.db)
+    .await;
+    if res.is_err() {
+        return Json(json!({"ok": false, "error": "创建节点失败"}));
+    }
+    Json(json!({"ok": true, "node_id": node_id, "token": token}))
+}
+
+async fn get_node_token(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(&q("SELECT token FROM nodes WHERE node_id = ?"))
+        .bind(&node_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    match row.and_then(|(token,)| token) {
+        Some(token) => Json(json!({"ok": true, "node_id": node_id, "token": token})),
+        None => Json(json!({"ok": false, "error": "节点不存在或没有 token"})),
+    }
+}
+
+async fn rotate_node_token(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
+    let exists: Option<(String,)> = sqlx::query_as(&q("SELECT node_id FROM nodes WHERE node_id = ?"))
+        .bind(&node_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    if exists.is_none() {
+        return Json(json!({"ok": false, "error": "节点不存在"}));
+    }
+    let token = random_token();
+    let _ = sqlx::query(&q("UPDATE nodes SET token_hash = ?, token = ? WHERE node_id = ?"))
+        .bind(hash_token(&token))
+        .bind(&token)
+        .bind(&node_id)
+        .execute(&state.db)
+        .await;
+    Json(json!({"ok": true, "node_id": node_id, "token": token}))
+}
+
+async fn install_script() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        INSTALL_SH,
+    )
+}
+
 async fn list_nodes(State(state): State<AppState>) -> Json<Value> {
     Json(nodes_payload_lite(&state).await)
 }
 
 #[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum NumOrStr {
+    Num(f64),
+    Str(String),
+    Null,
+}
+
+impl NumOrStr {
+    fn as_text(&self) -> String {
+        match self {
+            NumOrStr::Num(v) => v.to_string(),
+            NumOrStr::Str(v) => v.clone(),
+            NumOrStr::Null => String::new(),
+        }
+    }
+
+    fn as_number(&self) -> Option<Result<f64, ()>> {
+        match self {
+            NumOrStr::Num(v) => Some(Ok(*v)),
+            NumOrStr::Str(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.parse::<f64>().map_err(|_| ()))
+                }
+            }
+            NumOrStr::Null => None,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
 struct NodeSettingsBody {
     alias: Option<String>,
-    country_code: Option<String>,
-    latitude: Option<String>,
-    longitude: Option<String>,
+    country_code: Option<NumOrStr>,
+    latitude: Option<NumOrStr>,
+    longitude: Option<NumOrStr>,
     bandwidth_mbps: Option<f32>,
     bandwidth_up_mbps: Option<f32>,
     bandwidth_down_mbps: Option<f32>,
@@ -2727,8 +2859,8 @@ async fn set_node_settings(
         let _ = sqlx::query(&q("UPDATE nodes SET alias = ? WHERE node_id = ?"))
             .bind(alias.trim()).bind(&node_id).execute(&state.db).await;
     }
-    if let Some(country) = body.country_code.as_deref() {
-        let code = country.trim().to_lowercase();
+    if let Some(country) = body.country_code.as_ref() {
+        let code = country.as_text().trim().to_lowercase();
         if code.is_empty() {
             spawn_node_geo_refresh(state.clone(), node_id.clone());
         } else if code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic()) {
@@ -2742,10 +2874,12 @@ async fn set_node_settings(
         }
     }
     if body.latitude.is_some() || body.longitude.is_some() {
-        let parse = |value: &Option<String>| -> Result<Option<f64>, ()> {
-            match value.as_deref().map(str::trim) {
-                None | Some("") => Ok(None),
-                Some(text) => text.parse::<f64>().map(Some).map_err(|_| ()),
+        let parse = |value: &Option<NumOrStr>| -> Result<Option<f64>, ()> {
+            let Some(value) = value else { return Ok(None) };
+            match value.as_number() {
+                None => Ok(None),
+                Some(Ok(v)) => Ok(Some(v)),
+                Some(Err(())) => Err(()),
             }
         };
         let (Ok(lat), Ok(lon)) = (parse(&body.latitude), parse(&body.longitude)) else {
@@ -4648,8 +4782,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/routes", get(board_routes))
         .route("/api/board/history", get(board_history))
         .route("/api/board/audit", get(list_audit))
-        .route("/api/board/nodes", get(list_nodes))
+        .route("/api/board/nodes", get(list_nodes).post(add_node))
         .route("/api/board/nodes/{node_id}", get(get_node))
+        .route("/api/board/nodes/{node_id}/token", get(get_node_token).post(rotate_node_token))
         .route("/api/board/nodes/{node_id}/versions", get(list_versions))
         .route("/api/board/nodes/{node_id}/versions/{version_id}", get(get_version))
         .route("/api/board/nodes/{node_id}/command", axum::routing::post(post_command))
@@ -4672,6 +4807,7 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_auth));
     let base = Router::new()
         .route("/healthz", get(health))
+        .route("/install.sh", get(install_script))
         .route("/api/login", axum::routing::post(login))
         .route("/api/auth/status", get(auth_status))
         .route("/api/logout", axum::routing::post(logout))
@@ -4958,4 +5094,82 @@ mod runtime_tests {
         assert_eq!(frame["geo"]["cities"].as_array().unwrap().len(), 1, "SSE frame lost geo: {frame}");
     }
 
+
+    #[tokio::test]
+    async fn node_settings_accept_numeric_and_string_geo_overrides() {
+        let state = test_state().await;
+        let body = NodeSettingsBody {
+            alias: Some("renamed".into()),
+            country_code: Some(NumOrStr::Str("us".into())),
+            latitude: Some(NumOrStr::Num(30.5)),
+            longitude: Some(NumOrStr::Str("104.25".into())),
+            bandwidth_mbps: None,
+            bandwidth_up_mbps: None,
+            bandwidth_down_mbps: None,
+            bandwidth_intranet_down_mbps: None,
+            bandwidth_internet_down_mbps: None,
+            shared_listeners: None,
+        };
+        let res = set_node_settings(State(state.clone()), Path("n1".to_string()), Json(body)).await;
+        assert!(res.0.get("error").is_none(), "unexpected error: {}", res.0);
+        let (alias, country, lat, lon): (Option<String>, Option<String>, Option<f64>, Option<f64>) =
+            sqlx::query_as("SELECT alias, country_code, latitude, longitude FROM nodes WHERE node_id = 'n1'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(alias.as_deref(), Some("renamed"));
+        assert_eq!(country.as_deref(), Some("us"));
+        assert_eq!(lat, Some(30.5));
+        assert_eq!(lon, Some(104.25));
+
+        let body = NodeSettingsBody {
+            alias: None,
+            country_code: None,
+            latitude: Some(NumOrStr::Str("31.75".into())),
+            longitude: Some(NumOrStr::Str("".into())),
+            bandwidth_mbps: None,
+            bandwidth_up_mbps: None,
+            bandwidth_down_mbps: None,
+            bandwidth_intranet_down_mbps: None,
+            bandwidth_internet_down_mbps: None,
+            shared_listeners: None,
+        };
+        let res = set_node_settings(State(state.clone()), Path("n1".to_string()), Json(body)).await;
+        assert!(res.0.get("error").is_none(), "unexpected error: {}", res.0);
+        let (lat, lon): (Option<f64>, Option<f64>) =
+            sqlx::query_as("SELECT latitude, longitude FROM nodes WHERE node_id = 'n1'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(lat, Some(31.75));
+        assert_eq!(lon, Some(104.25));
+    }
+
+    #[tokio::test]
+    async fn add_node_and_rotate_token() {
+        let state = test_state().await;
+        let created = add_node(
+            State(state.clone()),
+            Json(AddNodeBody { node_id: "new-node-1".into(), alias: Some("New".into()) }),
+        )
+        .await;
+        assert_eq!(created.0["ok"].as_bool(), Some(true), "{:?}", created.0);
+        let token = created.0["token"].as_str().unwrap().to_string();
+        assert_eq!(token.len(), 32);
+
+        let fetched = get_node_token(State(state.clone()), Path("new-node-1".to_string())).await;
+        assert_eq!(fetched.0["token"].as_str(), Some(token.as_str()));
+
+        let dup = add_node(
+            State(state.clone()),
+            Json(AddNodeBody { node_id: "new-node-1".into(), alias: None }),
+        )
+        .await;
+        assert_eq!(dup.0["ok"].as_bool(), Some(false));
+
+        let rotated = rotate_node_token(State(state.clone()), Path("new-node-1".to_string())).await;
+        let new_token = rotated.0["token"].as_str().unwrap().to_string();
+        assert_ne!(new_token, token);
+        assert_eq!(new_token.len(), 32);
+    }
 }

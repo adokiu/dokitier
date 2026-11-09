@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2.7.0)'
+        required: true
+        default: 'v2.7.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build web UI
+        working-directory: web/webui
+        run: npm ci && npm run build
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Install protoc + zig (musl cross compilation)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          pip install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - name: Build console (amd64 musl)
+        run: |
+          cargo zigbuild --profile release-fast -p dokitier-console --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release-fast/dokitier-console dokitier-console-amd64
+
+      - name: Build core (amd64 musl)
+        run: |
+          cargo zigbuild --profile release-fast -p dokitier --bin dokitier-core --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release-fast/dokitier-core dokitier-core-amd64
+
+      - name: Build core (arm64 musl)
+        run: |
+          cargo zigbuild --profile release-fast -p dokitier --bin dokitier-core --target aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release-fast/dokitier-core dokitier-core-arm64
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dokitier-console-amd64
+            dokitier-core-amd64
+            dokitier-core-arm64
+            scripts/install.sh

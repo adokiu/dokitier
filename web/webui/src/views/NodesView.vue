@@ -6,6 +6,7 @@
         <div class="page-sub">{{ t('nodes.subtitle') }}</div>
       </div>
       <v-spacer />
+      <v-btn color="primary" size="small" prepend-icon="mdi-plus" @click="openAddNode">{{ t('nodes.addNode') || '添加节点' }}</v-btn>
       <v-select
         v-model="networkFilter"
         :items="networkFilterItems"
@@ -17,7 +18,6 @@
         hide-details
         style="max-width: 240px"
       />
-      <v-chip size="small" variant="tonal" color="primary">{{ t('nodes.total', { n: filteredNodes.length }) }}</v-chip>
     </div>
 
     <v-card>
@@ -85,6 +85,7 @@
         <template #item.actions="{ item }">
           <div class="d-flex gap-1">
             <v-btn size="x-small" variant="text" prepend-icon="mdi-cog" @click.stop="open(item)">{{ t('nodes.config') }}</v-btn>
+            <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click.stop="openInstall(item)">安装</v-btn>
           </div>
         </template>
       </DokTable>
@@ -188,6 +189,7 @@
                 </v-tooltip>
               </div>
               <v-text-field v-model.number="nodeInternetCap" type="number" density="compact" variant="outlined" hide-details placeholder="留空使用下行带宽" class="mb-4" />
+              <v-alert v-if="nodeSaveError" type="error" variant="tonal" density="compact" class="mb-3">{{ nodeSaveError }}</v-alert>
               <v-btn color="primary" :loading="savingNodeSettings" @click="saveNodeSettings">保存</v-btn>
             </div>
           </div>
@@ -331,6 +333,51 @@
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="addNodeOpen" max-width="480">
+      <v-card>
+        <v-card-title>添加节点</v-card-title>
+        <v-card-text>
+          <v-text-field v-model="newNodeId" density="compact" variant="outlined" label="节点 ID" placeholder="例如 hk-haridc-275" class="mb-3" hint="字母、数字、- _ .，安装后不可更改" persistent-hint />
+          <v-text-field v-model="newNodeAlias" density="compact" variant="outlined" label="显示名称（可选）" placeholder="留空使用主机名" />
+          <v-alert v-if="addNodeError" type="error" variant="tonal" density="compact" class="mt-3">{{ addNodeError }}</v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="addNodeOpen = false">{{ t('common.cancel') }}</v-btn>
+          <v-btn color="primary" :loading="addNodeSaving" @click="createNode">创建</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="installOpen" max-width="760">
+      <v-card>
+        <v-card-title>安装节点 <span class="text-medium-emphasis text-body-2">{{ installNodeId }}</span></v-card-title>
+        <v-card-text>
+          <v-text-field v-model="installEndpoint" density="compact" variant="outlined" label="Console 地址" class="mb-2" />
+          <v-text-field v-model="installToken" density="compact" variant="outlined" label="节点 Token" class="mb-3" />
+          <div class="d-flex flex-wrap gap-2 mb-3">
+            <v-text-field v-model="installVersion" density="compact" variant="outlined" label="安装版本" placeholder="latest" hide-details style="max-width: 180px" />
+            <v-text-field v-model="installProxy" density="compact" variant="outlined" label="GitHub 代理" placeholder="https://ghproxy.example/" hide-details style="max-width: 240px" />
+            <v-text-field v-model="installDir" density="compact" variant="outlined" label="安装目录" placeholder="/opt/dokitier" hide-details style="max-width: 200px" />
+            <v-text-field v-model="installService" density="compact" variant="outlined" label="服务名称" placeholder="dokitier-core" hide-details style="max-width: 200px" />
+            <v-text-field v-model="installInterval" density="compact" variant="outlined" label="采集间隔(秒)" placeholder="1" hide-details style="max-width: 140px" />
+            <v-checkbox v-model="installInsecure" density="compact" label="忽略证书" hide-details style="max-width: 130px" />
+          </div>
+          <div class="install-command">
+            <pre>{{ installCommand }}</pre>
+            <v-btn size="small" variant="tonal" prepend-icon="mdi-content-copy" @click="copyInstallCommand">{{ copied ? '已复制' : '复制命令' }}</v-btn>
+          </div>
+          <v-alert v-if="installError" type="error" variant="tonal" density="compact" class="mt-3">{{ installError }}</v-alert>
+          <div class="text-caption mt-2">在目标机器上以 root 执行该命令；安装完成后节点会自动连到 console，并在列表中出现。</div>
+        </v-card-text>
+        <v-card-actions>
+          <v-btn variant="text" @click="rotateToken" :loading="rotating">{{ '重置 Token' }}</v-btn>
+          <v-spacer />
+          <v-btn variant="text" @click="installOpen = false">{{ t('common.close') || '关闭' }}</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="aliasOpen" max-width="420">
       <v-card class="pa-4">
         <v-card-title>{{ t('nodes.setAlias') }}</v-card-title>
@@ -386,6 +433,24 @@ const saved = ref(false)
 const versionsOpen = ref(false)
 const versions = ref([])
 const rollingBack = ref(null)
+const addNodeOpen = ref(false)
+const newNodeId = ref('')
+const newNodeAlias = ref('')
+const addNodeError = ref('')
+const addNodeSaving = ref(false)
+const installOpen = ref(false)
+const installNodeId = ref('')
+const installToken = ref('')
+const installError = ref('')
+const rotating = ref(false)
+const copied = ref(false)
+const installEndpoint = ref(defaultInstallEndpoint())
+const installVersion = ref('')
+const installProxy = ref('')
+const installDir = ref('')
+const installService = ref('')
+const installInterval = ref('')
+const installInsecure = ref(false)
 const aliasOpen = ref(false)
 const aliasValue = ref('')
 const aliasTarget = ref(null)
@@ -404,6 +469,7 @@ const nodeInternetCap = ref('')
 const nodeSharedListeners = ref([])
 const sharedProtoOptions = ['tcp', 'udp', 'quic', 'ws', 'wss']
 const savingNodeSettings = ref(false)
+const nodeSaveError = ref('')
 const sysInfo = computed(() => detail.value?.system_info || detail.value?.snapshot?.system || {})
 const sysSnapshot = computed(() => detail.value?.snapshot || {})
 const sysNetwork = computed(() => sysInfo.value?.network || {})
@@ -446,6 +512,96 @@ function openAlias(item) {
   aliasTarget.value = item
   aliasValue.value = item.alias || ''
   aliasOpen.value = true
+}
+
+function defaultInstallEndpoint() {
+  if (typeof window === 'undefined') return 'wss://your-console/api/agent/ws'
+  const origin = window.location.origin
+  if (origin.startsWith('https://')) return 'wss://' + origin.slice(8) + '/api/agent/ws'
+  if (origin.startsWith('http://')) return 'ws://' + origin.slice(7) + '/api/agent/ws'
+  return 'wss://your-console/api/agent/ws'
+}
+
+function openAddNode() {
+  newNodeId.value = ''
+  newNodeAlias.value = ''
+  addNodeError.value = ''
+  addNodeOpen.value = true
+}
+
+async function createNode() {
+  addNodeSaving.value = true
+  addNodeError.value = ''
+  try {
+    const res = await api.createNode({ node_id: newNodeId.value.trim(), alias: newNodeAlias.value.trim() || null })
+    if (!res.ok) throw new Error(res.error || 'create failed')
+    addNodeOpen.value = false
+    installNodeId.value = res.node_id
+    installToken.value = res.token
+    installError.value = ''
+    copied.value = false
+    installOpen.value = true
+    await load()
+  } catch (e) {
+    addNodeError.value = String(e.message || e)
+  } finally {
+    addNodeSaving.value = false
+  }
+}
+
+async function openInstall(item) {
+  installNodeId.value = item.node_id
+  installToken.value = ''
+  installError.value = ''
+  copied.value = false
+  installOpen.value = true
+  try {
+    const res = await api.nodeToken(item.node_id)
+    if (res.ok) installToken.value = res.token
+    else installError.value = res.error || '无法获取 token'
+  } catch (e) {
+    installError.value = String(e.message || e)
+  }
+}
+
+async function rotateToken() {
+  rotating.value = true
+  try {
+    const res = await api.rotateNodeToken(installNodeId.value)
+    if (res.ok) installToken.value = res.token
+    else installError.value = res.error || '重置失败'
+  } finally {
+    rotating.value = false
+  }
+}
+
+const installCommand = computed(() => {
+  const parts = [
+    'wget -qO- https://raw.githubusercontent.com/adokiu/dokitier/main/scripts/install.sh | sudo bash -s --',
+    '-e', shellQuote(installEndpoint.value),
+    '-t', shellQuote(installToken.value || '<token>'),
+    '-n', shellQuote(installNodeId.value),
+  ]
+  if (installVersion.value.trim()) parts.push('--version', shellQuote(installVersion.value.trim()))
+  if (installProxy.value.trim()) parts.push('--github-proxy', shellQuote(installProxy.value.trim().replace(/\/+$/, '')))
+  if (installDir.value.trim()) parts.push('--install-dir', shellQuote(installDir.value.trim()))
+  if (installService.value.trim()) parts.push('--service-name', shellQuote(installService.value.trim()))
+  if (installInterval.value.trim()) parts.push('-i', shellQuote(installInterval.value.trim()))
+  if (installInsecure.value) parts.push('--insecure')
+  return parts.join(' ')
+})
+
+function shellQuote(text) {
+  const value = String(text ?? '')
+  return /^[A-Za-z0-9_./:@-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+async function copyInstallCommand() {
+  try {
+    await navigator.clipboard.writeText(installCommand.value)
+    copied.value = true
+    setTimeout(() => { copied.value = false }, 1500)
+  } catch {}
 }
 
 async function saveAlias() {
@@ -575,26 +731,28 @@ function connectEvents() {
 async function saveNodeSettings() {
   if (!detail.value) return
   savingNodeSettings.value = true
+  nodeSaveError.value = ''
+  const up = nodeBandwidthUp.value === '' ? null : Number(nodeBandwidthUp.value)
+  const down = nodeBandwidthDown.value === '' ? null : Number(nodeBandwidthDown.value)
+  const intranet = nodeIntranetCap.value === '' ? null : Number(nodeIntranetCap.value)
+  const internet = nodeInternetCap.value === '' ? null : Number(nodeInternetCap.value)
+  const listeners = nodeSharedListeners.value
+    .map((l) => joinEndpoint(l.proto, l.addr))
+    .filter(Boolean)
+    .join(',')
   try {
-    const up = nodeBandwidthUp.value === '' ? null : Number(nodeBandwidthUp.value)
-    const down = nodeBandwidthDown.value === '' ? null : Number(nodeBandwidthDown.value)
-    const intranet = nodeIntranetCap.value === '' ? null : Number(nodeIntranetCap.value)
-    const internet = nodeInternetCap.value === '' ? null : Number(nodeInternetCap.value)
     const res = await api.setNodeSettings(detail.value.node_id, {
       alias: nodeAlias.value,
       country_code: nodeCountry.value,
-      latitude: nodeLat.value,
-      longitude: nodeLon.value,
+      latitude: nodeLat.value === '' ? '' : String(nodeLat.value),
+      longitude: nodeLon.value === '' ? '' : String(nodeLon.value),
       bandwidth_up_mbps: up,
       bandwidth_down_mbps: down,
       bandwidth_intranet_down_mbps: intranet,
       bandwidth_internet_down_mbps: internet,
-      shared_listeners: nodeSharedListeners.value
-        .map((l) => joinEndpoint(l.proto, l.addr))
-        .filter(Boolean)
-        .join(','),
+      shared_listeners: listeners,
     })
-    if (!res.ok) throw new Error(res.error || 'save failed')
+    if (!res.ok) throw new Error(res.error || '保存失败')
     detail.value.alias = nodeAlias.value
     detail.value.country_code = nodeCountry.value
     detail.value.latitude = nodeLat.value === '' ? detail.value.latitude : Number(nodeLat.value)
@@ -611,6 +769,8 @@ async function saveNodeSettings() {
       row.bandwidth_intranet_down_mbps = intranet
       row.bandwidth_internet_down_mbps = internet
     }
+  } catch (e) {
+    nodeSaveError.value = String(e.message || e)
   } finally {
     savingNodeSettings.value = false
   }
@@ -742,8 +902,8 @@ async function open(item) {
   nodeBandwidthDown.value = item.bandwidth_down_mbps ?? item.bandwidth_mbps ?? ''
   nodeIntranetCap.value = item.bandwidth_intranet_down_mbps ?? ''
   nodeCountry.value = item.country_code || ''
-  nodeLat.value = item.latitude ?? ''
-  nodeLon.value = item.longitude ?? ''
+  nodeLat.value = item.latitude == null ? '' : String(item.latitude)
+  nodeLon.value = item.longitude == null ? '' : String(item.longitude)
   nodeSharedListeners.value = String(item.shared_listeners || '')
     .split(',')
     .map((url) => url.trim())
@@ -928,6 +1088,7 @@ onBeforeUnmount(() => {
 .meter-fill { height: 100%; border-radius: 999px; transition: width .3s ease, background .3s ease; }
 .version-cell { white-space: nowrap; }
 .info-icon { color: rgba(var(--v-theme-on-surface), .45); cursor: help; }
+.install-command pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.5; background: rgba(var(--v-theme-on-surface), .05); border: 1px solid rgba(var(--v-theme-on-surface), .12); border-radius: 8px; padding: 10px; margin: 0 0 8px; }
 .ip-v6 { color: var(--dok-subtle); }
 .node-flag { width: 24px; height: 16px; border-radius: 2px; object-fit: cover; flex: 0 0 auto; }
 .node-host { font-weight: 500; }
