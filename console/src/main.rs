@@ -171,6 +171,8 @@ struct AppState {
     agents: std::sync::Arc<dashmap::DashMap<String, tokio::sync::mpsc::Sender<Value>>>,
     pending: std::sync::Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<Value>>>,
     last_traffic: std::sync::Arc<dashmap::DashMap<String, (i64, u64, u64)>>,
+    edge_traffic: std::sync::Arc<dashmap::DashMap<String, (i64, u64, u64)>>,
+    edge_rates: std::sync::Arc<dashmap::DashMap<String, (f64, f64)>>,
     geo_attempts: std::sync::Arc<dashmap::DashMap<String, i64>>,
 }
 
@@ -2743,152 +2745,48 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
     }
 }
 
-async fn topology_payload(state: &AppState) -> Value {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-    let mut nodes: std::collections::BTreeMap<u32, Value> = std::collections::BTreeMap::new();
-    let mut edges: std::collections::BTreeMap<(u32, u32, String), Value> = std::collections::BTreeMap::new();
-    let mut peer_owner: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-    // p2p group per (node_id, network) from the config the console pushed; the
-    // agent snapshot does not carry it, so the topology view resolves it here.
-    let version_rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT node_id, network, toml FROM config_versions ORDER BY id DESC",
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let mut cv_groups: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    for (node_id, network, toml) in version_rows {
-        let key = (node_id.clone(), network);
-        if cv_groups.contains_key(&key) {
-            continue; // rows are newest-first
+fn spawn_edge_rate_sampler(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            for ((a, b, network), edge) in edges.iter_mut() {
+        let mut edge_rx = 0.0f64;
+        let mut edge_tx = 0.0f64;
+        if let Some(tunnels) = edge.get_mut("tunnels").and_then(|v| v.as_array_mut()) {
+            for (idx, tunnel) in tunnels.iter_mut().enumerate() {
+                let ident = tunnel
+                    .get("remote_addr")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("t{}", idx));
+                let key = format!("{}|{}|{}|{}", network, a, b, ident);
+                let (rx_bps, tx_bps) = state.edge_rates.get(&key).map(|v| *v).unwrap_or((0.0, 0.0));
+                edge_rx += rx_bps;
+                edge_tx += tx_bps;
+                tunnel["rx_bps"] = json!(rx_bps);
+                tunnel["tx_bps"] = json!(tx_bps);
+            }
         }
-        if let Ok(value) = toml::from_str::<toml::Value>(&toml) {
-            let group = value
-                .get("network_identity")
-                .and_then(|v| v.get("p2p_group"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            cv_groups.insert(key, group);
-        }
+        edge["rx_bps"] = json!(edge_rx);
+        edge["tx_bps"] = json!(edge_tx);
+        let tunnels = edge.get("tunnels").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let lat = tunnels
+            .iter()
+            .filter_map(|t| t.get("latency_ms").and_then(|v| v.as_f64()))
+            .fold(f64::INFINITY, f64::min);
+        let loss_vals: Vec<f64> = tunnels
+            .iter()
+            .filter_map(|t| t.get("loss_pct").and_then(|v| v.as_f64()))
+            .collect();
+        edge["latency_ms"] = if lat.is_finite() { json!(lat) } else { Value::Null };
+        edge["loss_pct"] = if loss_vals.is_empty() {
+            Value::Null
+        } else {
+            json!(loss_vals.iter().sum::<f64>() / loss_vals.len() as f64)
+        };
+        edge["bandwidth_bps"] = json!(edge_rx + edge_tx);
     }
-    // instance uuid -> p2p group: network_instances is the authoritative
-    // node/network -> instance_id mapping the console assigns on apply.
-    let mut instance_groups: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let inst_rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT node_id, network, instance_id FROM network_instances")
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-    for (node_id, network, instance_id) in inst_rows {
-        if let Some(group) = cv_groups.get(&(node_id, network)) {
-            if !group.is_empty() {
-                instance_groups.insert(instance_id, group.clone());
-            }
-        }
-    }
-    for (node_id, snapshot) in &rows {
-        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
-        for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
-            if let Some(pid) = inst.get("peer_id").and_then(|v| v.as_u64()) {
-                peer_owner.insert(pid as u32, node_id.clone());
-            }
-            let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
-            let p2p_group = inst.get("p2p_group").and_then(|v| v.as_str()).unwrap_or_default();
-            let Some(topo) = inst.get("topology") else { continue };
-            for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
-                if let Some(peer_id) = n.get("peer_id").and_then(|v| v.as_u64()) {
-                    let local = n.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let mut node = n.clone();
-                    node["network_name"] = json!(network);
-                    let resolved_group = n
-                        .get("instance_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|uuid| instance_groups.get(uuid).cloned())
-                        .unwrap_or_else(|| if local { p2p_group.to_string() } else { String::new() });
-                    node["p2p_group"] = json!(resolved_group);
-                    node["agent_node_id"] = json!(node_id);
-                    match nodes.entry(peer_id as u32) {
-                        std::collections::btree_map::Entry::Occupied(mut e) => {
-                            if local && !resolved_group.is_empty() {
-                                e.get_mut()["p2p_group"] = json!(resolved_group);
-                            }
-                        }
-                        std::collections::btree_map::Entry::Vacant(v) => {
-                            v.insert(node);
-                        }
-                    }
-                }
-            }
-            for e in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
-                let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let key = (a.min(b), a.max(b), network.to_string());
-                if let Some(existing) = edges.get_mut(&key) {
-                    let existing_probe = existing
-                        .get("tunnels")
-                        .and_then(|v| v.as_array())
-                        .map(|tunnels| tunnels.iter().any(|t| t.get("capacity_source").and_then(|v| v.as_str()) == Some("probe")))
-                        .unwrap_or(false);
-                    let new_probe = e
-                        .get("tunnels")
-                        .and_then(|v| v.as_array())
-                        .map(|tunnels| tunnels.iter().any(|t| t.get("capacity_source").and_then(|v| v.as_str()) == Some("probe")))
-                        .unwrap_or(false);
-                    if new_probe && !existing_probe {
-                        let mut replacement = e.clone();
-                        replacement["network_name"] = json!(network);
-                        let tunnel_types: Vec<Value> = replacement
-                            .get("tunnels")
-                            .and_then(|v| v.as_array())
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|t| t.get("type").cloned())
-                            .collect();
-                        replacement["tunnel_types"] = json!(tunnel_types);
-                        *existing = replacement;
-                    }
-                    continue;
-                }
-                let mut edge = e.clone();
-                edge["network_name"] = json!(network);
-                let tunnel_types: Vec<Value> = e.get("tunnels").and_then(|v| v.as_array()).into_iter().flatten()
-                    .filter_map(|t| t.get("type").cloned()).collect();
-                edge["tunnel_types"] = json!(tunnel_types);
-                edges.insert(key, edge);
-            }
-        }
-    }
-    let meta_rows: Vec<(String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT node_id, alias, country_code FROM nodes")
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut countries: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (id, alias, country) in meta_rows {
-        if let Some(alias) = alias.filter(|a| !a.is_empty()) {
-            aliases.insert(id.clone(), alias);
-        }
-        if let Some(country) = country.filter(|c| !c.is_empty()) {
-            countries.insert(id, country);
-        }
-    }
-    for (pid, owner) in &peer_owner {
-        if let Some(node) = nodes.get_mut(pid) {
-            if let Some(alias) = aliases.get(owner) {
-                node["alias"] = json!(alias);
-            }
-            if let Some(country) = countries.get(owner) {
-                node["country_code"] = json!(country);
-            }
-        }
-    }
+
     // Explicit group summary so the topology API is self-describing: the web
     // UI (and any other client) can render one region per p2p group without
     // inferring it from node fields.
@@ -2915,21 +2813,109 @@ async fn topology_payload(state: &AppState) -> Value {
             json!({"name": name, "count": members.len(), "members": members})
         })
         .collect();
+
+    // ---- server-side data scoping: network and/or p2p group ------------------
+    let mut node_list: Vec<Value> = nodes.values().cloned().collect();
+    let mut edge_list: Vec<Value> = edges.values().cloned().collect();
+    let mut cross_links: Vec<Value> = Vec::new();
+    let peer_group: std::collections::HashMap<u64, String> = node_list
+        .iter()
+        .filter_map(|n| {
+            let id = n.get("peer_id").and_then(|v| v.as_u64())?;
+            let g = n
+                .get("p2p_group")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some((id, g))
+        })
+        .collect();
+    let scoped = net_filter.is_some() || group_filter.is_some();
+    if scoped {
+        let allowed: std::collections::HashSet<u64> = node_list
+            .iter()
+            .filter(|n| {
+                let net_ok = net_filter
+                    .map(|f| n.get("network_name").and_then(|v| v.as_str()) == Some(f))
+                    .unwrap_or(true);
+                let grp_ok = group_filter
+                    .map(|f| n.get("p2p_group").and_then(|v| v.as_str()) == Some(f))
+                    .unwrap_or(true);
+                net_ok && grp_ok
+            })
+            .filter_map(|n| n.get("peer_id").and_then(|v| v.as_u64()))
+            .collect();
+        if group_filter.is_some() {
+            let mut seen: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
+            for e in &edge_list {
+                let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
+                let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
+                let in_a = allowed.contains(&a);
+                let in_b = allowed.contains(&b);
+                if in_a == in_b {
+                    continue;
+                }
+                let (inner, outer) = if in_a { (a, b) } else { (b, a) };
+                let target = peer_group.get(&outer).cloned().unwrap_or_default();
+                if target.is_empty() {
+                    continue;
+                }
+                if seen.insert((inner, target.clone())) {
+                    cross_links.push(json!({"peer_id": inner, "group": target}));
+                }
+            }
+        }
+        node_list.retain(|n| {
+            n.get("peer_id")
+                .and_then(|v| v.as_u64())
+                .map(|id| allowed.contains(&id))
+                .unwrap_or(false)
+        });
+        edge_list.retain(|e| {
+            let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
+            let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
+            if !allowed.contains(&a) || !allowed.contains(&b) {
+                return false;
+            }
+            net_filter
+                .map(|f| e.get("network_name").and_then(|v| v.as_str()) == Some(f))
+                .unwrap_or(true)
+        });
+    }
     json!({"graph": {
-        "nodes": nodes.values().cloned().collect::<Vec<_>>(),
-        "edges": edges.values().cloned().collect::<Vec<_>>(),
+        "nodes": node_list,
+        "edges": edge_list,
         "groups": groups,
+        "cross_links": cross_links,
     }})
 }
 
-async fn board_topology(State(state): State<AppState>) -> Json<Value> {
-    Json(topology_payload(&state).await)
+#[derive(serde::Deserialize, Default)]
+struct TopologyQuery {
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
 }
 
-async fn board_events(State(state): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = futures::stream::unfold(state, |state| async move {
+async fn board_topology(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<TopologyQuery>,
+) -> Json<Value> {
+    let net = query.network.filter(|s| !s.is_empty());
+    let grp = query.group.filter(|s| !s.is_empty());
+    Json(topology_payload(&state, net.as_deref(), grp.as_deref()).await)
+}
+
+async fn board_events(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<TopologyQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let net = query.network.filter(|s| !s.is_empty());
+    let grp = query.group.filter(|s| !s.is_empty());
+    let stream = futures::stream::unfold((state, net, grp), |(state, net, grp)| async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let payload = topology_payload(&state).await;
+        let payload = topology_payload(&state, net.as_deref(), grp.as_deref()).await;
         let nodes = nodes_payload(&state).await;
         let topology = Event::default().event("topology").data(
             json!({"type": "topology", "graph": payload.get("graph").cloned().unwrap_or(Value::Null)}).to_string(),
@@ -2937,7 +2923,10 @@ async fn board_events(State(state): State<AppState>) -> Sse<impl Stream<Item = R
         let nodes = Event::default().event("nodes").data(
             json!({"type": "nodes", "nodes": nodes.get("nodes").cloned().unwrap_or(Value::Null)}).to_string(),
         );
-        Some((futures::stream::iter(vec![Ok::<_, Infallible>(topology), Ok(nodes)]), state))
+        Some((
+            futures::stream::iter(vec![Ok::<_, Infallible>(topology), Ok(nodes)]),
+            (state, net, grp),
+        ))
     }).flatten();
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -3521,8 +3510,11 @@ async fn main() -> anyhow::Result<()> {
         agents: std::sync::Arc::new(dashmap::DashMap::new()),
         pending: std::sync::Arc::new(dashmap::DashMap::new()),
         last_traffic: std::sync::Arc::new(dashmap::DashMap::new()),
+        edge_traffic: std::sync::Arc::new(dashmap::DashMap::new()),
+        edge_rates: std::sync::Arc::new(dashmap::DashMap::new()),
         geo_attempts: std::sync::Arc::new(dashmap::DashMap::new()) };
     spawn_bandwidth_sampler(state.clone());
+    spawn_edge_rate_sampler(state.clone());
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());

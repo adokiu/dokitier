@@ -24,7 +24,7 @@ defineProps({
   position: fixed;
   z-index: 3000;
   min-width: 140px;
-  max-width: 300px;
+  max-width: 340px;
   padding: 10px 12px;
   border-radius: 12px;
   border: 1px solid rgba(var(--v-theme-on-surface), 0.12);
@@ -34,7 +34,9 @@ defineProps({
   font-size: 12px;
   line-height: 1.55;
   pointer-events: none;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .v-theme--PurpleThemeDark .dok-hover-card {
   border-color: rgba(255, 255, 255, 0.14);
@@ -51,6 +53,8 @@ defineProps({
   gap: 3px;
   color: rgba(var(--v-theme-on-surface), 0.7);
 }
-.dok-hover-card__row { display: flex; justify-content: space-between; gap: 18px; }
+.dok-hover-card__row { display: flex; justify-content: space-between; gap: 14px; min-width: 0; }
+.dok-hover-card__row span { flex: 0 0 auto; }
+.dok-hover-card__row b { min-width: 0; text-align: right; overflow-wrap: anywhere; }
 .dok-hover-card__row b { color: rgb(var(--v-theme-on-surface)); font-weight: 600; }
 </style>

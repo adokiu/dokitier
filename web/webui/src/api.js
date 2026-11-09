@@ -33,7 +33,13 @@ export const api = {
   sync: () => request('/api/sync'),
   getConfig: () => request('/api/config'),
   boardOverview: () => request('/api/board/overview'),
-  boardTopology: () => request('/api/board/topology'),
+  boardTopology: (network = '', group = '') => {
+    const qs = new URLSearchParams()
+    if (network) qs.set('network', network)
+    if (group) qs.set('group', group)
+    const q = qs.toString()
+    return request('/api/board/topology' + (q ? `?${q}` : ''))
+  },
   boardNetworks: () => request('/api/board/networks'),
   createNetwork: (body) => request('/api/board/networks/create', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body) }),
   boardLinks: () => request('/api/board/links'),
