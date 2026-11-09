@@ -1222,8 +1222,8 @@ function computeLayout(force = false) {
 
   const CARD_W = 170
   const CARD_H = 56
-  const PAD_X = 34
-  const PAD_Y = 58
+  const PAD_X = 66
+  const PAD_Y = 92
   const boundsOf = (c) => {
     let minX = Infinity
     let maxX = -Infinity
@@ -1247,7 +1247,7 @@ function computeLayout(force = false) {
       p.y += dy
     }
   }
-  for (let iter = 0; iter < 60; iter++) {
+  for (let iter = 0; iter < 200; iter++) {
     let moved = false
     for (let i = 0; i < clusters.length; i++) {
       for (let j = i + 1; j < clusters.length; j++) {
@@ -1567,16 +1567,13 @@ function buildGroupLevelOption() {
     const off = Math.min(160, seg * 0.36)
     const c1 = { x: p0.x + p0.nx * off, y: p0.y + p0.ny * off }
     const c2 = { x: p1.x + p1.nx * off, y: p1.y + p1.ny * off }
-    const route = routeLink(p0, c1, c2, p1, groupRects, rec.a, rec.b)
     const labelT = 0.38 + (hash % 3) * 0.12
-    const labelIdx = Math.max(1, Math.min(route.samples.length - 2, Math.round(labelT * (route.samples.length - 1))))
-    const labelPoint = route.samples[labelIdx]
+    const labelPoint = bezierPoint(p0, c1, c2, p1, labelT)
     const active = rec.traffic >= 102400
     const lat = rec.latencies.length ? rec.latencies.reduce((a, b) => a + b, 0) / rec.latencies.length : null
     const label = bps(rec.traffic) + (lat != null ? ' · ' + lat.toFixed(0) + ' ms' : '')
     return {
       p0, p1, c1, c2,
-      pathD: route.d,
       width: 2 + Math.min(10, Math.max(0, Math.log10(Math.max(10, rec.traffic)) - 4) * 3),
       color: active ? '#1D9E75' : 'rgba(127,127,127,0.9)',
       opacity: active ? 0.85 : 0.3,
@@ -1602,8 +1599,13 @@ function buildGroupLevelOption() {
             type: 'group',
             children: [
               {
-                type: 'path',
-                shape: { d: d.pathD || '' },
+                type: 'bezierCurve',
+                shape: {
+                  x1: d.p0.x, y1: d.p0.y,
+                  cpx1: d.c1.x, cpy1: d.c1.y,
+                  cpx2: d.c2.x, cpy2: d.c2.y,
+                  x2: d.p1.x, y2: d.p1.y,
+                },
                 style: { stroke: d.color, lineWidth: d.width, fill: 'none', opacity: d.opacity, lineCap: 'round' },
               },
               {
@@ -1738,46 +1740,20 @@ function buildDetailOption() {
     const seg = Math.hypot(p1.x - p0.x, p1.y - p0.y)
     const n0 = p0.side === 'h' ? { x: p0.sign, y: 0 } : { x: 0, y: p0.sign }
     const n1 = p1.side === 'h' ? { x: p1.sign, y: 0 } : { x: 0, y: p1.sign }
-    // no line merging: every link is drawn on its own
-    const s0 = { x: p0.x, y: p0.y }
-    const s1 = { x: p1.x, y: p1.y }
+    // Port-local rule: f(0)=0, f'(0)=0 (leave along the normal), deviation only
+    // grows and stays within a bounded angle. Both control points therefore sit
+    // purely on the outward normals, with a capped extension.
     const off = Math.min(160, seg * 0.36)
-    // rule: leave perpendicular to the card side; the only allowed deviation is
-    // bending to either side of that normal line (tangential component)
-    const t0 = p0.side === 'h' ? { x: 0, y: p1.y >= p0.y ? 1 : -1 } : { x: p1.x >= p0.x ? 1 : -1, y: 0 }
-    const t1 = p1.side === 'h' ? { x: 0, y: p0.y >= p1.y ? 1 : -1 } : { x: p0.x >= p1.x ? 1 : -1, y: 0 }
-    let best = null
-    const bends = [0, 0.3, 0.6, 0.9, 1.2, 1.5]
-    for (const ba of bends) {
-      for (const bb of bends) {
-        for (const sa of ba === 0 ? [1] : [1, -1]) {
-          for (const sb of bb === 0 ? [1] : [1, -1]) {
-            const c1 = { x: s0.x + n0.x * off + t0.x * off * ba * sa, y: s0.y + n0.y * off + t0.y * off * ba * sa }
-            const c2 = { x: s1.x + n1.x * off + t1.x * off * bb * sb, y: s1.y + n1.y * off + t1.y * off * bb * sb }
-            if (cubicBlocked(s0, c1, c2, s1, rects, e.a, e.b)) continue
-            const cost = ba + bb
-            if (!best || cost < best.cost) best = { c1, c2, cost }
-          }
-        }
-      }
-      if (best && best.cost === 0) break
-    }
-    if (!best) {
-      best = {
-        c1: { x: s0.x + n0.x * off, y: s0.y + n0.y * off },
-        c2: { x: s1.x + n1.x * off, y: s1.y + n1.y * off },
-      }
-    }
-    const c1 = best.c1
-    const c2 = best.c2
-    const mid = toScreen(bezierPoint(s0, c1, c2, s1, 0.5))
-    const sp0 = toScreen(s0)
+    const c1 = { x: p0.x + n0.x * off, y: p0.y + n0.y * off }
+    const c2 = { x: p1.x + n1.x * off, y: p1.y + n1.y * off }
+    const mid = toScreen(bezierPoint(p0, c1, c2, p1, 0.5))
+    const sp0 = toScreen(p0)
     const sc1 = toScreen(c1)
     const sc2 = toScreen(c2)
-    const sp1 = toScreen(s1)
+    const sp1 = toScreen(p1)
     const hitPts = []
     for (let i = 0; i <= 20; i++) {
-      const pt = toScreen(bezierPoint(s0, c1, c2, s1, i / 20))
+      const pt = toScreen(bezierPoint(p0, c1, c2, p1, i / 20))
       hitPts.push([pt.x, pt.y])
     }
     const bw = (m.rx_bps || 0) + (m.tx_bps || 0)
