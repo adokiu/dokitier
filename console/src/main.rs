@@ -420,6 +420,21 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
         )"
     };
     sqlx::query(metrics_ddl).execute(db).await?;
+    // query + retention indexes (network/pair for history, ts for pruning)
+    let index_stmts = [
+        "CREATE INDEX idx_link_metrics_pair_ts ON link_metrics(network, a_uuid, b_uuid, ts)",
+        "CREATE INDEX idx_link_metrics_ab_ts ON link_metrics(network, a, b, ts)",
+        "CREATE INDEX idx_link_metrics_ts ON link_metrics(ts)",
+    ];
+    for stmt in index_stmts {
+        let sql = if is_mysql() {
+            // MySQL has no IF NOT EXISTS for indexes; ignore duplicates
+            stmt.to_string()
+        } else {
+            stmt.replace("CREATE INDEX idx", "CREATE INDEX IF NOT EXISTS idx")
+        };
+        let _ = sqlx::query(&sql).execute(db).await;
+    }
     let samples_ddl = if POSTGRES.load(Ordering::Relaxed) {
         "CREATE TABLE IF NOT EXISTS bandwidth_samples (ts BIGINT PRIMARY KEY, rx_bps DOUBLE PRECISION NOT NULL, tx_bps DOUBLE PRECISION NOT NULL)"
     } else if is_mysql() {
@@ -1888,11 +1903,15 @@ async fn set_routing_settings(State(state): State<AppState>, Json(body): Json<Va
         return Json(json!({"ok": false, "error": "invalid routing params"}));
     }
     set_setting(&state.db, "routing_params", &body.to_string()).await;
-    let nodes: Vec<(String,)> = sqlx::query_as(&q("SELECT node_id FROM nodes WHERE status = 'online'"))
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-    for (node_id,) in nodes {
+    // online set comes from the memory registry (realtime), not SQL
+    let now_ts = now();
+    let nodes: Vec<String> = state
+        .node_rt
+        .iter()
+        .filter(|e| e.value().online && now_ts - e.value().ts <= 30)
+        .map(|e| e.key().clone())
+        .collect();
+    for node_id in nodes {
         push_routing_to_node(&state, &node_id).await;
     }
     Json(json!({"ok": true, "params": body}))
@@ -2935,8 +2954,7 @@ async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
             system_info = COALESCE(?, system_info), \
             public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6), \
             cpu_pct = ?, mem_pct = ?, mem_used = ?, mem_total = ?, \
-            rx_bps = ?, tx_bps = ?, traffic = ?, \
-            shared_listeners = COALESCE(NULLIF(?, ''), shared_listeners) WHERE node_id = ?"))
+            rx_bps = ?, tx_bps = ?, traffic = ? WHERE node_id = ?"))
         .bind(rt.last_seen)
         .bind(st)
         .bind(rt.hostname.clone())
@@ -2980,6 +2998,91 @@ async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
     tx.commit().await.is_ok()
 }
 
+/// Downsample link history and enforce the 30 day retention window.
+/// Tier 1: older than 1h -> 60s buckets, tier 2: older than 24h -> 5min,
+/// tier 3: older than 7d -> 30min. Rows already on a bucket boundary are left
+/// alone so repeated runs stay cheap.
+async fn compact_link_metrics(state: &AppState) {
+    let now_ts = now();
+    let oldest = now_ts - 30 * 24 * 3600;
+    // retention: nothing older than 30 days
+    let _ = sqlx::query("DELETE FROM link_metrics WHERE ts < ?")
+        .bind(oldest)
+        .execute(&state.db)
+        .await;
+    let tiers: [(i64, i64); 3] = [
+        (now_ts - 3600, 60),
+        (now_ts - 24 * 3600, 300),
+        (now_ts - 7 * 24 * 3600, 1800),
+    ];
+    for (cutoff, step) in tiers {
+        type Row = (String, i64, i64, Option<String>, Option<String>, i64, Option<f64>, Option<f64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT network, a, b, MAX(a_uuid), MAX(b_uuid), (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) \
+             FROM link_metrics WHERE ts < ? AND ts >= ? AND ts % ? <> 0 \
+             GROUP BY network, a, b, bucket",
+        )
+        .bind(step)
+        .bind(step)
+        .bind(cutoff)
+        .bind(oldest)
+        .bind(step)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        if rows.is_empty() {
+            continue;
+        }
+        let Ok(mut tx) = state.db.begin().await else { continue };
+        let del = sqlx::query(&q(
+            "DELETE FROM link_metrics WHERE ts < ? AND ts >= ? AND ts % ? <> 0",
+        ))
+        .bind(cutoff)
+        .bind(oldest)
+        .bind(step)
+        .execute(&mut *tx)
+        .await;
+        if del.is_err() {
+            let _ = tx.rollback().await;
+            continue;
+        }
+        let mut ok = true;
+        for (network, a, b, a_uuid, b_uuid, bucket, latency, loss) in rows {
+            let ins = sqlx::query(&q(
+                "INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ))
+            .bind(network)
+            .bind(a)
+            .bind(b)
+            .bind(a_uuid)
+            .bind(b_uuid)
+            .bind(bucket)
+            .bind(latency)
+            .bind(loss)
+            .execute(&mut *tx)
+            .await;
+            if ins.is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let _ = tx.commit().await;
+        } else {
+            let _ = tx.rollback().await;
+        }
+    }
+}
+
+fn spawn_history_maintenance(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            compact_link_metrics(&state).await;
+        }
+    });
+}
+
 fn spawn_snapshot_flusher(state: AppState) {
     tokio::spawn(async move {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
@@ -3018,72 +3121,78 @@ fn spawn_snapshot_flusher(state: AppState) {
     });
 }
 
-fn spawn_edge_rate_sampler(state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let fresh_before = now() - 30;
-            let rows: Vec<(String,)> = state
-                .node_rt
-                .iter()
-                .filter(|e| e.value().ts >= fresh_before)
-                .map(|e| (e.value().snapshot.to_string(),))
-                .collect();
-            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (snapshot,) in rows {
-                let Ok(value) = serde_json::from_str::<Value>(&snapshot) else { continue };
-                let Some(instances) = value.get("instances").and_then(|v| v.as_array()) else { continue };
-                for inst in instances {
-                    let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
-                    let Some(edges) = inst.pointer("/topology/edges").and_then(|v| v.as_array()) else { continue };
-                    for e in edges {
-                        let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let pair = if a < b { (a, b) } else { (b, a) };
-                        let Some(tunnels) = e.get("tunnels").and_then(|v| v.as_array()) else { continue };
-                        for (idx, tunnel) in tunnels.iter().enumerate() {
-                            let ident = tunnel
-                                .get("remote_addr")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| format!("t{}", idx));
-                            let rx = tunnel.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let tx = tunnel.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let key = format!("{}|{}|{}|{}", network, pair.0, pair.1, ident);
-                            if !seen_keys.insert(key.clone()) {
-                                continue;
+/// One sampling tick: derive per-tunnel bandwidth from the byte counters in the
+/// in-memory snapshots. Used by the background loop and by tests.
+fn sample_edge_rates_once(state: &AppState) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let fresh_before = now() - 30;
+        let rows: Vec<(String,)> = state
+            .node_rt
+            .iter()
+            .filter(|e| e.value().ts >= fresh_before)
+            .map(|e| (e.value().snapshot.to_string(),))
+            .collect();
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (snapshot,) in rows {
+            let Ok(value) = serde_json::from_str::<Value>(&snapshot) else { continue };
+            let Some(instances) = value.get("instances").and_then(|v| v.as_array()) else { continue };
+            for inst in instances {
+                let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+                let Some(edges) = inst.pointer("/topology/edges").and_then(|v| v.as_array()) else { continue };
+                for e in edges {
+                    let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let pair = if a < b { (a, b) } else { (b, a) };
+                    let Some(tunnels) = e.get("tunnels").and_then(|v| v.as_array()) else { continue };
+                    for (idx, tunnel) in tunnels.iter().enumerate() {
+                        let ident = tunnel
+                            .get("remote_addr")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("t{}", idx));
+                        let rx = tunnel.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let tx = tunnel.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let key = format!("{}|{}|{}|{}", network, pair.0, pair.1, ident);
+                        if !seen_keys.insert(key.clone()) {
+                            continue;
+                        }
+                        // Counters only move when a node reports (every few
+                        // seconds), so a 1s sample would otherwise read 0 in
+                        // between. Keep the last computed rate until the
+                        // counters actually change, and only decay to zero
+                        // after a few seconds without any movement.
+                        let prev = state.edge_traffic.get(&key).map(|v| *v);
+                        match prev {
+                            Some((ts, prx, ptx)) if rx > prx || tx > ptx => {
+                                let elapsed = ((now_ms - ts) as f64 / 1000.0).max(0.2);
+                                let drx = rx.saturating_sub(prx) as f64 / elapsed;
+                                let dtx = tx.saturating_sub(ptx) as f64 / elapsed;
+                                state.edge_rates.insert(key.clone(), (drx, dtx));
+                                state.edge_traffic.insert(key.clone(), (now_ms, rx, tx));
                             }
-                            // Counters only move when a node reports (every few
-                            // seconds), so a 1s sample would otherwise read 0 in
-                            // between. Keep the last computed rate until the
-                            // counters actually change, and only decay to zero
-                            // after a few seconds without any movement.
-                            let prev = state.edge_traffic.get(&key).map(|v| *v);
-                            match prev {
-                                Some((ts, prx, ptx)) if rx > prx || tx > ptx => {
-                                    let elapsed = ((now_ms - ts) as f64 / 1000.0).max(0.2);
-                                    let drx = rx.saturating_sub(prx) as f64 / elapsed;
-                                    let dtx = tx.saturating_sub(ptx) as f64 / elapsed;
-                                    state.edge_rates.insert(key.clone(), (drx, dtx));
-                                    state.edge_traffic.insert(key.clone(), (now_ms, rx, tx));
+                            Some((ts, _prx, _ptx)) => {
+                                if now_ms - ts > 6000 {
+                                    state.edge_rates.insert(key.clone(), (0.0, 0.0));
                                 }
-                                Some((ts, _prx, _ptx)) => {
-                                    if now_ms - ts > 6000 {
-                                        state.edge_rates.insert(key.clone(), (0.0, 0.0));
-                                    }
-                                }
-                                None => {
-                                    state.edge_traffic.insert(key.clone(), (now_ms, rx, tx));
-                                }
+                            }
+                            None => {
+                                state.edge_traffic.insert(key.clone(), (now_ms, rx, tx));
                             }
                         }
                     }
                 }
             }
+        }
+}
+
+fn spawn_edge_rate_sampler(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            sample_edge_rates_once(&state);
         }
     });
 }
@@ -3528,13 +3637,13 @@ async fn board_history(State(state): State<AppState>, axum::extract::Query(query
         (Some(ua), Some(ub)) => {
             let (lo, hi) = if ua <= ub { (ua, ub) } else { (ub, ua) };
             sqlx::query_as(&q(
-                "SELECT (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) FROM link_metrics WHERE network = ? AND a_uuid = ? AND b_uuid = ? AND ts > ? GROUP BY bucket ORDER BY bucket",
+                "SELECT (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) FROM link_metrics WHERE network = ? AND a_uuid = ? AND b_uuid = ? AND ts > ? GROUP BY bucket ORDER BY bucket LIMIT 4000",
             )).bind(step).bind(step).bind(&query.network).bind(&lo).bind(&hi).bind(since)
               .fetch_all(&state.db).await
         }
         _ => {
             sqlx::query_as(&q(
-                "SELECT (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) FROM link_metrics WHERE network = ? AND a = ? AND b = ? AND ts > ? GROUP BY bucket ORDER BY bucket",
+                "SELECT (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) FROM link_metrics WHERE network = ? AND a = ? AND b = ? AND ts > ? GROUP BY bucket ORDER BY bucket LIMIT 4000",
             )).bind(step).bind(step).bind(&query.network).bind(query.a).bind(query.b).bind(since)
               .fetch_all(&state.db).await
         }
@@ -4063,6 +4172,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_bandwidth_sampler(state.clone());
     spawn_edge_rate_sampler(state.clone());
     spawn_snapshot_flusher(state.clone());
+    spawn_history_maintenance(state.clone());
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
@@ -4152,4 +4262,183 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use sqlx::any::AnyPoolOptions;
+
+    async fn test_state() -> AppState {
+        sqlx::any::install_default_drivers();
+        POSTGRES.store(false, Ordering::Relaxed);
+        let db = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("sqlite memory");
+        init_db(&db).await.expect("schema");
+        sqlx::query("INSERT INTO nodes (node_id, token_hash, token, alias, country_code) VALUES (?, ?, ?, ?, ?)")
+            .bind("n1")
+            .bind(hash_token("tok"))
+            .bind("tok")
+            .bind("alias-n1")
+            .bind("cn")
+            .execute(&db)
+            .await
+            .expect("seed node");
+        AppState {
+            db,
+            sessions: Default::default(),
+            postgres: false,
+            agents: Default::default(),
+            pending: Default::default(),
+            last_traffic: Default::default(),
+            edge_traffic: Default::default(),
+            edge_rates: Default::default(),
+            node_rt: Default::default(),
+            rt_flush: Default::default(),
+            geo_attempts: Default::default(),
+        }
+    }
+
+    fn frame(rx: u64) -> Value {
+        json!({
+            "public_ipv4": "203.0.113.5",
+            "cpu_pct": 12.0,
+            "mem_pct": 30.0,
+            "mem_used": 1024,
+            "mem_total": 4096,
+            "instances": [{
+                "network_name": "netA",
+                "peer_id": 11,
+                "p2p_group": "cn",
+                "hostname": "node-one",
+                "version": "test",
+                "ipv4": "10.1.0.1",
+                "topology": {
+                    "nodes": [
+                        {"peer_id": 11, "local": true, "hostname": "node-one", "ipv4": "10.1.0.1"},
+                        {"peer_id": 22, "local": false, "hostname": "node-two", "ipv4": "10.1.0.2"}
+                    ],
+                    "edges": [{
+                        "a": 11, "b": 22,
+                        "tunnels": [{
+                            "type": "tcp",
+                            "local_addr": "tcp://10.1.0.1:11011",
+                            "remote_addr": "tcp://10.1.0.2:11011",
+                            "latency_ms": 12.5,
+                            "loss_pct": 0.5,
+                            "rx_bytes": rx,
+                            "tx_bytes": rx / 2,
+                            "capacity_mbps": 100.0
+                        }]
+                    }]
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn realtime_is_memory_only_and_flush_persists() {
+        let state = test_state().await;
+        apply_snapshot_to_rt(&state, "n1", &frame(1_000_000));
+        sample_edge_rates_once(&state);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        apply_snapshot_to_rt(&state, "n1", &frame(3_000_000));
+        sample_edge_rates_once(&state);
+
+        // 1) no SQL write happened just from receiving frames
+        let snapshot_before: Option<String> = sqlx::query_scalar("SELECT snapshot FROM nodes WHERE node_id = 'n1'")
+            .fetch_optional(&state.db)
+            .await
+            .unwrap()
+            .flatten();
+        // schema default is the literal string "null"; receiving frames must not
+        // replace it (only the batch flusher writes real snapshots)
+        assert!(
+            snapshot_before.as_deref().map(|v| v == "null" || v.is_empty()).unwrap_or(true),
+            "per-frame snapshot must not hit SQL, got {snapshot_before:?}"
+        );
+
+        // 2) topology API serves the in-memory state with rates + latency
+        let topo = topology_payload(&state, None, None).await;
+        let graph = &topo["graph"];
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+        let edges = graph["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        let rx = edges[0]["rx_bps"].as_f64().unwrap();
+        assert!(rx > 1_000_000.0, "rate should reflect ~2MB over ~1s, got {rx}");
+        assert_eq!(edges[0]["latency_ms"].as_f64().unwrap(), 12.5);
+
+        // 3) network scope still isolates correctly
+        let scoped = topology_payload(&state, Some("netA"), None).await;
+        assert_eq!(scoped["graph"]["edges"].as_array().unwrap().len(), 1);
+        let other = topology_payload(&state, Some("netB"), None).await;
+        assert!(other["graph"]["edges"].as_array().unwrap().is_empty());
+
+        // 4) node list merges DB static metadata with memory telemetry
+        let nodes = nodes_payload(&state).await;
+        let node = &nodes["nodes"].as_array().unwrap()[0];
+        assert_eq!(node["status"].as_str(), Some("online"));
+        assert_eq!(node["alias"].as_str(), Some("alias-n1"));
+        assert!(node["rx_bps"].as_f64().unwrap() > 0.0);
+
+        // 5) explicit flush writes snapshot, telemetry and link history
+        let rt = state.node_rt.get("n1").unwrap().clone();
+        assert!(flush_one_node(state.clone(), "n1".to_string(), rt).await);
+        let (snapshot_after, rx_bps): (String, f64) =
+            sqlx::query_as("SELECT snapshot, rx_bps FROM nodes WHERE node_id = 'n1'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert!(snapshot_after.contains("netA"));
+        assert!(rx_bps > 0.0);
+        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert!(links >= 1, "flush must persist link samples, got {links}");
+    }
+
+    #[tokio::test]
+    async fn link_history_is_downsampled_and_pruned() {
+        let state = test_state().await;
+        let now_ts = now();
+        let insert = |ts: i64, latency: f64| {
+            let db = state.db.clone();
+            async move {
+                sqlx::query("INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES ('netA', 11, 22, 'u1', 'u2', ?, ?, 0.0)")
+                    .bind(ts)
+                    .bind(latency)
+                    .execute(&db)
+                    .await
+                    .unwrap();
+            }
+        };
+        // two raw samples older than 1h, off bucket boundaries
+        insert(now_ts - 7200 + 7, 10.0).await;
+        insert(now_ts - 7200 + 19, 20.0).await;
+        // one sample beyond the 30 day retention window
+        insert(now_ts - 31 * 24 * 3600, 30.0).await;
+
+        compact_link_metrics(&state).await;
+
+        let raw_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics WHERE ts % 60 <> 0")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(raw_left, 0, "raw off-bucket samples must be aggregated away");
+        let aggregated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics WHERE ts % 60 = 0")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert!(aggregated >= 1, "aggregated buckets expected, got {aggregated}");
+        let expired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics WHERE ts < ?")
+            .bind(now_ts - 30 * 24 * 3600)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(expired, 0, "rows older than 30 days must be deleted");
+    }
 }
