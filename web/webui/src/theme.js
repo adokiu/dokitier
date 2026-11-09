@@ -26,7 +26,7 @@ export const PurpleTheme = {
     'on-background': '#1b1c1d',
     'on-primary': '#fff',
     'on-secondary': '#fff',
-    'on-surface-variant': '#fff',
+    'on-surface-variant': '#4b5563',
     'surface-variant': '#eef2f6',
     background: '#ffffff',
     overlay: '#ffffffaa',

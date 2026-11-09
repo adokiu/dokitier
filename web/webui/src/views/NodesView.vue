@@ -8,7 +8,9 @@
       <v-spacer />
       <v-select
         v-model="networkFilter"
-        :items="networkOptions"
+        :items="networkFilterItems"
+        item-title="title"
+        item-value="value"
         :label="t('nodes.networkFilter')"
         density="compact"
         variant="outlined"
@@ -16,11 +18,11 @@
         style="max-width: 240px"
       />
       <v-chip size="small" variant="tonal" color="primary">{{ t('nodes.total', { n: filteredNodes.length }) }}</v-chip>
-      <v-btn size="small" variant="text" prepend-icon="mdi-refresh" :loading="loading" @click="load">{{ t('common.refresh') }}</v-btn>
     </div>
 
     <v-card>
-      <v-data-table
+      <DokTable
+        class="nodes-table"
         :headers="headers"
         :items="filteredNodes"
         :loading="loading"
@@ -28,22 +30,40 @@
         hover
         @click:row="(_, row) => open(row.item)"
       >
-        <template #item.hostname="{ item }">
+        <template #item.status="{ item }">
+          <v-chip size="x-small" :color="item.status === 'online' ? 'success' : 'error'" variant="tonal">{{ item.status }}</v-chip>
+        </template>
+        <template #item.alias="{ item }">
           <div class="d-flex align-center gap-2 node-name">
-            <img
-              v-if="flagUrl(item)"
-              :src="flagUrl(item)"
-              class="node-flag"
-              alt=""
-              loading="lazy"
-            />
-            <v-icon v-else icon="mdi-earth" size="14" class="text-medium-emphasis" />
-            <span class="node-host">{{ item.hostname || item.node_id }}</span>
-            <v-chip v-if="item.status !== 'online'" size="x-small" color="error" variant="tonal">{{ item.status }}</v-chip>
+            <img :src="flagUrl(item)" class="node-flag" alt="" loading="lazy" />
+            <span class="node-alias">{{ item.alias || item.hostname || item.node_id }}</span>
           </div>
         </template>
-        <template #item.ip="{ item }">
-          <span class="mono text-caption">{{ item.public_ipv4 || item.public_ipv6 || overlayIp(item) || '-' }}</span>
+        <template #item.vpnIp="{ item }">
+          <div class="ip-cell">
+            <div v-if="ipInfo(item, 'vpn').v4">{{ ipInfo(item, 'vpn').v4 }}</div>
+            <div v-if="ipInfo(item, 'vpn').v6" class="ip-v6">{{ ipInfo(item, 'vpn').v6 }}</div>
+            <div v-if="!ipInfo(item, 'vpn').v4 && !ipInfo(item, 'vpn').v6">-</div>
+          </div>
+        </template>
+        <template #item.publicIp="{ item }">
+          <div class="ip-cell">
+            <div v-if="ipInfo(item, 'public').v4">{{ ipInfo(item, 'public').v4 }}</div>
+            <div v-if="ipInfo(item, 'public').v6" class="ip-v6">{{ ipInfo(item, 'public').v6 }}</div>
+            <div v-if="!ipInfo(item, 'public').v4 && !ipInfo(item, 'public').v6">-</div>
+          </div>
+        </template>
+        <template #item.cpu="{ item }">
+          <div class="meter-cell">
+            <div class="meter-value">{{ pctText(item.cpu_pct) }}</div>
+            <div class="meter-track"><div class="meter-fill" :style="{ width: barWidth(item.cpu_pct), background: usageColor(item.cpu_pct) }" /></div>
+          </div>
+        </template>
+        <template #item.mem="{ item }">
+          <div class="meter-cell">
+            <div class="meter-value">{{ pctText(memPct(item)) }}</div>
+            <div class="meter-track"><div class="meter-fill" :style="{ width: barWidth(memPct(item)), background: usageColor(memPct(item)) }" /></div>
+          </div>
         </template>
         <template #item.version="{ item }"><span class="text-caption">{{ item.version || '-' }}</span></template>
         <template #item.traffic="{ item }">
@@ -52,43 +72,202 @@
             <span class="down">↓ {{ bps(item.rx_bps) }}</span>
           </div>
         </template>
-        <template #item.last_seen="{ item }">{{ item.last_seen ? new Date(item.last_seen * 1000).toLocaleString() : '-' }}</template>
+        <template #item.trafficTotal="{ item }"><span class="traffic-total">{{ humanBytes(trafficTotal(item)) }}</span></template>
         <template #item.actions="{ item }">
           <div class="d-flex gap-1">
             <v-btn size="x-small" variant="text" prepend-icon="mdi-cog" @click.stop="open(item)">{{ t('nodes.config') }}</v-btn>
-            <v-btn size="x-small" variant="text" prepend-icon="mdi-refresh" @click.stop="refreshItem(item)">{{ t('common.refresh') }}</v-btn>
           </div>
         </template>
-      </v-data-table>
+      </DokTable>
     </v-card>
 
-    <DetailDrawer v-model="drawer" :title="detail?.hostname || detail?.node_id || ''" :subtitle="detail ? detail.node_id : ''" :width="620">
+    <DetailDrawer v-model="drawer" :title="detail ? (detail.hostname || detail.node_id) : ''" :subtitle="detail ? (detail.instance_ids?.[0]?.instance_id || detail.node_uuid || detail.node_id) : ''" :width="620">
       <template v-if="detail">
-        <div class="stat-label mb-2">{{ t('nodes.networks') }} ({{ currentNetworks.length }})</div>
-        <div v-for="n in currentNetworks" :key="n.network_name" class="net-row" :class="{ active: n.network_name === network }" @click="selectNetwork(n.network_name)">
-          <div>
-            <div class="net-name">{{ n.network_name }}</div>
-            <div class="net-meta">p2p {{ n.p2p_group || '-' }} / {{ n.ipv4 || '-' }}</div>
-          </div>
-          <v-chip size="x-small" variant="tonal" color="primary">{{ t('nodes.running') }}</v-chip>
-        </div>
+        <v-tabs v-model="drawerTab" density="compact" class="drawer-tabs mb-3">
+          <v-tab value="network">网络配置</v-tab>
+          <v-tab value="node">节点配置</v-tab>
+          <v-tab value="system">节点参数</v-tab>
+        </v-tabs>
 
-        <template v-if="network">
-          <v-divider class="my-4" />
-          <div class="d-flex align-center mb-2">
-            <span class="stat-label">{{ t('nodes.configFile') }} / {{ network }}</span>
-            <v-spacer />
-            <v-btn size="x-small" variant="text" prepend-icon="mdi-history" @click="openVersions">{{ t('nodes.history') }}</v-btn>
-            <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click="downloadConfig">{{ t('nodes.download') }}</v-btn>
+        <div class="drawer-panels">
+          <div v-show="drawerTab === 'network'">
+            <div class="stat-label mb-2">{{ t('nodes.networks') }} ({{ currentNetworks.length }})</div>
+            <div class="d-flex align-center gap-2">
+              <v-select
+                :model-value="network"
+                :items="networkSelectItems"
+                item-title="title"
+                item-value="value"
+                label="选择网络"
+                density="compact"
+                variant="outlined"
+                hide-details
+                class="network-picker"
+                @update:model-value="selectNetwork"
+              />
+              <v-btn size="small" variant="text" prepend-icon="mdi-plus" @click="addNetworkOpen = true">添加网络</v-btn>
+              <v-btn v-if="network" size="small" variant="text" icon="mdi-delete-outline" @click="deleteNetwork(network)" />
+            </div>
+
+            <template v-if="network">
+              <v-divider class="my-4" />
+              <div class="d-flex align-center mb-2">
+                <span class="stat-label">{{ t('nodes.configFile') }} / {{ network }}</span>
+                <v-spacer />
+                <v-btn size="x-small" variant="text" prepend-icon="mdi-history" @click="openVersions">{{ t('nodes.history') }}</v-btn>
+                <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click="downloadConfig">{{ t('nodes.download') }}</v-btn>
+              </div>
+              <v-alert v-if="draftNetwork" type="info" density="compact" variant="tonal" class="mb-3">
+                新网络草稿（{{ draftNetwork }}）：只有点击“保存并应用”才会下发，不会自动提交。
+              </v-alert>
+              <NetworkConfigEditor ref="configEditor" v-model:toml="configText" />
+              <v-alert v-if="configError" type="error" variant="tonal" density="compact" class="mb-2">{{ configError }}</v-alert>
+              <v-alert v-if="saved" type="success" variant="tonal" density="compact" class="mb-2">{{ t('nodes.applied') }}</v-alert>
+              <div class="d-flex gap-2 config-actions">
+                <v-btn color="primary" :loading="saving" @click="saveConfig">{{ t('nodes.saveApply') }}</v-btn>
+                <v-btn variant="text" :loading="configLoading" @click="loadConfig">{{ t('nodes.reload') }}</v-btn>
+              </div>
+            </template>
           </div>
-          <v-textarea v-model="configText" class="config-editor mono" rows="16" variant="outlined" density="compact" spellcheck="false" :loading="configLoading" />
-          <v-alert v-if="configError" type="error" variant="tonal" density="compact" class="mb-2">{{ configError }}</v-alert>
-          <v-alert v-if="saved" type="success" variant="tonal" density="compact" class="mb-2">{{ t('nodes.applied') }}</v-alert>
-          <div class="d-flex gap-2">
-            <v-btn color="primary" :loading="saving" @click="saveConfig">{{ t('nodes.saveApply') }}</v-btn>
-            <v-btn variant="text" :loading="configLoading" @click="loadConfig">{{ t('nodes.reload') }}</v-btn>
+
+          <div v-show="drawerTab === 'node'">
+            <div class="node-settings">
+              <div class="stat-label mb-1">节点名称</div>
+              <div class="node-field-hint">留空显示主机名，用于列表和拓扑展示</div>
+              <v-text-field v-model="nodeAlias" density="compact" variant="outlined" hide-details placeholder="留空显示主机名" class="mb-4" />
+              <div class="stat-label mb-1">上行带宽（Mbps）</div>
+              <div class="node-field-hint">节点上行能力，参与链路容量 min(up(src), down(dst))</div>
+              <v-text-field v-model.number="nodeBandwidthUp" type="number" density="compact" variant="outlined" hide-details placeholder="例如 500" class="mb-4" />
+              <div class="stat-label mb-1">下行带宽（Mbps）</div>
+              <div class="node-field-hint">节点下行能力，作为对端看到的链路容量上限</div>
+              <v-text-field v-model.number="nodeBandwidthDown" type="number" density="compact" variant="outlined" hide-details placeholder="例如 100" class="mb-4" />
+              <div class="stat-label mb-1">内网下行上限（Mbps）</div>
+              <div class="node-field-hint">对端为内网地址时额外施加的容量上限，留空继承下行带宽</div>
+              <v-text-field v-model.number="nodeIntranetCap" type="number" density="compact" variant="outlined" hide-details placeholder="留空使用下行带宽" class="mb-4" />
+              <div class="stat-label mb-1">共享监听地址（core 级）</div>
+              <div class="node-field-hint">所有网络共用；保存后原子热更新，已有连接不断开。可添加多个监听（TCP 与 QUIC 可使用同一端口）。</div>
+              <div v-for="(l, i) in nodeSharedListeners" :key="'sl' + i" class="shared-listener-row">
+                <v-select v-model="l.proto" :items="sharedProtoOptions" density="compact" variant="outlined" hide-details class="proto-select" />
+                <v-text-field v-model="l.addr" density="compact" variant="outlined" hide-details placeholder="0.0.0.0:12401" />
+                <v-btn size="small" variant="text" icon="mdi-delete-outline" @click="nodeSharedListeners.splice(i, 1)" />
+              </div>
+              <v-btn size="small" variant="text" prepend-icon="mdi-plus" class="mb-4" @click="nodeSharedListeners.push({ proto: 'tcp', addr: '0.0.0.0:12401' })">添加共享监听</v-btn>
+              <div class="stat-label mb-1">公网下行上限（Mbps）</div>
+              <div class="node-field-hint">对端为公网地址时额外施加的容量上限，留空继承下行带宽</div>
+              <v-text-field v-model.number="nodeInternetCap" type="number" density="compact" variant="outlined" hide-details placeholder="留空使用下行带宽" class="mb-4" />
+              <v-btn color="primary" :loading="savingNodeSettings" @click="saveNodeSettings">保存</v-btn>
+            </div>
           </div>
-        </template>
+
+          <div v-show="drawerTab === 'system'">
+            <div class="sys-grid">
+              <div class="sys-card">
+                <div class="sys-title">CPU</div>
+                <div class="sys-main">{{ sysInfo.cpu_model || '-' }}</div>
+                <div class="sys-sub">{{ sysInfo.cpu_cores || '-' }} 核 / {{ sysInfo.cpu_threads || '-' }} 线程 / {{ sysInfo.cpu_arch || '-' }}</div>
+              </div>
+              <div class="sys-card">
+                <div class="sys-title">内存</div>
+                <div class="sys-main">{{ fmtBytes(detail.mem_total) }}</div>
+                <div class="sys-sub">已用 {{ fmtBytes(detail.mem_used) }} / {{ Number(detail.mem_pct || 0).toFixed(1) }}%</div>
+                <div class="sys-bar"><div class="sys-bar-fill" :style="{ width: Math.min(100, Number(detail.mem_pct || 0)) + '%' }" /></div>
+              </div>
+              <div class="sys-card sys-card--wide">
+                <div class="sys-title">系统</div>
+                <div class="kv"><span>主机名</span><b>{{ sysInfo.hostname || detail.hostname || '-' }}</b></div>
+                <div class="kv"><span>操作系统</span><b>{{ sysInfo.os_version || sysInfo.os_name || '-' }}</b></div>
+                <div class="kv"><span>内核</span><b>{{ sysInfo.kernel || '-' }}</b></div>
+                <div class="kv"><span>运行时长</span><b>{{ uptimeText }}</b></div>
+              </div>
+              <div class="sys-card sys-card--wide">
+                <div class="sys-title">公网与路由</div>
+                <div class="kv"><span>公网 IPv4</span><b class="num">{{ detail.public_ipv4 || '未检测到' }}</b></div>
+                <div class="kv"><span>公网 IPv6</span><b class="num">{{ detail.public_ipv6 || '未检测到' }}</b></div>
+                <div class="kv"><span>网关</span><b class="num">{{ sysNetwork.gateway ? `${sysNetwork.gateway.gateway} dev ${sysNetwork.gateway.interface}` : '未检测到' }}</b></div>
+                <div class="kv"><span>IPv4 地址</span><b class="num">{{ ipv4List || '未检测到' }}</b></div>
+                <div class="kv"><span>IPv4 段</span><b class="num">{{ (sysNetwork.ipv4_prefixes || []).join('  ') || '未检测到' }}</b></div>
+                <div class="kv"><span>IPv6 地址</span><b class="num">{{ ipv6List || '未检测到' }}</b></div>
+                <div class="kv"><span>IPv6 段</span><b class="num">{{ (sysNetwork.ipv6_prefixes || []).join('  ') || '未检测到' }}</b></div>
+              </div>
+              <div class="sys-card sys-card--wide">
+                <div class="sys-title">网卡</div>
+                <div class="nic-scroll">
+                  <table class="nic-table">
+                    <thead><tr><th>网卡</th><th>状态</th><th>驱动/速率</th><th>MAC</th><th>IPv4</th><th>IPv6</th></tr></thead>
+                    <tbody>
+                      <tr v-for="nic in sysNetwork.interfaces || []" :key="nic.name">
+                        <td>{{ nic.name }}</td>
+                        <td>{{ nic.state || '-' }}</td>
+                        <td>{{ nic.driver || '-' }}<span v-if="nic.speed_mbps"> / {{ nic.speed_mbps }} Mbps</span></td>
+                        <td class="num">{{ nic.mac || '-' }}</td>
+                        <td class="num">{{ (nic.ipv4 || []).join(' ') || '-' }}</td>
+                        <td class="num">{{ (nic.ipv6 || []).join(' ') || '-' }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="sys-card sys-card--wide">
+                <div class="sys-title">磁盘</div>
+                <div class="nic-scroll">
+                  <table class="nic-table">
+                    <thead><tr><th>设备</th><th>挂载点</th><th>类型</th><th>容量</th><th>可用</th></tr></thead>
+                    <tbody>
+                      <tr v-for="disk in sysInfo.disks || []" :key="disk.name + disk.mount">
+                        <td>{{ disk.name }}</td>
+                        <td class="num">{{ disk.mount || '-' }}</td>
+                        <td>{{ disk.kind || '-' }}</td>
+                        <td>{{ fmtBytes(disk.total) }}</td>
+                        <td>{{ fmtBytes(disk.available) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="sys-card sys-card--wide">
+                <div class="sys-title">隧道质量</div>
+                <div class="nic-scroll">
+                  <table class="nic-table">
+                    <thead><tr><th>网络</th><th>类型</th><th>对端</th><th>Ping 延迟</th><th>Ping 丢包</th><th>传输丢包</th><th>容量</th><th>来源</th><th>利用率</th></tr></thead>
+                    <tbody>
+                      <tr v-for="row in tunnelRows" :key="row.network + row.remote">
+                        <td>{{ row.network }}</td>
+                        <td>
+                          <span v-if="row.typeLabel !== '-'" class="proto-badge" :class="'proto-badge--' + row.typeClass" :title="row.typeTitle">{{ row.typeLabel }}</span>
+                          <span v-else>-</span>
+                        </td>
+                        <td class="mono">{{ row.remote }}</td>
+                        <td>{{ row.latency != null ? row.latency.toFixed(2) + ' ms' : '-' }}</td>
+                        <td>{{ row.loss != null ? row.loss.toFixed(2) + ' %' : '-' }}</td>
+                        <td>{{ row.transportLoss != null ? row.transportLoss.toFixed(2) + ' %' : '-' }}</td>
+                        <td>{{ row.capacity ? row.capacity.toFixed(0) + ' Mbps' : '未测量' }}</td>
+                        <td>{{ capacitySourceLabel(row.capacitySource) }}</td>
+                        <td>{{ row.utilization != null ? (row.utilization * 100).toFixed(1) + ' %' : '-' }}</td>
+                      </tr>
+                      <tr v-if="!tunnelRows.length"><td colspan="9" class="text-medium-emphasis">暂无数据</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div class="sys-card sys-card--wide">
+                <div class="sys-title">虚拟网络能力</div>
+                <div class="kv" v-if="sysInfo.shared_listener"><span>共享监听</span><b class="num">{{ sysInfo.shared_listener }}</b></div>
+                <div class="cap-row">
+                  <v-chip size="x-small" :color="sysInfo.capabilities?.tun ? 'success' : 'error'" variant="tonal">TUN {{ sysInfo.capabilities?.tun ? '可用' : '不可用' }}</v-chip>
+                  <v-chip size="x-small" :color="sysInfo.capabilities?.tap ? 'success' : 'error'" variant="tonal">TAP {{ sysInfo.capabilities?.tap ? '可用' : '不可用' }}</v-chip>
+                  <v-chip size="x-small" :color="sysInfo.capabilities?.vxlan ? 'success' : 'error'" variant="tonal">VXLAN {{ sysInfo.capabilities?.vxlan ? '可用' : '不可用' }}</v-chip>
+                </div>
+              </div>
+              <div class="sys-card sys-card--wide">
+                <div class="sys-title">网络与运行</div>
+                <div class="kv"><span>公网 IPv4</span><b class="num">{{ detail.public_ipv4 || '-' }}</b></div>
+                <div class="kv"><span>公网 IPv6</span><b class="num">{{ detail.public_ipv6 || '-' }}</b></div>
+                <div class="kv"><span>节点 UUID</span><b class="num">{{ detail.instance_ids?.[0]?.instance_id || detail.node_uuid || detail.node_id }}</b></div>
+                <div class="kv"><span>版本</span><b>{{ detail.version || '-' }}</b></div>
+              </div>
+            </div>
+          </div>
+        </div>
       </template>
     </DetailDrawer>
 
@@ -98,7 +277,7 @@
         <v-list density="compact">
           <v-list-item v-for="v in versions" :key="v.id">
             <v-list-item-title>{{ new Date(v.created * 1000).toLocaleString() }}</v-list-item-title>
-            <v-list-item-subtitle class="mono">{{ v.network }} / {{ v.hash.slice(0, 16) }}</v-list-item-subtitle>
+            <v-list-item-subtitle class="num">{{ v.network }} / {{ v.hash.slice(0, 16) }}</v-list-item-subtitle>
             <template #append>
               <v-btn size="x-small" variant="text" :loading="rollingBack === v.id" @click="rollback(v)">回滚</v-btn>
             </template>
@@ -107,22 +286,55 @@
         </v-list>
       </v-card>
     </v-dialog>
+
+    <v-dialog v-model="addNetworkOpen" max-width="420">
+      <v-card class="pa-4">
+        <v-card-title>添加网络</v-card-title>
+        <v-text-field v-model="newNetworkName" label="网络名称" density="compact" variant="outlined" hide-details class="mt-2" />
+        <div class="d-flex justify-end gap-2 mt-4">
+          <v-btn variant="text" @click="addNetworkOpen = false">取消</v-btn>
+          <v-btn color="primary" @click="createNetwork">创建</v-btn>
+        </div>
+      </v-card>
+    </v-dialog>
+
+    <v-dialog v-model="aliasOpen" max-width="420">
+      <v-card class="pa-4">
+        <v-card-title>{{ t('nodes.setAlias') }}</v-card-title>
+        <v-text-field v-model="aliasValue" density="compact" variant="outlined" hide-details class="mt-2" :label="t('nodes.columns.name')" />
+        <div class="d-flex justify-end gap-2 mt-4">
+          <v-btn variant="text" @click="aliasOpen = false">{{ t('common.cancel') }}</v-btn>
+          <v-btn color="primary" :loading="savingAlias" @click="saveAlias">{{ t('common.save') }}</v-btn>
+        </div>
+      </v-card>
+    </v-dialog>
   </div>
-</template>
+  </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api } from '@/api'
 import DetailDrawer from '@/components/DetailDrawer.vue'
+import DokTable from '@/components/DokTable.vue'
+import NetworkConfigEditor from '@/components/NetworkConfigEditor.vue'
+import {
+  protocolClass,
+  protocolLabel,
+  protocolRaw,
+} from '@/utils/protocol'
 
 const { t } = useI18n()
 const headers = computed(() => [
-  { title: t('nodes.columns.hostname'), key: 'hostname' },
-  { title: t('nodes.columns.ip'), key: 'ip' },
-  { title: t('nodes.columns.version'), key: 'version' },
-  { title: t('nodes.columns.network'), key: 'traffic', sortable: false },
-  { title: t('nodes.columns.lastSeen'), key: 'last_seen' },
+  { title: t('nodes.columns.status'), key: 'status', width: 88 },
+  { title: t('nodes.columns.name'), key: 'alias', width: 220 },
+  { title: t('nodes.columns.vpnIp'), key: 'vpnIp', width: 132 },
+  { title: t('nodes.columns.publicIp'), key: 'publicIp', width: 180 },
+  { title: t('nodes.columns.version'), key: 'version', width: 100 },
+  { title: t('nodes.columns.cpu'), key: 'cpu', width: 160 },
+  { title: t('nodes.columns.mem'), key: 'mem', width: 160 },
+  { title: t('nodes.columns.network'), key: 'traffic', sortable: false, width: 200 },
+  { title: '流量', key: 'trafficTotal', sortable: false, width: 110 },
   { title: t('nodes.columns.actions'), key: 'actions', sortable: false },
 ])
 
@@ -140,6 +352,202 @@ const saved = ref(false)
 const versionsOpen = ref(false)
 const versions = ref([])
 const rollingBack = ref(null)
+const aliasOpen = ref(false)
+const aliasValue = ref('')
+const aliasTarget = ref(null)
+const savingAlias = ref(false)
+const configEditor = ref(null)
+const draftNetwork = ref('')
+const drawerTab = ref('network')
+const nodeAlias = ref('')
+const nodeBandwidthUp = ref('')
+const nodeBandwidthDown = ref('')
+const nodeIntranetCap = ref('')
+const nodeInternetCap = ref('')
+const nodeSharedListeners = ref([])
+const sharedProtoOptions = ['tcp', 'udp', 'quic', 'ws', 'wss']
+const savingNodeSettings = ref(false)
+const sysInfo = computed(() => detail.value?.system_info || detail.value?.snapshot?.system || {})
+const sysSnapshot = computed(() => detail.value?.snapshot || {})
+const sysNetwork = computed(() => sysInfo.value?.network || {})
+const ipv4List = computed(() => (sysNetwork.value.interfaces || []).flatMap((nic) => nic.ipv4 || []).join('  '))
+const ipv6List = computed(() => (sysNetwork.value.interfaces || []).flatMap((nic) => nic.ipv6 || []).join('  '))
+const tunnelRows = computed(() => {
+  const rows = []
+  for (const inst of sysSnapshot.value.instances || []) {
+    const network = inst.network_name || '-'
+    for (const edge of (inst.topology || {}).edges || []) {
+      for (const t of edge.tunnels || []) {
+        rows.push({
+          network,
+          type: t.type || '',
+          typeLabel: protocolLabel(t.type),
+          typeClass: protocolClass(t.type),
+          typeTitle: protocolRaw(t.type),
+          remote: t.remote_addr || `${edge.a} / ${edge.b}`,
+          latency: t.latency_ms,
+          loss: t.loss_pct,
+          transportLoss: t.transport_loss_pct,
+          capacity: t.capacity_mbps,
+          capacitySource: t.capacity_source,
+          utilization: t.utilization,
+        })
+      }
+    }
+  }
+  return rows
+})
+const uptimeText = computed(() => {
+  const boot = Number(sysInfo.value.boot_time_secs || 0)
+  if (!boot) return '-'
+  return fmtUptime(Date.now() / 1000 - boot)
+})
+const addNetworkOpen = ref(false)
+const newNetworkName = ref('')
+
+function openAlias(item) {
+  aliasTarget.value = item
+  aliasValue.value = item.alias || ''
+  aliasOpen.value = true
+}
+
+async function saveAlias() {
+  if (!aliasTarget.value) return
+  savingAlias.value = true
+  try {
+    await api.setAlias(aliasTarget.value.node_id, aliasValue.value)
+    aliasTarget.value.alias = aliasValue.value
+    aliasOpen.value = false
+  } finally {
+    savingAlias.value = false
+  }
+}
+
+function joinEndpoint(proto, addr) {
+  const value = String(addr || '').trim()
+  if (!value) return ''
+  if (value.includes('://')) return value
+  return `${proto || 'tcp'}://${value}`
+}
+
+function splitEndpoint(url) {
+  const value = String(url || '').trim()
+  const match = value.match(/^([a-z0-9+.-]+):\/\/(.*)$/i)
+  if (match) return { proto: match[1].toLowerCase(), addr: match[2] }
+  return { proto: 'tcp', addr: value }
+}
+
+function capacitySourceLabel(source) {
+  return { probe: '实测', unmeasured: '未测量' }[source] || source || '-'
+}
+
+function fmtUptime(seconds) {
+  const total = Number(seconds || 0)
+  if (!total) return '-'
+  const d = Math.floor(total / 86400)
+  const h = Math.floor((total % 86400) / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  return `${d}d ${h}h ${m}m`
+}
+
+const TRAFFIC_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']
+
+function humanBytes(value) {
+  let amount = Number(value || 0)
+  let unit = 0
+  while (amount >= 1024 && unit < TRAFFIC_UNITS.length - 1) {
+    amount /= 1024
+    unit += 1
+  }
+  return `${amount.toFixed(1)} ${TRAFFIC_UNITS[unit]}`
+}
+
+function trafficTotal(item) {
+  const map = item.traffic || {}
+  if (networkFilter.value && map[networkFilter.value] != null) return map[networkFilter.value]
+  return Object.values(map).reduce((sum, value) => sum + Number(value || 0), 0)
+}
+
+function fmtBytes(v) {
+  if (v == null) return '-'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let n = Number(v)
+  let i = 0
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
+  return `${n.toFixed(i >= 3 ? 1 : 0)} ${units[i]}`
+}
+
+function memText(item) {
+  if (!item.mem_total) return '-'
+  const pct = item.mem_pct != null ? item.mem_pct.toFixed(0) : Math.round(((item.mem_used || 0) / item.mem_total) * 100)
+  return `${fmtBytes(item.mem_used)} / ${fmtBytes(item.mem_total)} (${pct}%)`
+}
+
+let events = null
+let retry = null
+
+function mapNodes(list) {
+  return (list || []).map((n) => ({
+    ...n,
+    hostname: n.hostname || n.snapshot?.instances?.[0]?.hostname,
+    version: n.version || n.snapshot?.instances?.[0]?.version,
+  }))
+}
+
+function connectEvents() {
+  if (typeof EventSource === 'undefined') return
+  events = new EventSource('/api/board/events')
+  events.addEventListener('nodes', (ev) => {
+    try {
+      const data = JSON.parse(ev.data)
+      if (Array.isArray(data.nodes)) nodes.value = mapNodes(data.nodes)
+    } catch {}
+  })
+  events.onerror = () => {
+    events?.close()
+    events = null
+    if (retry) clearTimeout(retry)
+    retry = setTimeout(connectEvents, 5000)
+  }
+}
+
+async function saveNodeSettings() {
+  if (!detail.value) return
+  savingNodeSettings.value = true
+  try {
+    const up = nodeBandwidthUp.value === '' ? null : Number(nodeBandwidthUp.value)
+    const down = nodeBandwidthDown.value === '' ? null : Number(nodeBandwidthDown.value)
+    const intranet = nodeIntranetCap.value === '' ? null : Number(nodeIntranetCap.value)
+    const internet = nodeInternetCap.value === '' ? null : Number(nodeInternetCap.value)
+    const res = await api.setNodeSettings(detail.value.node_id, {
+      alias: nodeAlias.value,
+      bandwidth_up_mbps: up,
+      bandwidth_down_mbps: down,
+      bandwidth_intranet_down_mbps: intranet,
+      bandwidth_internet_down_mbps: internet,
+      shared_listeners: nodeSharedListeners.value
+        .map((l) => joinEndpoint(l.proto, l.addr))
+        .filter(Boolean)
+        .join(','),
+    })
+    if (!res.ok) throw new Error(res.error || 'save failed')
+    detail.value.alias = nodeAlias.value
+    detail.value.bandwidth_up_mbps = up
+    detail.value.bandwidth_down_mbps = down
+    detail.value.bandwidth_intranet_down_mbps = intranet
+    detail.value.bandwidth_internet_down_mbps = internet
+    const row = nodes.value.find((n) => n.node_id === detail.value.node_id)
+    if (row) {
+      row.alias = nodeAlias.value
+      row.bandwidth_up_mbps = up
+      row.bandwidth_down_mbps = down
+      row.bandwidth_intranet_down_mbps = intranet
+      row.bandwidth_internet_down_mbps = internet
+    }
+  } finally {
+    savingNodeSettings.value = false
+  }
+}
 
 function networksOf(item) {
   return item.snapshot?.instances || item.instances || []
@@ -151,6 +559,11 @@ const networkOptions = computed(() => {
   return [...names]
 })
 
+const networkFilterItems = computed(() => [
+  { title: '全部网络', value: '' },
+  ...networkOptions.value.map((name) => ({ title: name, value: name })),
+])
+
 const filteredNodes = computed(() => {
   if (!networkFilter.value) return nodes.value
   return nodes.value.filter((node) => networksOf(node).some((n) => n.network_name === networkFilter.value))
@@ -158,13 +571,47 @@ const filteredNodes = computed(() => {
 
 const currentNetworks = computed(() => (detail.value ? networksOf(detail.value) : []))
 
+const networkSelectItems = computed(() => {
+  const items = currentNetworks.value.map((n) => ({
+    title: n.network_name,
+    value: n.network_name,
+    subtitle: `p2p ${n.p2p_group || '-'} / ${n.ipv4 || '-'} / ${(detail.value?.instance_ids || []).find((x) => x.network === n.network_name)?.instance_id?.slice(0, 8) || '-'}`,
+  }))
+  if (network.value && !items.some((i) => i.value === network.value)) {
+    items.push({ title: network.value, value: network.value, subtitle: '未应用的草稿' })
+  }
+  return items
+})
+
+function pctText(v) {
+  return `${Number(v || 0).toFixed(2)}%`
+}
+
+function usageColor(v) {
+  const n = Number(v || 0)
+  if (n >= 85) return '#e53935'
+  if (n >= 60) return '#fb8c00'
+  return '#43a047'
+}
+
+function barWidth(v) {
+  return `${Math.max(0, Math.min(100, Number(v || 0)))}%`
+}
+
+function memPct(item) {
+  if (item.mem_pct != null) return item.mem_pct
+  if (item.mem_total) return ((item.mem_used || 0) / item.mem_total) * 100
+  return 0
+}
+
 function bps(v) {
   if (v == null) return '0 B/s'
   const units = ['B/s', 'KB/s', 'MB/s', 'GB/s']
   let n = Number(v)
   let i = 0
   while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
-  return `${n.toFixed(1)} ${units[i]}`
+  const text = n >= 100 ? n.toFixed(0) : n >= 10 ? n.toFixed(1) : n.toFixed(2)
+  return `${text} ${units[i]}`
 }
 
 function overlayIp(item) {
@@ -172,21 +619,31 @@ function overlayIp(item) {
   return inst?.ipv4 || ''
 }
 
+function shortIp(ip) {
+  if (!ip) return ''
+  const text = String(ip)
+  if (!text.includes(':') || text.length <= 24) return text
+  return `${text.slice(0, 12)}…${text.slice(-8)}`
+}
+
+function ipInfo(item, kind) {
+  const inst = networksOf(item)[0]
+  const v4 = kind === 'vpn' ? inst?.ipv4 : item.public_ipv4
+  const v6 = kind === 'vpn' ? inst?.ipv6 : item.public_ipv6
+  return { v4: v4 || '', v6: shortIp(v6) }
+}
+
 function flagUrl(item) {
-  const code = item.country_code
-  return code && code.length === 2 ? `https://flagcdn.com/${code.toLowerCase()}.svg` : ''
+  const code = (item.country_code || '').toLowerCase()
+  const safe = code.length === 2 ? code : 'un'
+  return `https://flagcdn.com/${safe}.svg`
 }
 
 async function load() {
   loading.value = true
   try {
     const data = await api.boardNodes()
-    nodes.value = (data.nodes || []).map((n) => ({
-      ...n,
-      hostname: n.hostname || n.snapshot?.instances?.[0]?.hostname,
-      version: n.version || n.snapshot?.instances?.[0]?.version,
-    }))
-    if (!networkFilter.value && networkOptions.value.length) networkFilter.value = networkOptions.value[0]
+    nodes.value = mapNodes(data.nodes)
   } finally {
     loading.value = false
   }
@@ -201,6 +658,17 @@ async function refreshItem(item) {
 
 async function open(item) {
   detail.value = item
+  nodeAlias.value = item.alias || ''
+  nodeBandwidthUp.value = item.bandwidth_up_mbps ?? item.bandwidth_mbps ?? ''
+  nodeBandwidthDown.value = item.bandwidth_down_mbps ?? item.bandwidth_mbps ?? ''
+  nodeIntranetCap.value = item.bandwidth_intranet_down_mbps ?? ''
+  nodeSharedListeners.value = String(item.shared_listeners || '')
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean)
+    .map(splitEndpoint)
+  nodeInternetCap.value = item.bandwidth_internet_down_mbps ?? ''
+  drawerTab.value = 'network'
   drawer.value = true
   network.value = networksOf(item)[0]?.network_name || ''
   configText.value = ''
@@ -209,7 +677,23 @@ async function open(item) {
   if (network.value) await loadConfig()
 }
 
+async function deleteNetwork(name) {
+  if (!window.confirm(`删除网络 ${name}？该操作会停止并移除该网络的本地配置`)) return
+  try {
+    const res = await api.boardCommand(detail.value.node_id, { kind: 'delete_network', network: name }, name)
+    if (!res.ok) throw new Error(res.error || 'delete failed')
+    if (network.value === name) {
+      network.value = ''
+      configText.value = ''
+    }
+    await load()
+  } catch (e) {
+    configError.value = String(e.message || e)
+  }
+}
+
 async function selectNetwork(name) {
+  draftNetwork.value = ''
   network.value = name
   configText.value = ''
   configError.value = ''
@@ -217,14 +701,44 @@ async function selectNetwork(name) {
   await loadConfig()
 }
 
+function networkTemplate(name) {
+  return [
+    'hostname = ""',
+    'ipv4 = ""',
+    '',
+    '[network_identity]',
+    `network_name = "${name}"`,
+    'network_secret = ""',
+    '',
+    '[flags]',
+  ].join('\n')
+}
+
+function createNetwork() {
+  const name = newNetworkName.value.trim()
+  if (!name) return
+  network.value = name
+  draftNetwork.value = name
+  configText.value = networkTemplate(name)
+  configError.value = ''
+  saved.value = false
+  addNetworkOpen.value = false
+  newNetworkName.value = ''
+}
+
 async function loadConfig() {
   configLoading.value = true
   configError.value = ''
   saved.value = false
   try {
-    const res = await api.boardCommand(detail.value.node_id, { kind: 'get_config' }, network.value)
-    if (!res.ok) throw new Error(res.error || 'read failed')
-    configText.value = res.config || ''
+    const res = await api.boardVersions(detail.value.node_id)
+    const latest = (res.versions || []).find((v) => v.network === network.value)
+    if (!latest) {
+      configText.value = networkTemplate(network.value)
+      return
+    }
+    const full = await api.boardVersion(detail.value.node_id, latest.id)
+    configText.value = full.toml || networkTemplate(network.value)
   } catch (e) {
     configError.value = String(e.message || e)
   } finally {
@@ -233,13 +747,21 @@ async function loadConfig() {
 }
 
 async function saveConfig() {
+  const problem = configEditor.value?.validate?.()
+  if (problem) {
+    configError.value = problem
+    return
+  }
   saving.value = true
   configError.value = ''
   saved.value = false
   try {
-    const res = await api.boardCommand(detail.value.node_id, { kind: 'apply_config', toml: configText.value }, network.value)
+    const precheck = await api.precheckConfig(network.value, configText.value)
+    if (!precheck.ok) throw new Error((precheck.errors || []).join('; ') || 'precheck failed')
+    const res = await api.boardCommand(detail.value.node_id, { kind: 'apply_network', network: network.value, toml: configText.value }, network.value)
     if (!res.ok) throw new Error(res.error || 'apply failed')
     saved.value = true
+    draftNetwork.value = ''
     await load()
   } catch (e) {
     configError.value = String(e.message || e)
@@ -262,7 +784,8 @@ async function rollback(version) {
   rollingBack.value = version.id
   try {
     const data = await api.boardVersion(detail.value.node_id, version.id)
-    const res = await api.boardCommand(detail.value.node_id, { kind: 'apply_config', toml: data.toml }, data.network || network.value)
+    const target = data.network || network.value
+    const res = await api.boardCommand(detail.value.node_id, { kind: 'apply_network', network: target, toml: data.toml }, target)
     if (!res.ok) throw new Error(res.error || 'rollback failed')
     versionsOpen.value = false
     saved.value = true
@@ -284,21 +807,92 @@ function downloadConfig() {
   URL.revokeObjectURL(a.href)
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  connectEvents()
+})
+
+onBeforeUnmount(() => {
+  if (events) events.close()
+  if (retry) clearTimeout(retry)
+})
 </script>
 
 <style scoped>
+
 .page-sub { margin-top: 4px; font-size: 12px; color: var(--dok-muted); }
 .node-name { min-width: 0; gap: 8px !important; }
-.node-flag { width: 20px; height: 14px; border-radius: 2px; object-fit: cover; flex: 0 0 auto; }
+.node-alias { max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ip-cell { font-size: inherit; line-height: 1.15; }
+:deep(.v-data-table__td:nth-child(6)),
+:deep(.v-data-table__td:nth-child(7)),
+:deep(.v-data-table__th:nth-child(6)),
+:deep(.v-data-table__th:nth-child(7)) { padding-inline: 0 !important; }
+.nodes-table :deep(.v-table__wrapper) { overflow-x: auto !important; overflow-y: hidden !important; }
+.nodes-table :deep(table) { width: 100% !important; min-width: 1500px; table-layout: fixed; }
+.nodes-table :deep(th:nth-child(6)), .nodes-table :deep(td:nth-child(6)),
+.nodes-table :deep(th:nth-child(7)), .nodes-table :deep(td:nth-child(7)) { width: 160px; max-width: 160px; overflow: hidden; }
+.nodes-table :deep(td) { overflow: hidden; text-overflow: ellipsis; }
+.nodes-table :deep(.traffic),
+.nodes-table :deep(.traffic-total),
+.nodes-table :deep(.meter-value),
+.nodes-table :deep(.ip-cell) { font-variant-numeric: tabular-nums; }
+.nodes-table :deep(th), .nodes-table :deep(td) { white-space: nowrap; }
+.nodes-table :deep(.v-data-table__td) { vertical-align: middle; }
+.meter-cell { display: block; width: 120px; overflow: hidden; }
+.meter-value { line-height: 16px; font-size: 12px; }
+.meter-track { display: block; width: 120px; height: 4px; margin-top: 3px; border-radius: 999px; background: rgba(var(--v-theme-on-surface), .14); overflow: hidden; }
+.meter-value { white-space: nowrap; }
+.meter-fill { height: 100%; border-radius: 999px; transition: width .3s ease, background .3s ease; }
+.ip-v6 { color: var(--dok-subtle); }
+.node-flag { width: 24px; height: 16px; border-radius: 2px; object-fit: cover; flex: 0 0 auto; }
 .node-host { font-weight: 500; }
-.traffic { display: flex; gap: 12px; font-size: 11px; color: var(--dok-muted); }
+.traffic { display: flex; gap: 12px; font-size: inherit; color: var(--dok-muted); }
 .traffic .up { color: #2e7d32; }
 .traffic .down { color: #1565c0; }
+.network-picker { max-width: 280px; }
+.config-actions {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px dashed rgba(var(--v-theme-on-surface), .14);
+}
 .net-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: 10px; cursor: pointer; }
 .net-row:hover { background: rgba(60, 150, 202, .05); }
 .net-row.active { background: rgba(60, 150, 202, .08); }
 .net-name { font-size: 13px; font-weight: 600; }
 .net-meta { margin-top: 3px; font-size: 11px; color: var(--dok-muted); }
 .config-editor :deep(textarea) { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.55; }
+
+.drawer-tabs { border-bottom: 1px solid var(--dok-table-line); }
+.node-settings { padding-top: 4px; }
+.shared-listener-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) 36px; gap: 8px; align-items: center; margin-bottom: 8px; }
+.shared-listener-row :deep(.v-input) { width: 100%; }
+.node-field-hint { margin: -4px 0 8px; font-size: 12px; color: rgba(var(--v-theme-on-surface), .58); }
+.drawer-panels { overflow: visible; }
+.drawer-panels > div { min-width: 0; }
+.drawer-tabs :deep(.v-tab) { font-size: 13px; text-transform: none; letter-spacing: 0; }
+.sys-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.cap-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.sys-card {
+  padding: 14px;
+  border: 1px solid rgba(var(--v-theme-on-surface), .12);
+  border-radius: 10px;
+  background: rgba(var(--v-theme-on-surface), .02);
+}
+.sys-card--wide { grid-column: 1 / -1; }
+.sys-title { font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: rgba(var(--v-theme-on-surface), .55); margin-bottom: 8px; }
+.sys-main { font-size: 16px; font-weight: 700; line-height: 1.35; overflow-wrap: anywhere; }
+.sys-sub { margin-top: 6px; font-size: 12px; color: rgba(var(--v-theme-on-surface), .66); }
+.sys-bar { margin-top: 10px; height: 6px; border-radius: 999px; background: rgba(var(--v-theme-on-surface), .12); overflow: hidden; }
+.sys-bar-fill { height: 100%; border-radius: 999px; background: rgb(var(--v-theme-primary)); }
+.kv { display: flex; justify-content: space-between; gap: 16px; padding: 7px 0; font-size: 13px; border-top: 1px dashed rgba(var(--v-theme-on-surface), .1); }
+.kv:first-of-type { border-top: 0; }
+.kv span { color: rgba(var(--v-theme-on-surface), .6); white-space: nowrap; }
+.kv b { font-weight: 500; text-align: right; overflow-wrap: anywhere; }
+
+.nic-scroll { overflow-x: auto; }
+.nic-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.nic-table th, .nic-table td { padding: 7px 10px; text-align: left; white-space: nowrap; border-top: 1px solid rgba(var(--v-theme-on-surface), .1); }
+.nic-table th { color: rgba(var(--v-theme-on-surface), .6); font-weight: 500; border-top: 0; }
+.nic-table td { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 </style>

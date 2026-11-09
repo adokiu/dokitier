@@ -374,6 +374,7 @@ mod tests {
                 Vec::new(),
                 UdpBindOptions::direct_connect(),
                 UdpSessionMode::Classified(UdpSessionProtocol::WireGuard),
+                None,
             )
             .await
             .unwrap();
@@ -459,6 +460,7 @@ mod tests {
                 Vec::new(),
                 UdpBindOptions::direct_connect(),
                 UdpSessionMode::Classified(UdpSessionProtocol::Quic),
+                None,
             )
             .await
             .unwrap();

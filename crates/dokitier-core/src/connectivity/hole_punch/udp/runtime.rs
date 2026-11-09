@@ -300,6 +300,14 @@ pub trait UdpHolePunchPeerSource: Send + Sync {
     fn local_peer_id(&self) -> crate::config::PeerId;
     fn p2p_policy_flags(&self) -> P2pPolicyFlags;
 
+    /// Network this peer belongs to. The hole-punch dialer announces it to the
+    /// punched address before the EasyTier mux Syn so a shared UDP listener can
+    /// demultiplex the flow. Implementations that are not attached to a network
+    /// keep the default (`None`).
+    fn network_name(&self) -> Option<String> {
+        None
+    }
+
     async fn candidates(&self) -> Vec<super::UdpPunchCandidate>;
 
     fn p2p_demand_notify(&self) -> Arc<ExternalTaskSignal>;

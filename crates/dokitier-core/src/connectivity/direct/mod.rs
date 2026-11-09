@@ -665,6 +665,10 @@ where
             self.options.socket_context(transport, IpVersion::Both),
         )
         .await?;
+        crate::socket::udp::register_connect_network(
+            remote_addr,
+            self.peer_manager.network_name().to_string(),
+        );
         let bind_addrs = if self.options.bind_device
             && self.options.allow_interface_bind
             && transport.supports_interface_bind()
@@ -698,6 +702,7 @@ where
                         bind_addrs,
                         self.options.udp_bind.clone(),
                         mode,
+                        Some(self.peer_manager.network_name().to_string()),
                     )
                     .await?,
                 ),
@@ -735,7 +740,17 @@ where
             .remote_send_udp_hole_punch_packet(dst_peer_id, vec![connector_addr], None, url)
             .await;
         let remote_addr = resolve_literal_url(url, IpVersion::V4)?;
-        let connected = udp::connect_with_socket(self.host.clone(), socket, remote_addr).await?;
+        crate::socket::udp::register_connect_network(
+            remote_addr,
+            self.peer_manager.network_name().to_string(),
+        );
+        let connected = udp::connect_with_socket(
+            self.host.clone(),
+            socket,
+            remote_addr,
+            Some(self.peer_manager.network_name().to_string()),
+        )
+        .await?;
         let tunnel = self
             .protocol
             .upgrade_client(ConnectedTransport::Udp(connected), url.clone())
@@ -778,7 +793,17 @@ where
                 .await;
         }
         let remote_addr = resolve_literal_url(url, IpVersion::V6)?;
-        let connected = udp::connect_with_socket(self.host.clone(), socket, remote_addr).await?;
+        crate::socket::udp::register_connect_network(
+            remote_addr,
+            self.peer_manager.network_name().to_string(),
+        );
+        let connected = udp::connect_with_socket(
+            self.host.clone(),
+            socket,
+            remote_addr,
+            Some(self.peer_manager.network_name().to_string()),
+        )
+        .await?;
         let tunnel = self
             .protocol
             .upgrade_client(ConnectedTransport::Udp(connected), url.clone())

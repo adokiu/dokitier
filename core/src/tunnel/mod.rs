@@ -19,6 +19,7 @@ pub mod quic;
 
 #[cfg(feature = "websocket")]
 pub mod websocket;
+pub mod ws_frame;
 
 pub fn build_url_from_socket_addr(addr: &String, scheme: &str) -> url::Url {
     if let Ok(sock_addr) = addr.parse::<SocketAddr>() {

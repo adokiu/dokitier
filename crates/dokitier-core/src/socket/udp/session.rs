@@ -573,6 +573,14 @@ impl Drop for UdpSessionCleanup {
 }
 
 impl UdpSession {
+    pub fn local_socket_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn peer_socket_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new<S>(
         socket: Arc<S>,
@@ -776,6 +784,7 @@ pub(super) fn udp_session_registry_entry(rings: &UdpSessionRingParts) -> UdpSess
 
 pub(super) fn close_udp_session(sessions: &UdpSessionRegistry, key: UdpSessionKey) {
     if let Some((_, entry)) = sessions.remove(&key) {
+        tracing::debug!(?key, "udp session closed");
         let _ = entry.close.send(true);
     }
 }

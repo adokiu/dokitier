@@ -55,6 +55,10 @@ pub enum AgentFrame {
         public_ipv4: Option<String>,
         #[serde(default)]
         public_ipv6: Option<String>,
+        #[serde(default)]
+        instance_id: Option<String>,
+        #[serde(default)]
+        system: Option<serde_json::Value>,
     },
     Heartbeat {
         node_id: String,
@@ -76,12 +80,59 @@ pub enum AgentFrame {
     },
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingParams {
+    pub latency_weight: f64,
+    pub loss_weight: f64,
+    pub bandwidth_weight: f64,
+    pub reference_bandwidth_mbps: f64,
+    pub utilization_weight: f64,
+    pub hop_weight: f64,
+    pub loss_gain: f64,
+    pub tcp_loss_weight: f64,
+    pub udp_loss_weight: f64,
+    pub kcp_loss_weight: f64,
+    pub quic_loss_weight: f64,
+    pub wg_loss_weight: f64,
+    pub min_bandwidth_mbps: f64,
+    pub weighted: bool,
+    #[serde(default = "default_probe_enabled")]
+    pub probe_enabled: bool,
+    #[serde(default = "default_probe_interval")]
+    pub probe_interval_secs: u64,
+    #[serde(default = "default_probe_payload")]
+    pub probe_payload_bytes: u32,
+    #[serde(default = "default_probe_repeats")]
+    pub probe_repeats: u32,
+    #[serde(default = "default_probe_concurrent")]
+    pub probe_max_concurrent: u32,
+    #[serde(default = "default_probe_idle")]
+    pub probe_idle_utilization_pct: f64,
+    #[serde(default = "default_probe_timeout")]
+    pub probe_timeout_ms: u64,
+    #[serde(default = "default_probe_range")]
+    pub probe_max_range_mbps: f64,
+}
+
+fn default_probe_enabled() -> bool { true }
+fn default_probe_interval() -> u64 { 3600 }
+fn default_probe_payload() -> u32 { 256 * 1024 }
+fn default_probe_repeats() -> u32 { 2 }
+fn default_probe_concurrent() -> u32 { 2 }
+fn default_probe_idle() -> f64 { 20.0 }
+fn default_probe_timeout() -> u64 { 5000 }
+fn default_probe_range() -> f64 { 5000.0 }
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConsoleCommand {
     GetConfig,
     ApplyConfig { toml: String },
+    ApplyNetwork { network: String, toml: String },
+    DeleteNetwork { network: String },
     RestartInstance,
+    ApplyRouting { params: RoutingParams },
+    ApplySharedListeners { listeners: Vec<String> },
 }
 
 pub fn proof(token: &str, role: &str, node_id: &str, nonce: &str, ts: i64) -> String {

@@ -10,8 +10,19 @@ export default defineConfig({
   server: {
     port: Number(process.env.PORT) || 5173,
     proxy: {
-      '/api': process.env.DOK_CONSOLE_URL || 'http://127.0.0.1:13110',
-      '/api/events': { target: process.env.DOK_CONSOLE_URL || 'ws://127.0.0.1:13110', ws: true }
+      // Local dev console: proxy API calls to the deployed console by default
+      // (tier.adokiu.com), override with DOK_CONSOLE_URL=...
+      '/api': {
+        target: process.env.DOK_CONSOLE_URL || 'https://tier.adokiu.com',
+        changeOrigin: true,
+        secure: false
+      },
+      '/api/events': {
+        target: process.env.DOK_CONSOLE_URL || 'https://tier.adokiu.com',
+        changeOrigin: true,
+        secure: false,
+        ws: true
+      }
     }
   },
   build: { outDir: 'dist' }

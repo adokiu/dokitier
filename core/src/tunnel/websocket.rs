@@ -1,8 +1,9 @@
+use super::ws_frame;
 use super::FromUrl;
 use crate::tunnel::common::bind;
 use crate::{proto::common::TunnelInfo, socket::tcp::RuntimeTcpSocket};
 use anyhow::Context as _;
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use cidr::IpCidr;
 use dokitier_core::{
     packet::{ZCPacket, ZCPacketType},
@@ -10,7 +11,7 @@ use dokitier_core::{
     tunnel::{IpVersion, Tunnel, TunnelError, wrapper::TunnelWrapper},
 };
 use forwarded_header_value::ForwardedHeaderValue;
-use futures::{Sink, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -18,10 +19,17 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
+    sync::mpsc,
+    time::timeout,
+};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::either::Either;
-use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, Message, ServerBuilder};
+use tokio_websockets::{
+    ClientBuilder, Limits, MaybeTlsStream, Message, ServerBuilder, WebSocketStream,
+};
 use zerocopy::AsBytes as _;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -102,6 +110,432 @@ where
             .map(|result| result.map_err(websocket_error))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Single-owner pump
+// ---------------------------------------------------------------------------
+//
+// `futures`' `split()` guards both halves of a `WebSocketStream` with a
+// `BiLock`, so the read task and the write task take turns acquiring the same
+// stream. Under concurrent bulk traffic in both directions this serializes the
+// two tokio tasks against each other, and the interlocked waker hand-off
+// inside tokio-websockets (`flushing_waker` in `poll_next_frame`)
+// intermittently stalls the write half: measured on a clean docker bridge,
+// bidirectional traffic collapsed to 80-180 Mbps per direction while each
+// direction alone sustains 400 Mbps. A single pump task owns the stream and
+// services both directions from one `select!` loop; the tunnel halves exposed
+// to the peer connection are then plain channels with no shared state.
+//
+// Wire format is untouched: tokio-websockets still performs the HTTP upgrade
+// and the frame codec, so peers (including the shared listeners and
+// EasyTier-compatible endpoints) interoperate unchanged.
+
+const WS_PUMP_CHANNEL_CAPACITY: usize = 128;
+const WS_PUMP_MAX_BATCH: usize = 32;
+
+struct WsChannelStream {
+    rx: mpsc::Receiver<Result<ZCPacket, TunnelError>>,
+}
+
+impl Stream for WsChannelStream {
+    type Item = Result<ZCPacket, TunnelError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_recv(cx)
+    }
+}
+
+struct WsChannelSink {
+    tx: tokio_util::sync::PollSender<ZCPacket>,
+}
+
+impl Sink<ZCPacket> for WsChannelSink {
+    type Error = TunnelError;
+
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        // PollSender registers the task waker with the channel's capacity
+        // semaphore; waking without registering (e.g. wake_by_ref on Full)
+        // would busy-spin instead of yielding until capacity frees up.
+        Pin::new(&mut self.tx)
+            .poll_reserve(cx)
+            .map_err(|_| TunnelError::Shutdown)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: ZCPacket) -> Result<(), Self::Error> {
+        Pin::new(&mut self.tx)
+            .send_item(item)
+            .map_err(|_| TunnelError::Shutdown)
+    }
+
+    // The channel forwards packets immediately; nothing to flush.
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn ws_pump<T>(
+    ws: WebSocketStream<T>,
+    incoming: mpsc::Sender<Result<ZCPacket, TunnelError>>,
+    mut outgoing: mpsc::Receiver<ZCPacket>,
+) where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    // Split into BiLock halves so one task can poll the read and write halves
+    // from the same `select!`. The lock is only ever held for a single poll
+    // here, so there is no cross-task contention, and — crucially — the read
+    // half keeps making progress while a write flush is waiting for socket
+    // writability. A sequential design (finish the flush, then read) would
+    // deadlock under full-duplex saturation: neither side drains, the reverse
+    // TCP window freezes, and one direction collapses to a trickle.
+    let (write, read) = ws.split();
+    let mut read = read;
+    let mut write = WebSocketPacketSink::new(write);
+    let mut flushing = false;
+    let mut batch: Vec<ZCPacket> = Vec::with_capacity(WS_PUMP_MAX_BATCH);
+    let stats = std::env::var("DOKITIER_WS_PUMP_STATS").is_ok();
+    let mut stat_reads: u64 = 0;
+    let mut stat_writes: u64 = 0;
+    let mut stat_flush_waits: u64 = 0;
+    let mut stat_last = std::time::Instant::now();
+    loop {
+        if stats && stat_last.elapsed() >= std::time::Duration::from_secs(2) {
+            let elapsed = stat_last.elapsed().as_secs_f64();
+            tracing::info!(
+                reads_per_s = (stat_reads as f64 / elapsed) as u64,
+                writes_per_s = (stat_writes as f64 / elapsed) as u64,
+                flush_pending_s = (stat_flush_waits as f64 / elapsed) as u64,
+                "ws pump stats"
+            );
+            stat_reads = 0;
+            stat_writes = 0;
+            stat_flush_waits = 0;
+            stat_last = std::time::Instant::now();
+        }
+        tokio::select! {
+            message = read.next() => {
+                stat_reads += 1;
+                match message {
+                    Some(message) => {
+                        let item = match map_from_ws_message(message).await {
+                            Some(item) => item,
+                            // Non-binary frame (ping/pong handled internally);
+                            // keep looping.
+                            None => continue,
+                        };
+                        if incoming.send(item).await.is_err() {
+                            return;
+                        }
+                    }
+                    None => return,
+                }
+            }
+            packet = outgoing.recv(), if !flushing => {
+                stat_writes += 1;
+                match packet {
+                    Some(packet) => batch.push(packet),
+                    None => return,
+                }
+                while batch.len() < WS_PUMP_MAX_BATCH {
+                    match outgoing.try_recv() {
+                        Ok(packet) => batch.push(packet),
+                        Err(_) => break,
+                    }
+                }
+                let mut failed = false;
+                for packet in batch.drain(..) {
+                    if write.feed(packet).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    return;
+                }
+                flushing = true;
+            }
+            _ = write.flush(), if flushing => {
+                stat_flush_waits += 1;
+                flushing = false;
+            }
+        }
+    }
+}
+
+pub fn build_ws_tunnel<T>(stream: WebSocketStream<T>, info: TunnelInfo) -> Box<dyn Tunnel>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    build_ws_handoff_tunnel(stream, None, info)
+}
+
+/// Same as [`build_ws_tunnel`], with an already-consumed first frame (the
+/// shared listener sniffs the network name before handing the connection over)
+/// prepended to the read half.
+pub fn build_ws_handoff_tunnel<T>(
+    stream: WebSocketStream<T>,
+    first: Option<ZCPacket>,
+    info: TunnelInfo,
+) -> Box<dyn Tunnel>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (incoming_tx, incoming_rx) =
+        mpsc::channel::<Result<ZCPacket, TunnelError>>(WS_PUMP_CHANNEL_CAPACITY);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<ZCPacket>(WS_PUMP_CHANNEL_CAPACITY);
+    if let Some(first) = first {
+        let _ = incoming_tx.try_send(Ok(first));
+    }
+    tokio::spawn(ws_pump(stream, incoming_tx, outgoing_rx));
+    Box::new(TunnelWrapper::new(
+        WsChannelStream { rx: incoming_rx },
+        WsChannelSink {
+            tx: tokio_util::sync::PollSender::new(outgoing_tx),
+        },
+        Some(info),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Custom data plane for plain `ws://` (true full-duplex)
+// ---------------------------------------------------------------------------
+
+/// Builds the tunnel for a plain `ws://` connection from the raw stream
+/// recovered after the HTTP upgrade. `client_role` must match the endpoint:
+/// the client masks outgoing frames and receives unmasked ones; the server is
+/// the mirror image (RFC 6455 §5.1-§5.3).
+pub fn build_plain_ws_tunnel<S>(
+    stream: S,
+    first: Option<ZCPacket>,
+    client_role: bool,
+    info: TunnelInfo,
+) -> Box<dyn Tunnel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (incoming_tx, incoming_rx) =
+        mpsc::channel::<Result<ZCPacket, TunnelError>>(WS_PUMP_CHANNEL_CAPACITY);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel::<ZCPacket>(WS_PUMP_CHANNEL_CAPACITY);
+    let (control_tx, control_rx) = mpsc::channel::<ws_frame::WsControl>(8);
+    if let Some(first) = first {
+        let _ = incoming_tx.try_send(Ok(first));
+    }
+    let (read_half, write_half) = tokio::io::split(stream);
+    let reader = tokio::io::BufReader::with_capacity(64 * 1024, read_half);
+    tokio::spawn(ws_custom_reader(reader, incoming_tx, control_tx));
+    tokio::spawn(ws_custom_writer(write_half, client_role, outgoing_rx, control_rx));
+    Box::new(TunnelWrapper::new(
+        ws_frame::WsFrameStream::new(incoming_rx),
+        ws_frame::WsFrameSink::new(tokio_util::sync::PollSender::new(outgoing_tx)),
+        Some(info),
+    ))
+}
+
+/// Reader task: owns the read half exclusively, so inbound frames never wait
+/// for the write side.
+async fn ws_custom_reader<R: AsyncRead + Unpin + Send + 'static>(
+    mut rd: tokio::io::BufReader<R>,
+    incoming: mpsc::Sender<Result<ZCPacket, TunnelError>>,
+    control_tx: mpsc::Sender<ws_frame::WsControl>,
+) {
+    let mut buf = BytesMut::with_capacity(64 * 1024);
+    loop {
+        match ws_frame::read_frame(&mut rd, &mut buf).await {
+            Ok(Some(frame)) => match frame.opcode {
+                ws_frame::OP_BINARY => {
+                    let packet =
+                        ZCPacket::new_from_buf(frame.payload, ZCPacketType::DummyTunnel);
+                    if incoming.send(Ok(packet)).await.is_err() {
+                        return;
+                    }
+                }
+                ws_frame::OP_PING => {
+                    if control_tx
+                        .send(ws_frame::WsControl::Pong(frame.payload.freeze()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                ws_frame::OP_CLOSE => {
+                    let _ = control_tx.send(ws_frame::WsControl::Close).await;
+                    return;
+                }
+                // Pongs and continuations carry no tunnel data; peer messages
+                // are unfragmented (frame_size 4 MB).
+                _ => continue,
+            },
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(?err, "ws frame read error");
+                return;
+            }
+        }
+    }
+}
+
+/// Writer task: owns the write half exclusively, so outbound frames never wait
+/// for the read side. Batches up to [`WS_PUMP_MAX_BATCH`] frames into one
+/// vectored write.
+async fn ws_custom_writer<W: AsyncWrite + Unpin + Send + 'static>(
+    mut wr: W,
+    client_role: bool,
+    mut outgoing: mpsc::Receiver<ZCPacket>,
+    mut control_rx: mpsc::Receiver<ws_frame::WsControl>,
+) {
+    let mut controls: Vec<Vec<u8>> = Vec::new();
+    let mut batch: Vec<ZCPacket> = Vec::with_capacity(WS_PUMP_MAX_BATCH);
+    let mut closed = false;
+    loop {
+        // Gather pending control frames without blocking.
+        while controls.len() < 8 {
+            match control_rx.try_recv() {
+                Ok(ws_frame::WsControl::Pong(payload)) => {
+                    controls.push(ws_frame::control_frame(
+                        ws_frame::OP_PONG,
+                        &payload,
+                        client_role,
+                    ));
+                }
+                Ok(ws_frame::WsControl::Close) => {
+                    controls
+                        .push(ws_frame::control_frame(ws_frame::OP_CLOSE, &[], client_role));
+                    closed = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        // Gather pending data frames without blocking.
+        if !closed {
+            while batch.len() < WS_PUMP_MAX_BATCH {
+                match outgoing.try_recv() {
+                    Ok(packet) => batch.push(packet),
+                    Err(_) => break,
+                }
+            }
+        }
+        if controls.is_empty() && batch.is_empty() {
+            // Nothing queued: wait for either direction to produce work.
+            tokio::select! {
+                packet = outgoing.recv(), if !closed => {
+                    match packet {
+                        Some(packet) => batch.push(packet),
+                        None => {
+                            controls.push(ws_frame::control_frame(
+                                ws_frame::OP_CLOSE,
+                                &[],
+                                client_role,
+                            ));
+                            closed = true;
+                        }
+                    }
+                }
+                control = control_rx.recv() => {
+                    match control {
+                        Some(ws_frame::WsControl::Pong(payload)) => {
+                            controls.push(ws_frame::control_frame(
+                                ws_frame::OP_PONG,
+                                &payload,
+                                client_role,
+                            ));
+                        }
+                        Some(ws_frame::WsControl::Close) => {
+                            controls.push(ws_frame::control_frame(
+                                ws_frame::OP_CLOSE,
+                                &[],
+                                client_role,
+                            ));
+                            closed = true;
+                        }
+                        None => return,
+                    }
+                }
+            }
+            continue;
+        }
+        let data: Vec<ZCPacket> = batch.drain(..).collect();
+        if write_all_frames(&mut wr, &controls, data, client_role)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        controls.clear();
+        if closed {
+            return;
+        }
+    }
+}
+
+/// Writes every frame as one vectored operation, falling back to sequential
+/// writes when the socket does not support vectored IO.
+async fn write_all_frames<W: AsyncWrite + Unpin>(
+    wr: &mut W,
+    controls: &[Vec<u8>],
+    data: Vec<ZCPacket>,
+    client_role: bool,
+) -> std::io::Result<()> {
+    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(controls.len() + data.len());
+    for control in controls {
+        bufs.push(control.clone());
+    }
+    for packet in data {
+        let payload = packet.tunnel_payload_bytes().freeze();
+        let mut buf = BytesMut::with_capacity(14 + payload.len());
+        let mask_key = if client_role {
+            Some(ws_frame::rand_mask_key())
+        } else {
+            None
+        };
+        ws_frame::put_frame_header(&mut buf, ws_frame::OP_BINARY, payload.len(), mask_key, true);
+        buf.put_slice(&payload);
+        if let Some(key) = mask_key {
+            let header_len = buf.len() - payload.len();
+            ws_frame::mask_payload(&key, &mut buf[header_len..]);
+        }
+        bufs.push(buf.to_vec());
+    }
+    let mut idx = 0usize;
+    let mut off = 0usize;
+    while idx < bufs.len() {
+        let slices: Vec<std::io::IoSlice> = bufs[idx..]
+            .iter()
+            .enumerate()
+            .map(|(i, buf)| {
+                if i == 0 && off > 0 {
+                    std::io::IoSlice::new(&buf[off..])
+                } else {
+                    std::io::IoSlice::new(buf)
+                }
+            })
+            .collect();
+        let written = wr.write_vectored(&slices).await?;
+        if written == 0 {
+            // Vectored IO unsupported or nothing accepted: fall back to
+            // sequential writes for the remainder.
+            for buf in &bufs[idx..] {
+                let start = if idx == 0 && off > 0 { off } else { 0 };
+                wr.write_all(&buf[start..]).await?;
+            }
+            return Ok(());
+        }
+        off += written;
+        while idx < bufs.len() && off >= bufs[idx].len() {
+            off -= bufs[idx].len();
+            idx += 1;
+        }
+    }
+    Ok(())
+}
+
 
 async fn map_from_ws_message(
     message: Result<Message, tokio_websockets::Error>,
@@ -263,7 +697,7 @@ where
             .append_pair("proxy", &peer_addr.to_string());
     }
 
-    let (write, read) = stream.split();
+    let plain_ws = !is_wss(&local_url)?;
     let remote_url: crate::proto::common::Url = remote_url.into();
     let info = TunnelInfo {
         tunnel_type: local_url.scheme().to_owned(),
@@ -271,11 +705,17 @@ where
         remote_addr: Some(remote_url.clone()),
         resolved_remote_addr: Some(remote_url),
     };
-    Ok(Box::new(TunnelWrapper::new(
-        read.filter_map(map_from_ws_message),
-        WebSocketPacketSink::new(write),
-        Some(info),
-    )))
+    if !plain_ws {
+        // wss keeps the tokio-websockets pump (TLS record buffering already
+        // gives it healthy full-duplex behaviour).
+        Ok(build_ws_tunnel(stream, info))
+    } else {
+        match stream.into_inner() {
+            // Plain ws: custom full-duplex data plane on the raw TCP stream.
+            Either::Right(tcp) => Ok(build_plain_ws_tunnel(tcp, None, false, info)),
+            Either::Left(_) => unreachable!("plain ws upgrade cannot be TLS"),
+        }
+    }
 }
 
 fn socket_url(scheme: &str, addr: SocketAddr) -> url::Url {
@@ -402,12 +842,14 @@ where
     };
 
     let (client, _) = client.connect_on(stream).await.map_err(websocket_error)?;
-    let (write, read) = client.split();
-    Ok(Box::new(TunnelWrapper::new(
-        read.filter_map(map_from_ws_message),
-        WebSocketPacketSink::new(write),
-        Some(info),
-    )))
+    if is_wss {
+        Ok(build_ws_tunnel(client, info))
+    } else {
+        match client.into_inner() {
+            MaybeTlsStream::Plain(tcp) => Ok(build_plain_ws_tunnel(tcp, None, true, info)),
+            MaybeTlsStream::Rustls(_) => unreachable!("plain ws upgrade cannot be TLS"),
+        }
+    }
 }
 
 #[cfg(test)]

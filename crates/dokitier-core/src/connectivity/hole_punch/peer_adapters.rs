@@ -37,6 +37,10 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
         PeerManagerCore::p2p_policy_flags(self)
     }
 
+    fn network_name(&self) -> Option<String> {
+        Some(PeerManagerCore::network_name(self).to_string())
+    }
+
     async fn candidates(&self) -> Vec<UdpPunchCandidate> {
         let now = Instant::now();
         let peer_map = self.get_peer_map();

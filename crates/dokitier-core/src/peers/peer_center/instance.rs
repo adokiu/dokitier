@@ -287,6 +287,24 @@ impl PeerCenterInstance {
                     resp.digest
                 );
 
+                eprintln!("BW_GLOBAL entries={}", resp.global_peer_map.len());
+                for (peer_id, info) in &resp.global_peer_map {
+                    if info.bandwidth_up_mbps > 0.0 && info.bandwidth_down_mbps > 0.0 {
+                        eprintln!(
+                            "BW_GLOBAL peer={peer_id} up={} down={}",
+                            info.bandwidth_up_mbps, info.bandwidth_down_mbps
+                        );
+                        crate::peers::link_policy::set_node_bandwidth_silent(
+                            *peer_id,
+                            info.bandwidth_up_mbps,
+                            info.bandwidth_down_mbps,
+                        );
+                        crate::peers::link_policy::set_peer_capacity(
+                            *peer_id,
+                            info.bandwidth_down_mbps,
+                        );
+                    }
+                }
                 *ctx.job_ctx.global_peer_map.write().unwrap() = GlobalPeerMap {
                     map: resp.global_peer_map,
                 };
@@ -320,7 +338,15 @@ impl PeerCenterInstance {
         self.client
             .init_periodic_job(ctx, |client, ctx| async move {
                 let my_node_id = ctx.my_peer_id;
-                let peers = ctx.job_ctx.peer_mgr.list_peers().await;
+                let mut peers = ctx.job_ctx.peer_mgr.list_peers().await;
+                if let Some(bw) = crate::peers::link_policy::node_bandwidth(my_node_id) {
+                    peers.bandwidth_up_mbps = bw.up_mbps;
+                    peers.bandwidth_down_mbps = bw.down_mbps;
+                    eprintln!(
+                        "BW_REPORT my={my_node_id} up={} down={}",
+                        bw.up_mbps, bw.down_mbps
+                    );
+                }
                 let peer_list = peers.direct_peers.keys().copied().collect();
                 let job_ctx = &ctx.job_ctx;
 
@@ -398,6 +424,15 @@ impl PeerCenterInstance {
 
             fn begin_update(&mut self) {
                 let global_peer_map = self.global_peer_map.read().unwrap();
+                for (peer_id, info) in &global_peer_map.map {
+                    if info.bandwidth_up_mbps > 0.0 && info.bandwidth_down_mbps > 0.0 {
+                        crate::peers::link_policy::set_node_bandwidth_silent(
+                            *peer_id,
+                            info.bandwidth_up_mbps,
+                            info.bandwidth_down_mbps,
+                        );
+                    }
+                }
                 self.global_peer_map_clone = global_peer_map.clone();
                 self.last_policy_generation.store(
                     crate::peers::link_policy::generation(),

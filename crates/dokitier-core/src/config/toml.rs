@@ -110,6 +110,11 @@ pub trait ConfigLoader: Send + Sync {
     fn patch_flags(&self, flags: FlagsPatch);
 
     fn get_exit_nodes(&self) -> Vec<IpAddr>;
+    fn get_node_bandwidth_mbps(&self) -> Option<f64>;
+    fn get_node_bandwidth_up_mbps(&self) -> Option<f64>;
+    fn get_node_bandwidth_down_mbps(&self) -> Option<f64>;
+    fn get_node_bandwidth_intranet_down_mbps(&self) -> Option<f64>;
+    fn get_node_bandwidth_internet_down_mbps(&self) -> Option<f64>;
     fn set_exit_nodes(&self, nodes: Vec<IpAddr>);
 
     fn get_routes(&self) -> Option<Vec<cidr::Ipv4Cidr>>;
@@ -422,6 +427,8 @@ struct ControllerToml {
     interval_secs: Option<u64>,
     #[serde(default)]
     heartbeat_secs: Option<u64>,
+    #[serde(default)]
+    shared_listeners: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -443,6 +450,15 @@ struct RoutingToml {
     loss_weight: Option<f64>,
     bandwidth_weight: Option<f64>,
     reference_bandwidth_mbps: Option<f64>,
+    utilization_weight: Option<f64>,
+    hop_weight: Option<f64>,
+    loss_gain: Option<f64>,
+    tcp_loss_weight: Option<f64>,
+    udp_loss_weight: Option<f64>,
+    kcp_loss_weight: Option<f64>,
+    quic_loss_weight: Option<f64>,
+    wg_loss_weight: Option<f64>,
+    min_bandwidth_mbps: Option<f64>,
     mode: Option<String>,
 }
 
@@ -462,8 +478,16 @@ struct Config {
     dhcpv6: Option<DhcpConfig<cidr::Ipv6Cidr>>,
     network_identity: Option<NetworkIdentity>,
     listeners: Option<Vec<url::Url>>,
+    // Runtime-only advertisement state (management API patches). Never read
+    // from or written to config files: config files only carry `listeners`.
+    #[serde(skip)]
     mapped_listeners: Option<Vec<url::Url>>,
     exit_nodes: Option<Vec<IpAddr>>,
+    node_bandwidth_mbps: Option<f64>,
+    node_bandwidth_up_mbps: Option<f64>,
+    node_bandwidth_down_mbps: Option<f64>,
+    node_bandwidth_intranet_down_mbps: Option<f64>,
+    node_bandwidth_internet_down_mbps: Option<f64>,
 
     peer: Option<Vec<PeerConfig>>,
     proxy_network: Option<Vec<ProxyNetworkConfig>>,
@@ -563,12 +587,30 @@ impl TomlConfig {
         let config = self.config.lock().unwrap();
         let controller = config.controller.as_ref()?;
         let url = controller.url.clone()?;
+        // The node's public shared listeners live in the standard top-level
+        // `listeners` field of the master config; `[controller].shared_listeners`
+        // is the legacy spelling and only used when `listeners` is absent.
+        let shared_listeners: Vec<String> = match config.listeners.as_ref() {
+            Some(listeners) if !listeners.is_empty() => listeners
+                .iter()
+                .map(|url| match (url.host(), url.port()) {
+                    (Some(url::Host::Ipv6(ip)), Some(port)) => {
+                        format!("{}://[{ip}]:{port}", url.scheme())
+                    }
+                    (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
+                    _ => url.to_string(),
+                })
+                .collect(),
+            _ => controller.shared_listeners.clone(),
+        };
         Some(crate::config::ControllerSettings {
             url,
             node_id: controller.node_id.clone().unwrap_or_default(),
             token: controller.token.clone().unwrap_or_default(),
-            interval_secs: controller.interval_secs.unwrap_or(2).max(1),
+            instance_id: config.instance_id.map(|id| id.to_string()),
+            interval_secs: controller.interval_secs.unwrap_or(1).max(1),
             heartbeat_secs: controller.heartbeat_secs.unwrap_or(20).max(5),
+            shared_listeners,
         })
     }
 
@@ -603,6 +645,19 @@ impl TomlConfig {
             reference_bandwidth_mbps: routing
                 .reference_bandwidth_mbps
                 .unwrap_or(defaults.reference_bandwidth_mbps),
+            utilization_weight: routing
+                .utilization_weight
+                .unwrap_or(defaults.utilization_weight),
+            hop_weight: routing.hop_weight.unwrap_or(defaults.hop_weight),
+            loss_gain: routing.loss_gain.unwrap_or(defaults.loss_gain),
+            tcp_loss_weight: routing.tcp_loss_weight.unwrap_or(defaults.tcp_loss_weight),
+            udp_loss_weight: routing.udp_loss_weight.unwrap_or(defaults.udp_loss_weight),
+            kcp_loss_weight: routing.kcp_loss_weight.unwrap_or(defaults.kcp_loss_weight),
+            quic_loss_weight: routing.quic_loss_weight.unwrap_or(defaults.quic_loss_weight),
+            wg_loss_weight: routing.wg_loss_weight.unwrap_or(defaults.wg_loss_weight),
+            min_bandwidth_mbps: routing
+                .min_bandwidth_mbps
+                .unwrap_or(defaults.min_bandwidth_mbps),
             weighted: routing
                 .mode
                 .as_deref()
@@ -722,13 +777,20 @@ impl TomlConfig {
                 .as_deref()
                 .is_none_or(|s| s.is_empty());
 
+        // Preserve the P2P isolation group: rebuilding the identity from
+        // name/secret alone dropped it, which silently disabled cross-group
+        // auto-P2P blocking at runtime.
         if is_credential {
-            config.set_network_identity(NetworkIdentity::new_credential(old_ns.network_name));
+            let mut identity = NetworkIdentity::new_credential(old_ns.network_name);
+            identity.p2p_group = old_ns.p2p_group;
+            config.set_network_identity(identity);
         } else {
-            config.set_network_identity(NetworkIdentity::new(
+            let mut identity = NetworkIdentity::new(
                 old_ns.network_name,
                 old_ns.network_secret.unwrap_or_default(),
-            ));
+            );
+            identity.p2p_group = old_ns.p2p_group;
+            config.set_network_identity(identity);
         }
 
         Ok(config)
@@ -1034,6 +1096,40 @@ impl ConfigLoader for TomlConfig {
             .exit_nodes
             .clone()
             .unwrap_or_default()
+    }
+
+    fn get_node_bandwidth_mbps(&self) -> Option<f64> {
+        self.config.lock().unwrap().node_bandwidth_mbps
+    }
+
+    fn get_node_bandwidth_up_mbps(&self) -> Option<f64> {
+        let config = self.config.lock().unwrap();
+        config
+            .node_bandwidth_up_mbps
+            .or(config.node_bandwidth_mbps)
+    }
+
+    fn get_node_bandwidth_down_mbps(&self) -> Option<f64> {
+        let config = self.config.lock().unwrap();
+        config
+            .node_bandwidth_down_mbps
+            .or(config.node_bandwidth_mbps)
+    }
+
+    fn get_node_bandwidth_intranet_down_mbps(&self) -> Option<f64> {
+        let config = self.config.lock().unwrap();
+        config
+            .node_bandwidth_intranet_down_mbps
+            .or(config.node_bandwidth_down_mbps)
+            .or(config.node_bandwidth_mbps)
+    }
+
+    fn get_node_bandwidth_internet_down_mbps(&self) -> Option<f64> {
+        let config = self.config.lock().unwrap();
+        config
+            .node_bandwidth_internet_down_mbps
+            .or(config.node_bandwidth_down_mbps)
+            .or(config.node_bandwidth_mbps)
     }
 
     fn set_exit_nodes(&self, nodes: Vec<IpAddr>) {

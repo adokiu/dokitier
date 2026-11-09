@@ -234,6 +234,7 @@ where
                 Vec::new(),
                 self.options.tcp_bind.clone(),
                 self.options.udp_bind.clone(),
+                None,
             )
             .await?
         };
@@ -840,6 +841,11 @@ where
                 } else {
                     Vec::new()
                 };
+                // The network name now travels explicitly through
+                // `connect_resolved` -> `transport::connect_udp` -> the
+                // per-attempt `UdpSessionLayer`; no process-global registration
+                // is needed (and none is safe: the same public address can be
+                // dialed by several networks of this core).
                 Ok((remote_addr, bind_addrs))
             })
             .await?,
@@ -872,6 +878,9 @@ where
                     bind_addrs,
                     data.options.tcp_bind.clone(),
                     data.options.udp_bind.clone(),
+                    data.peer_manager
+                        .upgrade()
+                        .map(|manager| manager.network_name().to_string()),
                 )
                 .await?
             }
@@ -907,6 +916,7 @@ pub(crate) async fn connect_resolved<H>(
     bind_addrs: Vec<SocketAddr>,
     tcp_bind: TcpBindOptions,
     udp_bind: UdpBindOptions,
+    network_name: Option<String>,
 ) -> anyhow::Result<ConnectedTransport<<H as VirtualTcpSocketFactory>::Socket>>
 where
     H: ManualConnectorHost,
@@ -918,7 +928,7 @@ where
                 .map(ConnectedTransport::Tcp)
         }
         ManualTransport::Udp(mode) => {
-            transport::connect_udp(host, remote_addr, bind_addrs, udp_bind, mode)
+            transport::connect_udp(host, remote_addr, bind_addrs, udp_bind, mode, network_name)
                 .await
                 .map(ConnectedTransport::Udp)
         }

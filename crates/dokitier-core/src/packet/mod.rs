@@ -44,7 +44,8 @@ pub enum UdpPacketType {
     HolePunch = 5,
     V4HolePunch = 6, // when receiving v4 hole punch packet, the packet contains a socket addr of other peer, we
     // will send a hole punch packet to that peer. we only accept this packet from loopback interface.
-    V6HolePunch = 7, // when receiving v6 hole punch packet, the packet contains a socket addr of other peer, we
+    V6HolePunch = 7,
+    NetworkAnnounce = 8, // when receiving v6 hole punch packet, the packet contains a socket addr of other peer, we
                      // will send a hole punch packet to that peer. we only accept this packet from lookback interface.
 }
 

@@ -42,6 +42,76 @@ use super::{
 
 pub(super) const UDP_SESSION_HOLE_PUNCH_PACKET_BODY_LEN: u16 = 32;
 
+/// Process-wide network hint for an outbound UDP connect, keyed by the resolved
+/// remote address.
+///
+/// Every peer-manager driven connector now passes the network name explicitly
+/// (manual connector, direct connector, UDP hole punching) and the session
+/// layer installs it with [`UdpSessionLayer::set_network_name`] before
+/// connecting. This map is only a last-resort hint for call sites that cannot
+/// name a network (e.g. a standalone/raw UDP tunnel that is not attached to a
+/// network instance); entries expire quickly so a stale hint is never reused.
+/// Because the key carries no network identity, callers that *do* know the
+/// network must pass it explicitly instead of relying on this map.
+static CONNECT_NETWORKS: std::sync::OnceLock<
+    StdMutex<std::collections::HashMap<SocketAddr, (String, std::time::Instant)>>,
+> =
+    std::sync::OnceLock::new();
+
+pub fn register_connect_network(remote_addr: SocketAddr, network: impl Into<String>) {
+    let map = CONNECT_NETWORKS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap().insert(remote_addr, (network.into(), std::time::Instant::now()));
+}
+
+fn take_connect_network(remote_addr: SocketAddr) -> Option<String> {
+    let map = CONNECT_NETWORKS.get()?;
+    let mut map = map.lock().unwrap();
+    let (network, at) = map.get(&remote_addr)?.clone();
+    if at.elapsed() > std::time::Duration::from_secs(15) {
+        map.remove(&remote_addr);
+        return None;
+    }
+    Some(network)
+}
+
+/// A shared UDP listener (see `core/src/shared_listener.rs`) remembers the
+/// network announced by a client address with a TTL (180s today) and drops
+/// datagrams from an address it has no fresh announce for. A long-lived tunnel
+/// therefore has to refresh its announce periodically, otherwise it stops
+/// being routable after the receiver's TTL expires even though the EasyTier
+/// session itself is still healthy.
+const UDP_ANNOUNCE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn announce_packet(network: &str) -> Vec<u8> {
+    crate::socket::udp::new_network_announce_packet(network).into_bytes().to_vec()
+}
+
+/// Keeps re-announcing `network` to `remote_addr` for the lifetime of the UDP
+/// session layer. Stops when the layer shuts down (its watch sender fires or is
+/// dropped with the layer).
+fn spawn_announce_refresh<S>(
+    socket: Arc<S>,
+    remote_addr: SocketAddr,
+    network: String,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    S: VirtualUdpSocket + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = crate::foundation::time::sleep(UDP_ANNOUNCE_REFRESH_INTERVAL) => {}
+                _ = shutdown.wait_for(|closed| *closed) => break,
+            }
+            let announce = announce_packet(&network);
+            if let Err(err) = socket.send_to(&announce, remote_addr).await {
+                tracing::debug!(?err, %remote_addr, %network, "udp announce refresh failed");
+                break;
+            }
+        }
+    });
+}
+
 #[derive(Debug)]
 pub struct UdpSessionLayer<S, R = NoopUdpSessionStunResponder> {
     socket: Arc<S>,
@@ -55,6 +125,7 @@ pub struct UdpSessionLayer<S, R = NoopUdpSessionStunResponder> {
     _control_rx: TokioMutex<mpsc::Receiver<UdpSessionLayerControl>>,
     session_shutdown_tx: watch::Sender<bool>,
     recv_task: JoinHandle<()>,
+    network_name: Arc<StdMutex<Option<String>>>,
 }
 
 pub(super) fn create_classified_udp_session_accepts() -> Arc<ClassifiedUdpSessionAccepts> {
@@ -124,7 +195,25 @@ where
             _control_rx: TokioMutex::new(control_rx),
             session_shutdown_tx,
             recv_task,
+            network_name: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    pub fn set_network_name(&self, name: impl Into<String>) {
+        let name = name.into();
+        tracing::debug!(%name, "udp layer network name set");
+        *self.network_name.lock().unwrap() = Some(name);
+    }
+
+    /// Network to announce before the EasyTier mux handshake. The explicitly
+    /// installed name always wins; the process-wide map is only a fallback for
+    /// connectors that cannot name their network.
+    fn configured_connect_network(&self, remote_addr: SocketAddr) -> Option<String> {
+        self.network_name
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| take_connect_network(remote_addr))
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -184,6 +273,8 @@ where
         &self,
         remote_addr: SocketAddr,
     ) -> Result<UdpSession, UdpSessionConnectError> {
+        let network = self.configured_connect_network(remote_addr);
+        tracing::debug!(%remote_addr, ?network, "udp layer connect");
         let local_addr = self.socket.local_addr()?;
         let magic = rand::random();
         let (control_tx, mut control_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAPACITY);
@@ -226,6 +317,7 @@ where
                 remote_addr,
                 conn_id,
                 magic,
+                network.as_deref(),
                 &mut control_rx,
                 &mut sack_rx,
             )
@@ -241,6 +333,18 @@ where
                 }
                 cleanup_guard.set_session_key(key);
                 cleanup_guard.disarm_keep_session();
+
+                // Datagrams are sent to the address the Syn/Sack handshake
+                // settled on (`recv_addr`), so refresh the announce toward that
+                // address, not necessarily the originally dialed one.
+                if let Some(network) = network {
+                    spawn_announce_refresh(
+                        self.socket.clone(),
+                        recv_addr,
+                        network,
+                        self.session_shutdown_tx.subscribe(),
+                    );
+                }
 
                 let close =
                     UdpSessionClose::easy_tier(key, rings.close_tx.clone(), self.sessions.clone());
@@ -316,9 +420,21 @@ where
         remote_addr: SocketAddr,
         conn_id: u32,
         magic: u64,
+        network: Option<&str>,
         control_rx: &mut mpsc::Receiver<UdpConnectControl>,
         sack_rx: &mut watch::Receiver<Option<SocketAddr>>,
     ) -> Result<SocketAddr, UdpSessionConnectError> {
+        // `NetworkAnnounce` is a prelude, not part of the mux handshake: shared
+        // UDP listeners use it to learn which instance owns this client address.
+        // It is retransmitted with every Syn so a single lost announce datagram
+        // cannot deadlock the connect attempt.
+        let announce = network
+            .filter(|network| !network.is_empty())
+            .map(announce_packet);
+        if let Some(announce) = announce.as_ref() {
+            tracing::debug!(?network, %remote_addr, "udp announce sent");
+            self.socket.send_to(announce, remote_addr).await?;
+        }
         let syn_packet = new_syn_packet(conn_id, magic).into_bytes();
         self.socket.send_to(&syn_packet, remote_addr).await?;
 
@@ -346,6 +462,9 @@ where
                 }
                 _ = &mut timeout => return Err(UdpSessionConnectError::Timeout),
                 _ = &mut resend_sleep => {
+                    if let Some(announce) = announce.as_ref() {
+                        self.socket.send_to(announce, remote_addr).await?;
+                    }
                     self.socket.send_to(&syn_packet, remote_addr).await?;
                     resend_sleep
                         .as_mut()
@@ -354,6 +473,12 @@ where
                 control = control_rx.recv() => {
                     match control {
                         Some(UdpConnectControl::HolePunch { recv_addr }) => {
+                            // The session may settle on a different address
+                            // than the dialed one; announce there as well so a
+                            // shared listener on that address can route us.
+                            if let Some(announce) = announce.as_ref() {
+                                self.socket.send_to(announce, recv_addr).await?;
+                            }
                             self.socket.send_to(&syn_packet, recv_addr).await?;
                         }
                         Some(UdpConnectControl::InvalidPacket(reason)) => {
@@ -851,8 +976,12 @@ where
     let accept_permit = match mux_accepted.clone().try_reserve_owned() {
         Ok(permit) => permit,
         Err(err) => {
-            tracing::debug!(?err, ?key, "udp accept queue unavailable");
-            return true;
+            // Do NOT mark the Syn as consumed: the client retransmits the Syn
+            // and the accept queue will have drained by then. Swallowing the
+            // Syn here would leave the client without a Sack until its connect
+            // timeout despite the listener being healthy.
+            tracing::debug!(?err, ?key, "udp accept queue unavailable, syn not consumed");
+            return false;
         }
     };
     let local_addr = match socket.local_addr() {

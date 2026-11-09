@@ -1,0 +1,11 @@
+[package]
+name = "ws-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio-util = "0.7"
+tokio-websockets = { git = "https://github.com/EasyTier/tokio-websockets", features = ["rustls-webpki-roots", "client", "server", "fastrand", "ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+futures = "0.3"
+bytes = "1"

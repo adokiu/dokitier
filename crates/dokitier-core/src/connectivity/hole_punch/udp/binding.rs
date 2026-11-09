@@ -445,6 +445,12 @@ where
         self.validate_socket_route(socket.socket_context(), remote)
             .await?;
         let layer = self.session_layer(socket);
+        // The punch socket is a fresh per-connection layer, so it has to learn
+        // the network explicitly: a shared UDP listener needs the announce
+        // prelude to know which instance owns the punched flow.
+        if let Some(network) = self.peer_source.network_name() {
+            layer.set_network_name(network);
+        }
         let session = layer.connect(remote).await?;
         if session.peer_addr()? != remote {
             tracing::debug!(

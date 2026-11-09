@@ -86,7 +86,30 @@ impl AgentTransport {
             tracing::info!(%addr, "quic transport connected");
             return Ok(Self::Quic { endpoint, send, recv });
         }
-        if url.starts_with("ws://") || url.starts_with("wss://") {
+        if let Some(rest) = url.strip_prefix("wss://") {
+            // Console certificates are self-signed; verify-skip mirrors the
+            // QUIC agent path above.
+            let _ = rest;
+            let provider = rustls::crypto::ring::default_provider();
+            let mut crypto = rustls::ClientConfig::builder_with_provider(provider.into())
+                .with_safe_default_protocol_versions()?
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification(
+                    rustls::crypto::ring::default_provider().into(),
+                )))
+                .with_no_client_auth();
+            crypto.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(crypto));
+            let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+                url,
+                None,
+                false,
+                Some(connector),
+            )
+            .await?;
+            return Ok(Self::Ws(ws));
+        }
+        if url.starts_with("ws://") {
             let (ws, _) = connect_async(url).await?;
             return Ok(Self::Ws(ws));
         }

@@ -9,8 +9,8 @@ const messages = {
     history: { title: '历史指标', selectLink: '选择链路', latencyLoss: '延迟 / 丢包', bandwidth: '带宽使用', range24h: '24 小时', range7d: '7 天' },
     settings: { title: '设置' },
     nav: {
-      dashboard: '仪表盘', topology: '拓扑', nodes: '节点', links: '链路',
-      routes: '路由', history: '历史指标', settings: '系统设置', system: '系统',
+      dashboard: '仪表盘', topology: '拓扑', networks: '网络', nodes: '节点', links: '链路',
+      routes: '路由', acl: '访问控制', history: '历史指标', settings: '系统设置', system: '系统',
     },
     login: {
       title: 'DokiTier Console', subtitle: '欢迎使用',
@@ -24,7 +24,7 @@ const messages = {
       history: '历史', download: '下载', saveApply: '保存并应用',
       reload: '重新加载', applied: '已下发并重启该网络实例',
       noVersions: '暂无版本',
-      columns: { hostname: '主机名', ip: 'IP', version: '版本', network: '网络', lastSeen: '最后上报', actions: '操作' },
+      columns: { status: '状态', name: '名称', hostname: '主机名', vpnIp: 'VPN IP', publicIp: '公网 IP', version: '版本', cpu: 'CPU', mem: '内存', network: '网络', actions: '操作' }, setAlias: '设置名称',
     },
   },
   en: {
@@ -35,8 +35,8 @@ const messages = {
     history: { title: 'History', selectLink: 'Select link', latencyLoss: 'Latency / loss', bandwidth: 'Bandwidth', range24h: '24 hours', range7d: '7 days' },
     settings: { title: 'Settings' },
     nav: {
-      dashboard: 'Dashboard', topology: 'Topology', nodes: 'Nodes', links: 'Links',
-      routes: 'Routes', history: 'History', settings: 'System settings', system: 'System',
+      dashboard: 'Dashboard', topology: 'Topology', networks: 'Networks', nodes: 'Nodes', links: 'Links',
+      routes: 'Routes', acl: 'ACL', history: 'History', settings: 'System settings', system: 'System',
     },
     login: {
       title: 'DokiTier Console', subtitle: 'Welcome',
@@ -50,7 +50,7 @@ const messages = {
       history: 'History', download: 'Download', saveApply: 'Save & apply',
       reload: 'Reload', applied: 'Pushed and restarted this network instance',
       noVersions: 'No versions yet',
-      columns: { hostname: 'Hostname', ip: 'IP', version: 'Version', network: 'Network', lastSeen: 'Last seen', actions: 'Actions' },
+      columns: { status: 'Status', name: 'Name', hostname: 'Hostname', vpnIp: 'VPN IP', publicIp: 'Public IP', version: 'Version', cpu: 'CPU', mem: 'Memory', network: 'Network', actions: 'Actions' }, setAlias: 'Set name',
     },
   },
 }

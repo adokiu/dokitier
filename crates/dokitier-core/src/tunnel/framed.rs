@@ -20,7 +20,7 @@ use crate::{
     tunnel::{SinkError, SinkItem, StreamItem, TunnelError},
 };
 
-pub const TCP_MTU_BYTES: usize = 2000;
+pub const TCP_MTU_BYTES: usize = 128 * 1024;
 
 pub fn reserve_buf(buf: &mut BytesMut, min_size: usize, max_size: usize) {
     if buf.capacity() < min_size {

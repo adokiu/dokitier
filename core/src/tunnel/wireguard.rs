@@ -810,6 +810,7 @@ pub mod tests {
                     Vec::new(),
                     UdpBindOptions::direct_connect(),
                     UdpSessionMode::Classified(UdpSessionProtocol::WireGuard),
+                    None,
                 )
                 .await
                 .unwrap();

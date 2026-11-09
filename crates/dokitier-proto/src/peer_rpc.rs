@@ -136,6 +136,8 @@ impl From<Vec<crate::api::instance::PeerInfo>> for PeerInfoForGlobalMap {
         }
         PeerInfoForGlobalMap {
             direct_peers: peer_map,
+            bandwidth_up_mbps: 0.0,
+            bandwidth_down_mbps: 0.0,
         }
     }
 }

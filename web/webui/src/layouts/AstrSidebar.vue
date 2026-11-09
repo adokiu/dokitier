@@ -78,7 +78,7 @@ import { useRoute } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import { useI18n } from 'vue-i18n'
 import {
-  Activity, Compass, LayoutDashboard, Link2, PanelLeft, Route, Server, Settings,
+  Compass, LayoutDashboard, Network, PanelLeft, Route, Server, Settings, ShieldCheck,
 } from '@lucide/vue'
 
 const { t } = useI18n()
@@ -91,10 +91,10 @@ const isRail = computed(() => rail.value && !smAndDown.value)
 const navItems = [
   { titleKey: 'nav.dashboard', icon: markRaw(LayoutDashboard), to: '/dashboard' },
   { titleKey: 'nav.topology', icon: markRaw(Compass), to: '/topology' },
+  { titleKey: 'nav.networks', icon: markRaw(Network), to: '/networks' },
   { titleKey: 'nav.nodes', icon: markRaw(Server), to: '/nodes' },
-  { titleKey: 'nav.links', icon: markRaw(Link2), to: '/links' },
+  { titleKey: 'nav.acl', icon: markRaw(ShieldCheck), to: '/acl' },
   { titleKey: 'nav.routes', icon: markRaw(Route), to: '/routes' },
-  { titleKey: 'nav.history', icon: markRaw(Activity), to: '/history' },
 ]
 
 watch(rail, (value) => localStorage.setItem('dokitier-sidebar-rail', value ? '1' : '0'))

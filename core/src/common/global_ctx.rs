@@ -344,7 +344,12 @@ impl GlobalCtx {
     }
 
     pub fn runtime_mapped_listeners(&self) -> Vec<url::Url> {
-        let listeners = self.config.get_mapped_listeners();
+        // Runtime advertisement only: shared listeners contribute the public
+        // shared addresses, and management-API patches may add more. Config
+        // files themselves never carry mapped listeners.
+        let mut runtime = crate::shared_listener::advertise_urls();
+        runtime.extend(self.config.get_mapped_listeners());
+        let listeners = runtime;
         let Some(protocols) = &self.runtime_endpoint_protocols else {
             return listeners;
         };

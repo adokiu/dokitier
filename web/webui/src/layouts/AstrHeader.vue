@@ -5,12 +5,42 @@
     </v-btn>
     <v-spacer />
     <div class="header-actions">
-      <v-btn size="small" variant="text" @click="toggleLang">{{ locale === 'zh' ? 'EN' : '中' }}</v-btn>
-      <v-btn icon variant="text" size="small" @click="toggleTheme">
-        <Sun v-if="isDark" :size="18" />
-        <Moon v-else :size="18" />
-        <v-tooltip activator="parent">{{ t('nav.settings') }}</v-tooltip>
-      </v-btn>
+      <v-menu location="bottom end" offset="6">
+        <template #activator="{ props: langProps }">
+          <v-btn v-bind="langProps" icon variant="text" size="small">
+            <v-icon size="18">mdi-translate</v-icon>
+            <v-tooltip activator="parent" location="top">语言</v-tooltip>
+          </v-btn>
+        </template>
+        <v-card rounded="lg" min-width="160" class="styled-menu-card">
+          <v-list density="compact" class="pa-1">
+            <v-list-item rounded="md" :active="locale === 'zh'" @click="setLocale('zh')">
+              <template #prepend><img class="language-flag-img" src="https://flagcdn.com/cn.svg" alt="CN" loading="lazy" /></template>
+              <v-list-item-title>简体中文</v-list-item-title>
+            </v-list-item>
+            <v-list-item rounded="md" :active="locale === 'en'" @click="setLocale('en')">
+              <template #prepend><img class="language-flag-img" src="https://flagcdn.com/us.svg" alt="US" loading="lazy" /></template>
+              <v-list-item-title>English</v-list-item-title>
+            </v-list-item>
+          </v-list>
+        </v-card>
+      </v-menu>
+      <v-menu location="bottom end" offset="6">
+        <template #activator="{ props: themeProps }">
+          <v-btn v-bind="themeProps" icon variant="text" size="small">
+            <v-icon size="18">{{ themeIcon }}</v-icon>
+            <v-tooltip activator="parent" location="top">主题</v-tooltip>
+          </v-btn>
+        </template>
+        <v-card rounded="lg" min-width="170" class="styled-menu-card">
+          <v-list density="compact" class="pa-1">
+            <v-list-item v-for="option in themeOptions" :key="option.mode" rounded="md" :active="themeMode === option.mode" @click="setThemeMode(option.mode)">
+              <template #prepend><v-icon size="18" class="mr-2">{{ option.icon }}</v-icon></template>
+              <v-list-item-title>{{ option.label }}</v-list-item-title>
+            </v-list-item>
+          </v-list>
+        </v-card>
+      </v-menu>
       <v-menu location="bottom end" offset="6">
         <template #activator="{ props: menuProps }">
           <button v-bind="menuProps" type="button" class="header-user">
@@ -31,7 +61,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useTheme } from 'vuetify'
 import { useI18n } from 'vue-i18n'
@@ -46,11 +76,33 @@ const { t, locale } = useI18n()
 const isDark = computed(() => theme.global.current.value.dark)
 const smAndDown = computed(() => window.innerWidth < 960)
 
-function toggleLang() { setLocale(locale.value === 'zh' ? 'en' : 'zh') }
-function toggleTheme() {
-  theme.global.name.value = isDark.value ? 'PurpleTheme' : 'PurpleThemeDark'
-  localStorage.setItem('dokitier_theme', theme.global.name.value)
+const themeMode = ref(localStorage.getItem('dokitier_theme_mode') || 'light')
+const themeOptions = [
+  { mode: 'light', icon: 'mdi-white-balance-sunny', label: '浅色模式' },
+  { mode: 'dark', icon: 'mdi-weather-night', label: '深色模式' },
+  { mode: 'system', icon: 'mdi-monitor', label: '跟随系统' },
+]
+const themeIcon = computed(() => themeOptions.find((o) => o.mode === themeMode.value)?.icon || 'mdi-white-balance-sunny')
+
+function applyTheme(mode) {
+  const dark = mode === 'dark' || (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+  const name = dark ? 'PurpleThemeDark' : 'PurpleTheme'
+  theme.change(name)
+  localStorage.setItem('dokitier_theme', name)
 }
+
+function setThemeMode(mode) {
+  themeMode.value = mode
+  localStorage.setItem('dokitier_theme_mode', mode)
+  applyTheme(mode)
+}
+
+onMounted(() => {
+  applyTheme(themeMode.value)
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (themeMode.value === 'system') applyTheme('system')
+  })
+})
 async function logout() {
   try { await api.logout() } catch {}
   router.push('/login')
@@ -81,4 +133,6 @@ async function logout() {
 @media (max-width: 959.98px) {
   .app-header-context { margin-left: 0; }
 }
+
+.language-flag-img { width: 18px; height: 13px; border-radius: 2px; object-fit: cover; margin-right: 10px; }
 </style>

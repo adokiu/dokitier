@@ -18,7 +18,7 @@ use dokitier_core::{
 };
 use quinn::{
     AsyncUdpSocket, ClientConfig, Connecting, Connection, ConnectionError, Endpoint,
-    EndpointConfig, Incoming, ServerConfig, TransportConfig, congestion::BbrConfig,
+    EndpointConfig, Incoming, ServerConfig, TransportConfig,
     default_runtime,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -370,10 +370,15 @@ pub fn transport_config() -> Arc<TransportConfig> {
         .max_concurrent_bidi_streams(u8::MAX.into())
         .max_concurrent_uni_streams(0u8.into())
         .keep_alive_interval(Some(Duration::from_secs(5)))
-        .initial_mtu(1200)
+        .initial_mtu(1472)
         .min_mtu(1200)
-        .enable_segmentation_offload(true)
-        .congestion_controller_factory(Arc::new(BbrConfig::default()));
+        .enable_segmentation_offload(false)
+        // BBR collapses one direction to a trickle when both directions are
+        // saturated on low-RTT paths (measured 46 Mbps vs 717 Mbps unidirectional);
+        // CUBIC keeps bidirectional bulk transfer fair and full-speed.
+        .congestion_controller_factory(Arc::new(
+            quinn_proto::congestion::CubicConfig::default(),
+        ));
 
     Arc::new(config)
 }
@@ -436,6 +441,43 @@ pub(crate) async fn connect_with_etq1(
 
 const QUIC_ACCEPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn spawn_metrics_sampler(conn: &Connection, addr: SocketAddr) {
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let key = addr.to_string();
+        let mut last_sent = 0u64;
+        let mut last_lost = 0u64;
+        let mut loss_ewma = 0.0f32;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let stats = conn.stats();
+            let sent = stats.path.sent_packets;
+            let lost = stats.path.lost_packets;
+            let d_sent = sent.saturating_sub(last_sent);
+            let d_lost = lost.saturating_sub(last_lost);
+            last_sent = sent;
+            last_lost = lost;
+            if d_sent + d_lost > 0 {
+                let ratio = d_lost as f32 / (d_sent + d_lost) as f32 * 100.0;
+                loss_ewma = loss_ewma * 0.7 + ratio * 0.3;
+            }
+            dokitier_core::peers::transport_metrics::publish(
+                key.clone(),
+                dokitier_core::peers::transport_metrics::TransportSample {
+                    proto: "quic".to_string(),
+                    loss_pct: Some(loss_ewma.clamp(0.0, 100.0)),
+                    rtt_us: Some(stats.path.rtt.as_micros().min(u32::MAX as u128) as u32),
+                    ..Default::default()
+                },
+            );
+            if conn.close_reason().is_some() {
+                break;
+            }
+        }
+        dokitier_core::peers::transport_metrics::remove(&key);
+    });
+}
+
 struct ConnWrapper {
     conn: Connection,
     _endpoint: Endpoint,
@@ -461,6 +503,7 @@ pub(crate) async fn upgrade_connected(
         Endpoint::new_with_abstract_socket(endpoint_config(), None, socket, runtime)?;
     endpoint.set_default_client_config(client_config());
     let connection = connect_with_etq1(&endpoint, remote_addr, "localhost").await?;
+    spawn_metrics_sampler(&connection, connection.remote_address());
     let (write, read) = connection
         .open_bi()
         .await
@@ -507,6 +550,7 @@ async fn finish_quic_session_tunnel(
         .await
         .map_err(TunnelError::Timeout)?
         .with_context(|| "accept connection failed")?;
+    spawn_metrics_sampler(&connection, connection.remote_address());
     let (write, read) =
         tokio::time::timeout(QUIC_ACCEPT_COMPLETION_TIMEOUT, connection.accept_bi())
             .await
@@ -709,6 +753,7 @@ mod tests {
                 Vec::new(),
                 UdpBindOptions::direct_connect(),
                 UdpSessionMode::Classified(UdpSessionProtocol::Quic),
+                None,
             )
             .await
             .unwrap();

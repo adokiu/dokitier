@@ -27,6 +27,49 @@ static WEIGHTED: AtomicBool = AtomicBool::new(true);
 static WEIGHTS: OnceLock<RwLock<RoutingWeights>> = OnceLock::new();
 static LINKS: OnceLock<RwLock<HashMap<(PeerId, PeerId), LinkPolicy>>> = OnceLock::new();
 static STATIC_ROUTES: OnceLock<RwLock<Vec<(IpCidr, PeerId)>>> = OnceLock::new();
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeBandwidth {
+    pub up_mbps: f64,
+    pub down_mbps: f64,
+}
+
+static NODE_BANDWIDTH: OnceLock<RwLock<HashMap<PeerId, NodeBandwidth>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+pub struct PeerMetrics {
+    pub proto: String,
+    pub transport_loss_pct: f32,
+    pub utilization: f64,
+    pub capacity_mbps: f64,
+    pub transport_rtt_us: Option<u32>,
+    pub probe_capacity_mbps: Option<f64>,
+}
+
+static PEER_METRICS: OnceLock<RwLock<HashMap<PeerId, PeerMetrics>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalBandwidthCaps {
+    pub intranet_down_mbps: Option<f64>,
+    pub internet_down_mbps: Option<f64>,
+}
+
+static LOCAL_CAPS: OnceLock<RwLock<LocalBandwidthCaps>> = OnceLock::new();
+
+fn local_caps() -> &'static RwLock<LocalBandwidthCaps> {
+    LOCAL_CAPS.get_or_init(|| RwLock::new(LocalBandwidthCaps::default()))
+}
+
+pub fn set_local_bandwidth_caps(caps: LocalBandwidthCaps) {
+    *local_caps().write().unwrap() = caps;
+}
+
+pub fn intranet_down_cap() -> Option<f64> {
+    local_caps().read().unwrap().intranet_down_mbps
+}
+
+pub fn internet_down_cap() -> Option<f64> {
+    local_caps().read().unwrap().internet_down_mbps
+}
 
 fn weights() -> &'static RwLock<RoutingWeights> {
     WEIGHTS.get_or_init(|| RwLock::new(RoutingWeights::default()))
@@ -38,6 +81,112 @@ fn links() -> &'static RwLock<HashMap<(PeerId, PeerId), LinkPolicy>> {
 
 fn static_routes() -> &'static RwLock<Vec<(IpCidr, PeerId)>> {
     STATIC_ROUTES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn node_bandwidths() -> &'static RwLock<HashMap<PeerId, NodeBandwidth>> {
+    NODE_BANDWIDTH.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Advertised per-node uplink/downlink capacity (Mbps). Directional link
+/// capacity is derived as `min(up(src), down(dst))`; explicit per-link
+/// overrides still win.
+pub fn set_node_bandwidth_silent(peer: PeerId, up_mbps: f64, down_mbps: f64) {
+    let mut map = node_bandwidths().write().unwrap();
+    let entry = map.entry(peer).or_insert(NodeBandwidth {
+        up_mbps: 0.1,
+        down_mbps: 0.1,
+    });
+    entry.up_mbps = up_mbps.max(0.1);
+    entry.down_mbps = down_mbps.max(0.1);
+}
+
+pub fn set_node_bandwidth(peer: PeerId, up_mbps: f64, down_mbps: f64) {
+    node_bandwidths().write().unwrap().insert(
+        peer,
+        NodeBandwidth {
+            up_mbps: up_mbps.max(0.1),
+            down_mbps: down_mbps.max(0.1),
+        },
+    );
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn node_bandwidth(peer: PeerId) -> Option<NodeBandwidth> {
+    node_bandwidths().read().unwrap().get(&peer).copied()
+}
+
+fn peer_metrics_map() -> &'static RwLock<HashMap<PeerId, PeerMetrics>> {
+    PEER_METRICS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Publish measured transport metrics for a peer. Bumps the policy generation
+/// only when the change is significant, to avoid re-running OSPF every second.
+pub fn set_peer_metrics(peer: PeerId, metrics: PeerMetrics) {
+    let mut map = peer_metrics_map().write().unwrap();
+    let changed = match map.get(&peer) {
+        Some(previous) => {
+            (previous.transport_loss_pct - metrics.transport_loss_pct).abs() > 1.0
+                || (previous.utilization - metrics.utilization).abs() > 0.05
+                || (previous.capacity_mbps - metrics.capacity_mbps).abs() > 1.0
+        }
+        None => true,
+    };
+    map.insert(peer, metrics);
+    drop(map);
+    if changed {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Update only the capacity estimate for a peer (advertised bandwidth from the
+/// peer center), preserving loss/utilization samples.
+pub fn set_peer_capacity(peer: PeerId, capacity_mbps: f64) {
+    if capacity_mbps <= 0.0 {
+        return;
+    }
+    let capacity_mbps = capacity_mbps.round().max(1.0);
+    let mut map = peer_metrics_map().write().unwrap();
+    let entry = map.entry(peer).or_default();
+    if (entry.capacity_mbps - capacity_mbps).abs() > 1.0 {
+        entry.capacity_mbps = capacity_mbps;
+        drop(map);
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+    } else {
+        entry.capacity_mbps = capacity_mbps;
+    }
+}
+
+pub fn set_peer_probe_capacity(peer: PeerId, capacity_mbps: f64) {
+    if capacity_mbps <= 0.0 {
+        return;
+    }
+    let mut map = peer_metrics_map().write().unwrap();
+    let entry = map.entry(peer).or_default();
+    let changed = entry
+        .probe_capacity_mbps
+        .map(|previous| (previous - capacity_mbps).abs() > 1.0)
+        .unwrap_or(true);
+    entry.probe_capacity_mbps = Some(capacity_mbps);
+    entry.capacity_mbps = capacity_mbps;
+    drop(map);
+    if changed {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn peer_metrics(peer: PeerId) -> Option<PeerMetrics> {
+    peer_metrics_map().read().unwrap().get(&peer).cloned()
+}
+
+fn protocol_loss_weight(global: &RoutingWeights, proto: Option<&str>) -> f64 {
+    match proto.map(str::to_ascii_lowercase).as_deref() {
+        Some("tcp") | Some("ws") | Some("wss") | Some("faketcp") => global.tcp_loss_weight,
+        Some("udp") => global.udp_loss_weight,
+        Some("kcp") => global.kcp_loss_weight,
+        Some("quic") => global.quic_loss_weight,
+        Some("wg") | Some("wireguard") => global.wg_loss_weight,
+        _ => 1.0,
+    }
 }
 
 pub fn generation() -> u64 {
@@ -80,23 +229,58 @@ fn link_for(src: PeerId, dst: PeerId) -> Option<LinkPolicy> {
         .cloned()
 }
 
-/// Cost formula:
-/// `latency*w_lat + loss_pct*w_loss + (ref_bw/bandwidth)*w_bw`.
+/// Cost formula (directional):
+/// `latency*w_lat + loss_term*w_loss + (ref_bw/bandwidth)*w_bw
+///  + utilization*w_util + w_hop`, where the loss term is `-ln(1-p)` so
+/// independent losses combine multiplicatively across hops.
 pub fn calculate_cost(src: PeerId, dst: PeerId, latency_ms: i32, loss_pct: f32) -> i32 {
-    let Some(link) = link_for(src, dst) else {
-        return cost_with(&routing_weights(), None, latency_ms, loss_pct);
+    calculate_cost_ext(src, dst, latency_ms, loss_pct, None, None)
+}
+
+pub fn calculate_cost_ext(
+    src: PeerId,
+    dst: PeerId,
+    latency_ms: i32,
+    loss_pct: f32,
+    proto: Option<&str>,
+    utilization: Option<f64>,
+) -> i32 {
+    let src_bw = node_bandwidth(src);
+    let dst_bw = node_bandwidth(dst);
+    let node_bw = match (src_bw, dst_bw) {
+        (Some(a), Some(b)) => Some(a.up_mbps.min(b.down_mbps)),
+        (Some(a), None) => Some(a.up_mbps),
+        (None, Some(b)) => Some(b.down_mbps),
+        (None, None) => None,
     };
-    if link.disabled {
-        // Must be >= AVOID_RELAY_COST in the OSPF graph so the least-hop
-        // computation stops treating this edge as a normal one-hop link.
+    let link = link_for(src, dst);
+    if link.as_ref().is_some_and(|link| link.disabled) {
         return i32::MAX;
     }
-    cost_with(&routing_weights(), Some(&link), latency_ms, loss_pct)
+    let metrics = peer_metrics(dst).or_else(|| peer_metrics(src));
+    let proto = proto.or_else(|| metrics.as_ref().map(|m| m.proto.as_str()));
+    let utilization = utilization.or_else(|| metrics.as_ref().map(|m| m.utilization));
+    let effective_loss = metrics
+        .as_ref()
+        .map(|m| loss_pct.max(m.transport_loss_pct))
+        .unwrap_or(loss_pct);
+    let node_bw = node_bw.or_else(|| {
+        metrics
+            .as_ref()
+            .map(|m| m.capacity_mbps)
+            .filter(|v| *v > 0.0)
+    });
+    let global = routing_weights();
+    let weight = protocol_loss_weight(&global, proto);
+    cost_with(&global, link.as_ref(), node_bw, weight, utilization, latency_ms, effective_loss)
 }
 
 fn cost_with(
     global: &RoutingWeights,
     link: Option<&LinkPolicy>,
+    node_bw: Option<f64>,
+    protocol_loss_weight: f64,
+    utilization: Option<f64>,
     latency_ms: i32,
     loss_pct: f32,
 ) -> i32 {
@@ -105,20 +289,38 @@ fn cost_with(
         .unwrap_or(global.latency_weight);
     let w_loss = link
         .and_then(|l| l.loss_weight)
-        .unwrap_or(global.loss_weight);
+        .unwrap_or(global.loss_weight)
+        * protocol_loss_weight.max(0.05);
     let w_bw = link
         .and_then(|l| l.bandwidth_weight)
         .unwrap_or(global.bandwidth_weight);
     let bandwidth = link
         .and_then(|l| l.bandwidth_mbps)
+        .or(node_bw)
         .unwrap_or(global.reference_bandwidth_mbps)
         .max(0.1);
     let ref_bw = global.reference_bandwidth_mbps.max(0.1);
 
+    if global.min_bandwidth_mbps > 0.0 && bandwidth < global.min_bandwidth_mbps {
+        // hard prune: keep below AVOID_RELAY_COST semantics but very expensive
+        return i32::MAX - 3;
+    }
+
+    let loss_fraction = (loss_pct as f64 / 100.0).clamp(0.0, 0.999);
+    let loss_term = if loss_fraction > 0.0 {
+        -((1.0 - loss_fraction).ln()) * global.loss_gain.max(0.0)
+    } else {
+        0.0
+    };
+    let utilization_term = global.utilization_weight.max(0.0)
+        * utilization.unwrap_or(0.0).clamp(0.0, 1.0).powi(2);
+
     let cost = latency_ms as f64 * w_lat
-        + loss_pct as f64 * w_loss
-        + (ref_bw / bandwidth) * w_bw;
-    (cost.clamp(1.0, (i32::MAX - 2) as f64)) as i32
+        + loss_term * w_loss
+        + (ref_bw / bandwidth) * w_bw
+        + utilization_term
+        + global.hop_weight.max(0.0);
+    (cost.clamp(1.0, (i32::MAX - 4) as f64)) as i32
 }
 
 #[cfg(test)]
@@ -132,7 +334,7 @@ mod tests {
             loss_weight: 10.0,
             bandwidth_weight: 0.0,
             reference_bandwidth_mbps: 100.0,
-            weighted: true,
+            ..RoutingWeights::default()
         });
         set_links(HashMap::new());
         // 20ms * 1 + 5% * 10 = 70

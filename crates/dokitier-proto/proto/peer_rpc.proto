@@ -295,6 +295,9 @@ message DirectConnectedPeerInfo {
 
 message PeerInfoForGlobalMap {
   map<uint32, DirectConnectedPeerInfo> direct_peers = 1;
+  // Advertised node capacity, filled by the reporting peer itself.
+  double bandwidth_up_mbps = 2;
+  double bandwidth_down_mbps = 3;
 }
 
 message ReportPeersRequest {
@@ -311,6 +314,20 @@ message GetGlobalPeerMapRequest { uint64 digest = 1; }
 message GetGlobalPeerMapResponse {
   map<uint32, PeerInfoForGlobalMap> global_peer_map = 1;
   optional uint64 digest = 2;
+}
+
+message BandwidthProbeRequest {
+  uint32 size_bytes = 1;
+  uint64 nonce = 2;
+}
+
+message BandwidthProbeResponse {
+  uint64 nonce = 1;
+  bytes payload = 2;
+}
+
+service BandwidthProbeRpc {
+  rpc Probe(BandwidthProbeRequest) returns (BandwidthProbeResponse);
 }
 
 service PeerCenterRpc {

@@ -11,11 +11,15 @@ pub(super) async fn connect_with_socket<H>(
     host: Arc<H>,
     socket: Arc<<H as VirtualUdpSocketFactory>::Socket>,
     remote_addr: SocketAddr,
+    network_name: Option<String>,
 ) -> anyhow::Result<ConnectedUdpSession>
 where
     H: DirectConnectorHost,
 {
     let layer = Arc::new(UdpSessionLayer::new_with_stun_responder(socket, host));
+    if let Some(network_name) = network_name {
+        layer.set_network_name(network_name);
+    }
     let session = layer.connect(remote_addr).await?;
     Ok(ConnectedUdpSession::new(session, layer))
 }

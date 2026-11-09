@@ -461,11 +461,115 @@ pub(crate) async fn direct_peer_info(peer_maps: &[Arc<PeerMap>]) -> PeerInfoForG
         ) else {
             continue;
         };
-        let loss_rate = if conns.is_empty() {
+        let mut loss_rate = if conns.is_empty() {
             0.0
         } else {
             conns.iter().map(|conn| conn.loss_rate).sum::<f32>() / conns.len() as f32
         };
+
+        // Transport-level measurements: TCP retransmission ratio from
+        // /proc/net/tcp, QUIC loss/RTT published by the QUIC sampler.
+        let mut transport_loss_pct = 0.0f32;
+        let mut utilization = 0.0f64;
+        let mut capacity_mbps = 0.0f64;
+        let mut proto = String::new();
+        let mut transport_rtt_us = None;
+        for conn in &conns {
+            let Some(tunnel) = conn.tunnel.as_ref() else { continue };
+            let Some(remote) = tunnel.resolved_remote_addr.as_ref().or(tunnel.remote_addr.as_ref()) else { continue };
+            let Ok(parsed) = url::Url::parse(&remote.url) else { continue };
+            let Some(host) = parsed.host_str() else { continue };
+            let Some(port) = parsed.port() else { continue };
+            let key = format!("{host}:{port}");
+            let tunnel_type = tunnel.tunnel_type.to_ascii_lowercase();
+            if tunnel_type == "tcp" || tunnel_type == "faketcp" {
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    let socket = std::net::SocketAddr::new(ip, port);
+                    if let Some(retrans) = crate::peers::transport_metrics::linux_tcp_retrans(socket) {
+                        let tx_packets = conn
+                            .stats
+                            .as_ref()
+                            .map(|stats| stats.tx_packets as u64)
+                            .unwrap_or(0);
+                        if let Some(loss) = crate::peers::transport_metrics::tcp_loss_tick(&key, retrans, tx_packets) {
+                            transport_loss_pct = transport_loss_pct.max(loss);
+                            proto = "tcp".to_string();
+                        }
+                    }
+                }
+            }
+            if let Some(sample) = crate::peers::transport_metrics::get_fresh(
+                &key,
+                std::time::Duration::from_secs(10),
+            ) {
+                if let Some(loss) = sample.loss_pct {
+                    transport_loss_pct = transport_loss_pct.max(loss);
+                }
+                if sample.proto == "quic" {
+                    proto = "quic".to_string();
+                }
+                transport_rtt_us = sample.rtt_us.or(transport_rtt_us);
+            }
+            if let Some(stats) = conn.stats.as_ref() {
+                // remote declared bandwidth is not exchanged yet; use the
+                // reference bandwidth as a floor so idle links are not
+                // treated as 1 Mbps capacity
+                let advertised = crate::peers::link_policy::node_bandwidth(peer)
+                    .map(|bw| bw.down_mbps)
+                    .filter(|value| *value > 0.0);
+                let reachability_cap = host
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+                    .map(|ip| match ip {
+                        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+                        std::net::IpAddr::V6(v6) => v6.is_unique_local() || v6.is_loopback(),
+                    })
+                    .and_then(|intranet| {
+                        if intranet {
+                            crate::peers::link_policy::intranet_down_cap()
+                        } else {
+                            crate::peers::link_policy::internet_down_cap()
+                        }
+                    });
+                // Only an active burst measurement defines link capacity.
+                // Advertised bandwidth, NIC speed and passive peaks are never
+                // used as a fallback; without a measurement the capacity stays
+                // unknown and the UI shows "未测量".
+                let probe_capacity = crate::peers::link_policy::peer_metrics(peer)
+                    .and_then(|metrics| metrics.probe_capacity_mbps)
+                    .map(|value| value.round().max(1.0));
+                if let Some(rate) = crate::peers::transport_metrics::update_rate(
+                    &key,
+                    stats.tx_bytes,
+                    stats.rx_bytes,
+                    1.0,
+                    probe_capacity,
+                ) {
+                    if rate.capacity_mbps > 0.0 {
+                        capacity_mbps = capacity_mbps.max(rate.capacity_mbps);
+                        utilization = utilization.max(rate.utilization);
+                    }
+                }
+            }
+        }
+        if transport_loss_pct > 0.0 {
+            loss_rate = (loss_rate * 100.0).max(transport_loss_pct) / 100.0;
+        }
+        if capacity_mbps > 0.0 || transport_loss_pct > 0.0 || !proto.is_empty() {
+            let probe_capacity = crate::peers::link_policy::peer_metrics(peer)
+                .and_then(|metrics| metrics.probe_capacity_mbps);
+            crate::peers::link_policy::set_peer_metrics(
+                peer,
+                crate::peers::link_policy::PeerMetrics {
+                    proto: proto.clone(),
+                    transport_loss_pct,
+                    utilization,
+                    capacity_mbps,
+                    transport_rtt_us,
+                    probe_capacity_mbps: probe_capacity,
+                },
+            );
+        }
 
         ret.direct_peers.insert(
             peer,

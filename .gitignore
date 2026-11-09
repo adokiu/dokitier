@@ -74,3 +74,10 @@ console/board.db*
 *.db
 *.db-shm
 *.db-wal
+
+# local cross-compile / tool caches (never commit)
+.rust-target/
+.zig-cache/
+.zigbuild-cache/
+__pycache__/
+*.pyc

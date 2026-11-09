@@ -7,7 +7,6 @@ use strum::VariantArray as _;
 #[cfg(feature = "management")]
 use tokio::io::AsyncReadExt as _;
 
-use dokitier_core::config::MappedListenerPolicy;
 #[cfg(feature = "management")]
 pub use dokitier_core::config::api_input::{
     NetworkConfig, NetworkConfigExt, NetworkingMethod, add_proxy_network_to_config,
@@ -18,17 +17,8 @@ pub use dokitier_core::config::toml::*;
 use crate::common::env_parser;
 #[cfg(feature = "logging")]
 use crate::common::log;
-use crate::tunnel::IpScheme;
-
 #[cfg(feature = "management")]
 pub use dokitier_core::management::{config_source_from_rpc, config_source_to_rpc};
-
-pub fn parse_mapped_listener_urls(
-    mapped_listeners: &[String],
-) -> Result<Vec<url::Url>, anyhow::Error> {
-    MappedListenerPolicy::new(IpScheme::VARIANTS.iter().map(ToString::to_string))
-        .parse_urls(mapped_listeners)
-}
 
 pub fn load_toml_config_from_path(path: &PathBuf) -> Result<TomlConfigLoader, anyhow::Error> {
     let config = std::fs::read_to_string(path)

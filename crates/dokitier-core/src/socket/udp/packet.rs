@@ -43,6 +43,17 @@ where
     ret
 }
 
+pub fn new_network_announce_packet(network: &str) -> ZCPacket {
+    new_udp_packet(
+        |header| {
+            header.msg_type = UdpPacketType::NetworkAnnounce as u8;
+            header.conn_id.set(0);
+            header.len.set(network.len() as u16);
+        },
+        network.as_bytes(),
+    )
+}
+
 pub fn new_syn_packet(conn_id: u32, magic: u64) -> ZCPacket {
     new_udp_packet(
         |header| {

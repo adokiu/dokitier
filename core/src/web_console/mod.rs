@@ -526,19 +526,28 @@ pub async fn reload_routing_policy(store: &dokitier_web::Store) {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(default)
     };
-    dokitier_core::peers::link_policy::set_routing_weights(RoutingWeights {
-        latency_weight: read("routing.latency_weight", defaults.latency_weight),
-        loss_weight: read("routing.loss_weight", defaults.loss_weight),
-        bandwidth_weight: read("routing.bandwidth_weight", defaults.bandwidth_weight),
-        reference_bandwidth_mbps: read(
-            "routing.reference_bandwidth_mbps",
-            defaults.reference_bandwidth_mbps,
-        ),
-        weighted: settings
-            .get("routing.mode")
-            .map(|mode| mode != "least_hop")
-            .unwrap_or(true),
-    });
+    let mut weights = defaults;
+    weights.latency_weight = read("routing.latency_weight", weights.latency_weight);
+    weights.loss_weight = read("routing.loss_weight", weights.loss_weight);
+    weights.bandwidth_weight = read("routing.bandwidth_weight", weights.bandwidth_weight);
+    weights.reference_bandwidth_mbps = read(
+        "routing.reference_bandwidth_mbps",
+        weights.reference_bandwidth_mbps,
+    );
+    weights.utilization_weight = read("routing.utilization_weight", weights.utilization_weight);
+    weights.hop_weight = read("routing.hop_weight", weights.hop_weight);
+    weights.loss_gain = read("routing.loss_gain", weights.loss_gain);
+    weights.min_bandwidth_mbps = read("routing.min_bandwidth_mbps", weights.min_bandwidth_mbps);
+    weights.tcp_loss_weight = read("routing.tcp_loss_weight", weights.tcp_loss_weight);
+    weights.udp_loss_weight = read("routing.udp_loss_weight", weights.udp_loss_weight);
+    weights.kcp_loss_weight = read("routing.kcp_loss_weight", weights.kcp_loss_weight);
+    weights.quic_loss_weight = read("routing.quic_loss_weight", weights.quic_loss_weight);
+    weights.wg_loss_weight = read("routing.wg_loss_weight", weights.wg_loss_weight);
+    weights.weighted = settings
+        .get("routing.mode")
+        .map(|mode| mode != "least_hop")
+        .unwrap_or(true);
+    dokitier_core::peers::link_policy::set_routing_weights(weights);
 
     let static_routes = store.list_static_routes().await.unwrap_or_default();
     let parsed = static_routes

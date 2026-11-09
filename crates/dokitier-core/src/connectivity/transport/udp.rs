@@ -48,6 +48,7 @@ pub async fn connect_udp<H>(
     bind_addrs: Vec<SocketAddr>,
     default_bind: UdpBindOptions,
     mode: UdpSessionMode,
+    network_name: Option<String>,
 ) -> anyhow::Result<ConnectedUdpSession>
 where
     H: VirtualUdpSocketFactory,
@@ -68,14 +69,14 @@ where
         let bind = default_bind
             .with_local_addr(Some(local_addr))
             .with_only_v6(true);
-        futures.push(bind_and_connect(host.clone(), bind, remote_addr, mode));
+        futures.push(bind_and_connect(host.clone(), bind, remote_addr, mode, network_name.clone()));
     } else {
         for bind_addr in bind_addrs {
             let bind = default_bind
                 .clone()
                 .with_local_addr(Some(bind_addr))
                 .with_only_v6(true);
-            futures.push(bind_and_connect(host.clone(), bind, remote_addr, mode));
+            futures.push(bind_and_connect(host.clone(), bind, remote_addr, mode, network_name.clone()));
         }
     }
     first_success(futures).await
@@ -86,12 +87,20 @@ async fn bind_and_connect<H>(
     bind: UdpBindOptions,
     remote_addr: SocketAddr,
     mode: UdpSessionMode,
+    network_name: Option<String>,
 ) -> anyhow::Result<ConnectedUdpSession>
 where
     H: VirtualUdpSocketFactory,
 {
     let socket = host.bind_udp(bind).await?;
     let layer = Arc::new(UdpSessionLayer::new_with_stun_responder(socket, host));
+    // The layer is created per connection attempt, so the network name has to be
+    // installed here before connecting. Without it the EasyTier mux handshake is
+    // sent without the `NetworkAnnounce` prelude and a shared UDP listener (one
+    // public port serving several networks) cannot demultiplex the flow.
+    if let Some(network) = network_name.as_deref() {
+        layer.set_network_name(network);
+    }
     let session = match mode {
         UdpSessionMode::EasyTierMux => layer.connect(remote_addr).await?,
         UdpSessionMode::Classified(protocol) => {

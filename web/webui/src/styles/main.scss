@@ -3,14 +3,19 @@
 
 
 
+
+
 :root {
+  --dok-font: 'Outfit', 'Noto Sans', 'Noto Sans CJK SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
   --dok-font-cjk: 'Noto Sans CJK SC', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC';
-  --dok-accent: #3c96ca;
-  --dok-accent-rgb: 60, 150, 202;
-  --dok-border: rgba(var(--v-theme-on-surface), .1);
   --dok-muted: rgba(var(--v-theme-on-surface), .62);
-  --dok-subtle: rgba(var(--v-theme-on-surface), .46);
-  --admin-chrome: #fdfcfc;
+  --dok-subtle: rgba(var(--v-theme-on-surface), .45);
+  --dok-border: rgba(var(--v-theme-on-surface), .12);
+}
+.v-theme--PurpleThemeDark {
+  --dok-muted: rgba(var(--v-theme-on-surface), .66);
+  --dok-subtle: rgba(var(--v-theme-on-surface), .5);
+  --dok-border: rgba(var(--v-theme-on-surface), .16);
 }
 
 * { box-sizing: border-box; }
@@ -18,14 +23,14 @@ a { color: inherit; text-decoration: none; }
 html, body, #app { min-height: 100%; }
 body {
   margin: 0;
-  font-family: 'Outfit', 'Noto Sans', var(--dok-font-cjk), sans-serif;
+  font-family: var(--dok-font);
   background: rgb(var(--v-theme-background));
   color: rgb(var(--v-theme-on-surface));
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 .v-application {
-  font-family: 'Outfit', 'Noto Sans', var(--dok-font-cjk), sans-serif !important;
+  font-family: var(--dok-font) !important;
   background: rgb(var(--v-theme-background)) !important;
 }
 .v-application .text-body-1, .v-application .text-body-2, .v-application .text-caption { font-family: inherit !important; }
@@ -47,6 +52,7 @@ body {
 .stat-label { color: var(--dok-muted); font-size: 12px; }
 .stat-value { font-size: 1.5rem; line-height: 1.2; font-weight: 600; letter-spacing: -.02em; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.num { font-variant-numeric: tabular-nums; }
 
 /* ---------- shell ---------- */
 .admin-shell {
@@ -171,16 +177,86 @@ body {
   background: transparent !important;
   --v-table-header-height: 42px;
 }
-.v-data-table__thead tr {
-  border-bottom: 1px solid rgba(var(--v-theme-borderLight), .22) !important;
+.v-data-table,
+.v-data-table__wrapper { border: 0 !important; box-shadow: none !important; }
+
+.v-data-table > .v-table__wrapper > table > thead > tr > th,
+.v-data-table > .v-table__wrapper > table > tbody > tr > td,
+.v-data-table > .v-table__wrapper > table > tbody > tr > th,
+.v-data-table > .v-table__wrapper > table > tfoot > tr > td,
+.v-data-table > .v-table__wrapper > table > tfoot > tr > th {
+  border-style: solid !important;
+  border-color: var(--dok-table-line) !important;
+  border-width: 0 0 1px 0 !important;
+  box-shadow: none !important;
 }
-.v-data-table__tbody tr {
-  border-bottom: 1px solid rgba(var(--v-theme-borderLight), .12) !important;
+.v-data-table > .v-table__wrapper > table > tbody > tr:last-child > td,
+.v-data-table > .v-table__wrapper > table > tbody > tr:last-child > th {
+  border-bottom-width: 0 !important;
 }
-.v-data-table__tbody tr:last-child { border-bottom: 0 !important; }
+.v-data-table-footer {
+  border-top: 0 !important;
+  box-shadow: none !important;
+}
+.v-data-table > .v-table__wrapper {
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  border: 0 !important;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(var(--v-theme-on-surface), .26) transparent;
+}
+.v-data-table > .v-table__wrapper::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+  border: 0;
+  background: transparent;
+}
+.v-data-table > .v-table__wrapper::-webkit-scrollbar-track {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+.v-data-table > .v-table__wrapper::-webkit-scrollbar-thumb {
+  background: rgba(var(--v-theme-on-surface), .24);
+  border-radius: 999px;
+  border: 0;
+  box-shadow: none;
+}
+.v-data-table > .v-table__wrapper::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--v-theme-on-surface), .38);
+}
+.v-data-table > .v-table__wrapper::-webkit-scrollbar-corner {
+  background: transparent;
+  border: 0;
+}
+.v-data-table > .v-divider {
+  border-color: var(--dok-table-line) !important;
+  border-top-width: 1px !important;
+  border-top-style: solid !important;
+  opacity: 1 !important;
+  max-height: 1px !important;
+}
+.v-data-table .v-divider,
+.v-data-table .v-divider__wrapper,
+.v-data-table hr {
+  border-color: var(--dok-table-line) !important;
+  background-color: transparent !important;
+  opacity: 1 !important;
+}
+.v-theme--PurpleTheme { --dok-table-line: rgba(0, 0, 0, .08); }
+.v-theme--PurpleThemeDark { --dok-table-line: rgba(255, 255, 255, .05); }
 .v-data-table__td, .v-data-table__th { padding-inline: 16px !important; }
-.v-theme--PurpleThemeDark .v-data-table__tbody tr { border-bottom-color: rgba(255,255,255,.06) !important; }
-.v-theme--PurpleThemeDark .v-data-table__thead tr { border-bottom-color: rgba(255,255,255,.09) !important; }
+/* unified table typography: bigger text, same row height */
+.v-data-table__td { font-size: 14px; line-height: 1.25; }
+.v-data-table__th { font-size: 13px; }
+.v-data-table__td .text-caption { font-size: 14px !important; }
+.v-data-table__td .mono { font-size: 14px !important; }
+.v-data-table__td .mono,
+.v-data-table__td .mono div {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace !important;
+}
+.v-data-table__td .v-btn, .v-data-table__td .v-chip { font-size: 14px; }
+.v-data-table__td .v-chip .v-chip__content { font-size: 14px; }
 
 /* ---------- AstrBot integrated shell ---------- */
 .admin-shell {
@@ -319,3 +395,61 @@ html, body { height: 100%; overflow: hidden; }
 .v-theme--PurpleThemeDark .v-field--focused .v-field__outline { color: rgb(var(--v-theme-primary)); }
 .v-theme--PurpleThemeDark .v-field__outline__start,
 .v-theme--PurpleThemeDark .v-field__outline__end { border-color: rgba(255, 255, 255, 0.16); }
+
+
+/* Drawers are teleported above the app shell (z-index 4000); Vuetify menus,
+   selects and tooltips live in the global overlay container, so it must sit
+   above the drawer as well or its popups open behind it. */
+.v-overlay-container { z-index: 5000 !important; }
+
+
+/* Selects, menus and tooltips are attached to body; keep every Vuetify
+   overlay above the full-screen detail drawer (z-index 4000). */
+.v-overlay, .v-tooltip { z-index: 6000 !important; }
+
+/* Link/tunnel protocol badges — keep in sync with src/utils/protocol.js.
+   Every protocol reported by the core (including composed "https-ws" and
+   aggregated "udp/tcp") must render through these classes, never as a raw
+   type string. */
+.proto-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  max-width: 100%;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  padding: 2px 6px;
+  border-radius: 5px;
+  color: rgb(var(--v-theme-primary));
+  background: rgba(60, 150, 202, .08);
+}
+.proto-badge--tcp { color: #3c96ca; background: rgba(60, 150, 202, .12); }
+.proto-badge--udp { color: #2f9e6e; background: rgba(47, 158, 110, .12); }
+.proto-badge--quic { color: #d98324; background: rgba(217, 131, 36, .13); }
+.proto-badge--ws { color: #8a5cd6; background: rgba(138, 92, 214, .13); }
+.proto-badge--wss { color: #b04aa0; background: rgba(176, 74, 160, .13); }
+.proto-badge--faketcp { color: #7a8794; background: rgba(122, 135, 148, .13); }
+.proto-badge--wg { color: #c0605a; background: rgba(192, 96, 90, .13); }
+.proto-badge--ring { color: #5f8fa8; background: rgba(95, 143, 168, .13); }
+.proto-badge--unix { color: #6b7785; background: rgba(107, 119, 133, .13); }
+.proto-badge--http { color: #3f7fbf; background: rgba(63, 127, 191, .12); }
+.proto-badge--https { color: #2f6fa8; background: rgba(47, 111, 168, .13); }
+.proto-badge--mixed { color: #4f7fa8; background: linear-gradient(135deg, rgba(47, 158, 110, .14), rgba(60, 150, 202, .14)); }
+.proto-badge--other { color: rgb(var(--v-theme-primary)); background: rgba(60, 150, 202, .08); }
+.v-theme--PurpleThemeDark .proto-badge { background-color: rgba(255, 255, 255, .06); }
+.v-theme--PurpleThemeDark .proto-badge--tcp { background-color: rgba(60, 150, 202, .18); }
+.v-theme--PurpleThemeDark .proto-badge--udp { background-color: rgba(47, 158, 110, .18); }
+.v-theme--PurpleThemeDark .proto-badge--quic { background-color: rgba(217, 131, 36, .2); }
+.v-theme--PurpleThemeDark .proto-badge--ws { background-color: rgba(138, 92, 214, .2); }
+.v-theme--PurpleThemeDark .proto-badge--wss { background-color: rgba(176, 74, 160, .2); }
+.v-theme--PurpleThemeDark .proto-badge--faketcp { background-color: rgba(122, 135, 148, .2); }
+.v-theme--PurpleThemeDark .proto-badge--wg { background-color: rgba(192, 96, 90, .2); }
+.v-theme--PurpleThemeDark .proto-badge--ring { background-color: rgba(95, 143, 168, .2); }
+.v-theme--PurpleThemeDark .proto-badge--unix { background-color: rgba(107, 119, 133, .2); }
+.v-theme--PurpleThemeDark .proto-badge--http { background-color: rgba(63, 127, 191, .18); }
+.v-theme--PurpleThemeDark .proto-badge--https { background-color: rgba(47, 111, 168, .2); }
+.v-theme--PurpleThemeDark .proto-badge--mixed { background: linear-gradient(135deg, rgba(47, 158, 110, .22), rgba(60, 150, 202, .22)); }

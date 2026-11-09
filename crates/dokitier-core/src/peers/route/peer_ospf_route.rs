@@ -57,7 +57,8 @@ use crate::{
         peer_rpc::{
             ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey, OspfRouteRpc,
             OspfRouteRpcClientFactory, OspfRouteRpcServer, PeerGroupInfo, PeerIdVersion,
-            PeerIdentityType, PublicIpv6AddrRpcServer, RouteForeignNetworkInfos,
+            BandwidthProbeRpcServer, PeerIdentityType, PublicIpv6AddrRpcServer,
+            RouteForeignNetworkInfos,
             RouteForeignNetworkSummary, RoutePeerInfo, RoutePeerInfos, SyncRouteInfoError,
             SyncRouteInfoRequest, SyncRouteInfoResponse, TrustedCredentialPubkey,
             TrustedCredentialPubkeyProof, route_foreign_network_infos,
@@ -4544,6 +4545,12 @@ impl PeerRoute {
         );
         peer_rpc.rpc_server().registry().register(
             PublicIpv6AddrRpcServer::new(self.public_ipv6_service.rpc_server()),
+            &self.context.network_name(),
+        );
+        peer_rpc.rpc_server().registry().register(
+            BandwidthProbeRpcServer::new(
+                crate::peers::bandwidth_probe::BandwidthProbeServerImpl,
+            ),
             &self.context.network_name(),
         );
 

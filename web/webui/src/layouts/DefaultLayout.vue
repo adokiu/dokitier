@@ -4,7 +4,11 @@
   <v-main>
     <v-container fluid class="page-wrapper">
       <div class="page-content">
-        <router-view />
+        <router-view v-slot="{ Component, route }">
+          <transition name="page-fade" mode="out-in">
+            <component :is="Component" :key="route.path" />
+          </transition>
+        </router-view>
       </div>
     </v-container>
   </v-main>
@@ -29,6 +33,10 @@ function toggleDrawer() { sidebar.value?.toggle?.() }
   --v-layout-top: 0px !important;
   background: rgb(var(--v-theme-surface));
 }
+.page-fade-enter-active { transition: opacity .2s ease, transform .2s cubic-bezier(.25,.8,.25,1); }
+.page-fade-leave-active { transition: opacity .12s ease; }
+.page-fade-enter-from { opacity: 0; transform: translateY(8px); }
+.page-fade-leave-to { opacity: 0; }
 .page-wrapper {
   height: calc(100dvh - 40px - 6px);
   width: calc(100% - 6px);
@@ -43,7 +51,7 @@ function toggleDrawer() { sidebar.value?.toggle?.() }
 .page-content {
   height: 100%;
   width: 100%;
-  padding: 8px;
+  padding: 8px 24px;
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-width: none;

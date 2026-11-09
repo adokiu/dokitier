@@ -6,7 +6,7 @@ use crate::{
             LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader,
             VpnPortalClientConfig, VpnPortalConfig, add_proxy_network_to_config,
             load_config_from_file, load_toml_config_from_path,
-            load_toml_config_from_str_with_source, parse_mapped_listener_urls,
+            load_toml_config_from_str_with_source,
         },
         constants::EASYTIER_VERSION,
         log,
@@ -276,15 +276,6 @@ struct NetworkOptions {
         num_args = 0..
     )]
     listeners: Vec<String>,
-
-    #[arg(
-        long,
-        env = "ET_MAPPED_LISTENERS",
-        value_delimiter = ',',
-        help = t!("core_clap.mapped_listeners").to_string(),
-        num_args = 0..
-    )]
-    mapped_listeners: Vec<String>,
 
     #[arg(
         long,
@@ -791,9 +782,6 @@ impl NetworkOptions {
             );
         }
 
-        if !self.mapped_listeners.is_empty() {
-            cfg.set_mapped_listeners(Some(parse_mapped_listener_urls(&self.mapped_listeners)?));
-        }
 
         for n in self.proxy_networks.iter() {
             add_proxy_network_to_config(n, cfg)?;
@@ -1333,6 +1321,7 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "web-console")]
     let mut web_config_path: Option<std::path::PathBuf> = None;
     let mut toml_routing: Option<dokitier_core::config::RoutingWeights> = None;
+    let mut board_mode = false;
 
     let mut crate_cli_network = {
         if cli.daemon {
@@ -1401,6 +1390,13 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
             control.permission,
             cfg.dump_redacted()
         );
+        // board mode: the startup file only holds controller credentials and the
+        // node identity; network instances live in the networks/ directory
+        if cfg.controller_settings().is_some() {
+            log::info!("board connection config: skipping local network instance");
+            board_mode = true;
+            continue;
+        }
         manager.run_network_instance(cfg, control)?;
     }
 
@@ -1450,7 +1446,13 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
     let sigterm = std::future::pending::<()>();
 
     tokio::select! {
-        _ = manager.wait() => {
+        _ = async {
+            if board_mode {
+                std::future::pending::<()>().await;
+            } else {
+                manager.wait().await;
+            }
+        } => {
             let infos = manager.collect_network_infos().await?;
             let mut errors = String::new();
             for (instance_id, info) in infos {

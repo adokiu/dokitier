@@ -351,6 +351,15 @@ pub struct RoutingWeights {
     pub loss_weight: f64,
     pub bandwidth_weight: f64,
     pub reference_bandwidth_mbps: f64,
+    pub utilization_weight: f64,
+    pub hop_weight: f64,
+    pub loss_gain: f64,
+    pub tcp_loss_weight: f64,
+    pub udp_loss_weight: f64,
+    pub kcp_loss_weight: f64,
+    pub quic_loss_weight: f64,
+    pub wg_loss_weight: f64,
+    pub min_bandwidth_mbps: f64,
     /// When true (default), the weighted cost table is used for every packet.
     /// When false, the classic least-hop table is used unless the packet asks
     /// for latency-first routing.
@@ -364,6 +373,15 @@ impl Default for RoutingWeights {
             loss_weight: 20.0,
             bandwidth_weight: 0.5,
             reference_bandwidth_mbps: 100.0,
+            utilization_weight: 10.0,
+            hop_weight: 0.05,
+            loss_gain: 1.0,
+            tcp_loss_weight: 1.0,
+            udp_loss_weight: 1.0,
+            kcp_loss_weight: 1.0,
+            quic_loss_weight: 1.0,
+            wg_loss_weight: 1.0,
+            min_bandwidth_mbps: 0.0,
             weighted: true,
         }
     }
@@ -877,6 +895,8 @@ pub struct ControllerSettings {
     pub url: String,
     pub node_id: String,
     pub token: String,
+    pub instance_id: Option<String>,
     pub interval_secs: u64,
     pub heartbeat_secs: u64,
+    pub shared_listeners: Vec<String>,
 }

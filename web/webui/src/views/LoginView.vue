@@ -20,11 +20,11 @@
               <v-card class="styled-menu-card" elevation="8" rounded="lg" min-width="150">
                 <v-list density="compact" class="pa-1">
                   <v-list-item class="styled-menu-item" rounded="md" @click="setLocale('zh')">
-                    <template #prepend><span class="language-flag">🇨🇳</span></template>
+                    <template #prepend><img class="language-flag-img" src="https://flagcdn.com/cn.svg" alt="CN" loading="lazy" /></template>
                     <v-list-item-title>简体中文</v-list-item-title>
                   </v-list-item>
                   <v-list-item class="styled-menu-item" rounded="md" @click="setLocale('en')">
-                    <template #prepend><span class="language-flag">🇺🇸</span></template>
+                    <template #prepend><img class="language-flag-img" src="https://flagcdn.com/us.svg" alt="US" loading="lazy" /></template>
                     <v-list-item-title>English</v-list-item-title>
                   </v-list-item>
                 </v-list>
@@ -83,6 +83,19 @@
               :disabled="loading"
               @click:append-inner="showPassword = !showPassword"
             />
+            <v-text-field
+              v-if="totpEnabled"
+              v-model="totp"
+              label="动态验证码（启用 TOTP 时填写）"
+              name="totp"
+              inputmode="numeric"
+              maxlength="6"
+              variant="outlined"
+              hide-details="auto"
+              class="mt-3"
+              prepend-inner-icon="mdi-shield-key"
+              :disabled="loading"
+            />
             <div v-if="error" class="mt-4">
               <v-alert color="error" variant="tonal" icon="mdi-alert-circle" border="start">{{ error }}</v-alert>
             </div>
@@ -115,10 +128,13 @@ import { useRouter } from 'vue-router'
 import { useTheme } from 'vuetify'
 import { useI18n } from 'vue-i18n'
 import { setLocale } from '@/i18n'
+import { onMounted } from 'vue'
 import { api } from '@/api'
 
 const username = ref('admin')
 const password = ref('')
+const totp = ref('')
+const totpEnabled = ref(false)
 const error = ref('')
 const loading = ref(false)
 const showPassword = ref(false)
@@ -138,9 +154,17 @@ function setThemeMode(mode) {
   themeMode.value = mode
   localStorage.setItem('dokitier_theme_mode', mode)
   const dark = mode === 'dark' || (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
-  theme.global.name.value = dark ? 'PurpleThemeDark' : 'PurpleTheme'
-  localStorage.setItem('dokitier_theme', theme.global.name.value)
+  const name = dark ? 'PurpleThemeDark' : 'PurpleTheme'
+  theme.change(name)
+  localStorage.setItem('dokitier_theme', name)
 }
+
+onMounted(async () => {
+  try {
+    const status = await api.authStatus()
+    totpEnabled.value = status.totp_enabled === true
+  } catch {}
+})
 
 async function submit() {
   if (loading.value) return
@@ -151,9 +175,10 @@ async function submit() {
   loading.value = true
   error.value = ''
   try {
-    await api.login(username.value, password.value)
+    await api.login(username.value, password.value, totp.value.trim() || undefined)
     router.push('/dashboard')
   } catch (e) {
+    if (String(e.message || '').includes('totp')) totpEnabled.value = true
     error.value = e.message === 'unauthorized' ? t('login.wrong') : String(e.message || e)
   } finally {
     loading.value = false
@@ -191,6 +216,6 @@ async function submit() {
 }
 .login-version-item { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .login-version-label { margin-right: 4px; }
-.language-flag { font-size: 16px; margin-right: 8px; }
+.language-flag-img { width: 18px; height: 13px; border-radius: 2px; object-fit: cover; margin-right: 10px; }
 .language-switcher { width: 32px !important; min-width: 32px !important; height: 32px !important; border-radius: 50% !important; margin: 0 4px; }
 </style>

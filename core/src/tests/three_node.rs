@@ -3545,6 +3545,7 @@ async fn assert_peer_admission_blocked(inst: &Instance, url: url::Url) {
                     Vec::new(),
                     dokitier_core::socket::udp::UdpBindOptions::direct_connect(),
                     dokitier_core::connectivity::transport::UdpSessionMode::EasyTierMux,
+                    None,
                 )
                 .await?,
             ),
