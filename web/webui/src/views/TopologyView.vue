@@ -1336,6 +1336,140 @@ function anchor(from, to) {
 
 // One continuous SVG bezier path through all waypoints (Catmull-Rom control
 // points): a link is a single curve object, never a chain of separate elements.
+// Catmull-Rom sample points for a path through `points` (used for hit testing
+// and for checking that the curve never touches a card).
+function catmullSamples(points, perSegment = 12) {
+  const out = []
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[Math.max(0, i - 1)]
+    const p1 = points[i]
+    const p2 = points[i + 1]
+    const p3 = points[Math.min(points.length - 1, i + 2)]
+    const c1 = { x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6 }
+    const c2 = { x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6 }
+    for (let k = 0; k < perSegment; k++) {
+      const t = k / perSegment
+      const mt = 1 - t
+      out.push({
+        x: mt * mt * mt * p1.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * p2.x,
+        y: mt * mt * mt * p1.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * p2.y,
+      })
+    }
+  }
+  out.push(points[points.length - 1])
+  return out
+}
+
+function pathTouchesCards(points, rects, idA, idB) {
+  const samples = catmullSamples(points, 14)
+  for (const pt of samples) {
+    for (const r of rects) {
+      if (r.id === idA || r.id === idB) continue
+      if (pt.x > r.x && pt.x < r.x + r.w && pt.y > r.y && pt.y < r.y + r.h) return true
+    }
+  }
+  return false
+}
+
+// Route one intra-group link: endpoints follow the port-normal rule, the middle
+// may use up to two extra waypoints (≤5 curve points) so the line bends around
+// cards instead of touching them.
+function routeIntraLink(p0, n0, p1, n1, off, rects, idA, idB) {
+  const h0 = { x: p0.x + n0.x * off, y: p0.y + n0.y * off }
+  const h1 = { x: p1.x + n1.x * off, y: p1.y + n1.y * off }
+  const simple = [p0, h0, h1, p1]
+  if (!pathTouchesCards(simple, rects, idA, idB)) return simple
+  const mid = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 }
+  const dx = p1.x - p0.x
+  const dy = p1.y - p0.y
+  const len = Math.hypot(dx, dy) || 1
+  const perp = { x: -dy / len, y: dx / len }
+  // one extra waypoint
+  for (const mag of [70, 110, 160, 220, 300, 400, 520]) {
+    for (const side of [1, -1]) {
+      const wp = { x: mid.x + perp.x * mag * side, y: mid.y + perp.y * mag * side }
+      const pts = [p0, h0, wp, h1, p1]
+      if (!pathTouchesCards(pts, rects, idA, idB)) return pts
+    }
+  }
+  // two extra waypoints around the blocking field
+  for (const mag of [110, 170, 240, 330, 440, 560]) {
+    for (const side of [1, -1]) {
+      const wp1 = { x: p0.x + dx * 0.33 + perp.x * mag * side, y: p0.y + dy * 0.33 + perp.y * mag * side }
+      const wp2 = { x: p0.x + dx * 0.67 + perp.x * mag * side, y: p0.y + dy * 0.67 + perp.y * mag * side }
+      const pts = [p0, h0, wp1, wp2, h1, p1]
+      if (!pathTouchesCards(pts, rects, idA, idB)) return pts
+    }
+  }
+  return simple
+}
+
+function cubicHitCount(p0, c1, c2, p1, rects, idA, idB) {
+  let hits = 0
+  for (let i = 1; i < 26; i++) {
+    const pt = bezierPoint(p0, c1, c2, p1, i / 26)
+    for (const r of rects) {
+      if (r.id === idA || r.id === idB) continue
+      if (pt.x > r.x && pt.x < r.x + r.w && pt.y > r.y && pt.y < r.y + r.h) {
+        hits++
+        break
+      }
+    }
+  }
+  return hits
+}
+
+// Exactly two control points, both on the port normals. If the direct cubic
+// would touch a card, the port position along the card edge and the normal
+// extensions are adjusted until the curve clears every card.
+function pickCubic(a, b, na, nb, rects, idA, idB) {
+  const baseAxis = Math.abs(b.x - a.x) >= Math.abs(b.y - a.y) ? 'h' : 'v'
+  const seg = Math.hypot(b.x - a.x, b.y - a.y)
+  const off = Math.min(160, seg * 0.36)
+  const make = (axis, s0, s1, fa, fb) => {
+    const tang = axis === 'h' ? { x: 0, y: 1 } : { x: 1, y: 0 }
+    const p0 = anchorAxis(a, b, axis)
+    const p1 = anchorAxis(b, a, axis)
+    p0.x += tang.x * s0
+    p0.y += tang.y * s0
+    p1.x += tang.x * s1
+    p1.y += tang.y * s1
+    const n0 = p0.side === 'h' ? { x: p0.sign, y: 0 } : { x: 0, y: p0.sign }
+    const n1 = p1.side === 'h' ? { x: p1.sign, y: 0 } : { x: 0, y: p1.sign }
+    return {
+      p0,
+      p1,
+      c1: { x: p0.x + n0.x * off * fa, y: p0.y + n0.y * off * fa },
+      c2: { x: p1.x + n1.x * off * fb, y: p1.y + n1.y * off * fb },
+    }
+  }
+  // fast path: the natural cubic (both ports at their default spot)
+  const simple = make(baseAxis, 0, 0, 1, 1)
+  simple.hits = cubicHitCount(simple.p0, simple.c1, simple.c2, simple.p1, rects, idA, idB)
+  if (simple.hits === 0) return simple
+  let best = simple
+  let bestCost = simple.hits * 100
+  for (const axis of [baseAxis, baseAxis === 'h' ? 'v' : 'h']) {
+    for (const s0 of [0, -24, 24]) {
+      for (const s1 of [0, -24, 24]) {
+        for (const fa of [1, 1.5, 0.6]) {
+          for (const fb of [1, 1.5, 0.6]) {
+            const cand = make(axis, s0, s1, fa, fb)
+            cand.hits = cubicHitCount(cand.p0, cand.c1, cand.c2, cand.p1, rects, idA, idB)
+            const cost = cand.hits * 100 + Math.abs(fa - 1) + Math.abs(fb - 1) + (Math.abs(s0) + Math.abs(s1)) / 60
+            if (cost < bestCost) {
+              bestCost = cost
+              best = cand
+            }
+            if (cand.hits === 0 && s0 === 0 && s1 === 0 && fa === 1 && fb === 1) return cand
+          }
+        }
+      }
+    }
+  }
+  return best
+}
+
 function edgePathD(points) {
   if (!points || points.length < 2) return ''
   let d = `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`
@@ -1757,19 +1891,13 @@ function buildDetailOption() {
           rx_bps: m.rx_bps,
           tx_bps: m.tx_bps,
         }]
-    // one orientation axis for both ports -> anti-parallel normals
-    const axis = Math.abs(b.x - a.x) >= Math.abs(b.y - a.y) ? 'h' : 'v'
-    const p0 = anchorAxis(a, b, axis)
-    const p1 = anchorAxis(b, a, axis)
-    const seg = Math.hypot(p1.x - p0.x, p1.y - p0.y)
-    const n0 = p0.side === 'h' ? { x: p0.sign, y: 0 } : { x: 0, y: p0.sign }
-    const n1 = p1.side === 'h' ? { x: p1.sign, y: 0 } : { x: 0, y: p1.sign }
-    // Port-local rule: f(0)=0, f'(0)=0 (leave along the normal), deviation only
-    // grows and stays within a bounded angle. Both control points therefore sit
-    // purely on the outward normals, with a capped extension.
-    const off = Math.min(160, seg * 0.36)
-    const c1 = { x: p0.x + n0.x * off, y: p0.y + n0.y * off }
-    const c2 = { x: p1.x + n1.x * off, y: p1.y + n1.y * off }
+    // exactly two control points on the port normals; the port position along
+    // the card edge may shift so the curve never touches another card
+    const chosen = pickCubic(a, b, na, nb, rects, e.a, e.b)
+    const p0 = chosen.p0
+    const p1 = chosen.p1
+    const c1 = chosen.c1
+    const c2 = chosen.c2
     const mid = toScreen(bezierPoint(p0, c1, c2, p1, 0.5))
     const sp0 = toScreen(p0)
     const sc1 = toScreen(c1)
