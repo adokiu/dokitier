@@ -1426,14 +1426,17 @@ function pickCubic(a, b, na, nb, rects, idA, idB) {
   const baseAxis = Math.abs(b.x - a.x) >= Math.abs(b.y - a.y) ? 'h' : 'v'
   const seg = Math.hypot(b.x - a.x, b.y - a.y)
   const off = Math.min(160, seg * 0.36)
-  const make = (axis, s0, s1, fa, fb) => {
-    const tang = axis === 'h' ? { x: 0, y: 1 } : { x: 1, y: 0 }
-    const p0 = anchorAxis(a, b, axis)
-    const p1 = anchorAxis(b, a, axis)
-    p0.x += tang.x * s0
-    p0.y += tang.y * s0
-    p1.x += tang.x * s1
-    p1.y += tang.y * s1
+  // each end may use its own axis, i.e. the link is allowed to switch card
+  // sides when that makes a cleaner curve
+  const make = (axis0, axis1, s0, s1, fa, fb) => {
+    const p0 = anchorAxis(a, b, axis0)
+    const p1 = anchorAxis(b, a, axis1)
+    const t0 = axis0 === 'h' ? { x: 0, y: 1 } : { x: 1, y: 0 }
+    const t1 = axis1 === 'h' ? { x: 0, y: 1 } : { x: 1, y: 0 }
+    p0.x += t0.x * s0
+    p0.y += t0.y * s0
+    p1.x += t1.x * s1
+    p1.y += t1.y * s1
     const n0 = p0.side === 'h' ? { x: p0.sign, y: 0 } : { x: 0, y: p0.sign }
     const n1 = p1.side === 'h' ? { x: p1.sign, y: 0 } : { x: 0, y: p1.sign }
     return {
@@ -1443,25 +1446,26 @@ function pickCubic(a, b, na, nb, rects, idA, idB) {
       c2: { x: p1.x + n1.x * off * fb, y: p1.y + n1.y * off * fb },
     }
   }
-  // fast path: the natural cubic (both ports at their default spot)
-  const simple = make(baseAxis, 0, 0, 1, 1)
-  simple.hits = cubicHitCount(simple.p0, simple.c1, simple.c2, simple.p1, rects, idA, idB)
-  if (simple.hits === 0) return simple
-  let best = simple
-  let bestCost = simple.hits * 100
-  for (const axis of [baseAxis, baseAxis === 'h' ? 'v' : 'h']) {
-    for (const s0 of [0, -24, 24]) {
-      for (const s1 of [0, -24, 24]) {
-        for (const fa of [1, 1.5, 0.6]) {
-          for (const fb of [1, 1.5, 0.6]) {
-            const cand = make(axis, s0, s1, fa, fb)
-            cand.hits = cubicHitCount(cand.p0, cand.c1, cand.c2, cand.p1, rects, idA, idB)
-            const cost = cand.hits * 100 + Math.abs(fa - 1) + Math.abs(fb - 1) + (Math.abs(s0) + Math.abs(s1)) / 60
-            if (cost < bestCost) {
-              bestCost = cost
-              best = cand
+  // fast path: natural anchors on the chord's dominant axis
+  let best = make(baseAxis, baseAxis, 0, 0, 1, 1)
+  best.hits = cubicHitCount(best.p0, best.c1, best.c2, best.p1, rects, idA, idB)
+  best.cost = best.hits * 100
+  if (best.hits === 0) return best
+  for (const axis0 of [baseAxis, baseAxis === 'h' ? 'v' : 'h']) {
+    for (const axis1 of [baseAxis, baseAxis === 'h' ? 'v' : 'h']) {
+      for (const s0 of [0, -20, 20]) {
+        for (const s1 of [0, -20, 20]) {
+          for (const fa of [1, 1.4, 0.65]) {
+            for (const fb of [1, 1.4, 0.65]) {
+              const cand = make(axis0, axis1, s0, s1, fa, fb)
+              cand.hits = cubicHitCount(cand.p0, cand.c1, cand.c2, cand.p1, rects, idA, idB)
+              const axisPenalty = (axis0 === baseAxis ? 0 : 0.15) + (axis1 === baseAxis ? 0 : 0.15)
+              const cost = cand.hits * 100 + axisPenalty + Math.abs(fa - 1) + Math.abs(fb - 1) + (Math.abs(s0) + Math.abs(s1)) / 80
+              if (cost < best.cost) {
+                best = cand
+                best.cost = cost
+              }
             }
-            if (cand.hits === 0 && s0 === 0 && s1 === 0 && fa === 1 && fb === 1) return cand
           }
         }
       }
