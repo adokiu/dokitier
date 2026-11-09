@@ -2749,7 +2749,210 @@ fn spawn_edge_rate_sampler(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            for ((a, b, network), edge) in edges.iter_mut() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let rows = match sqlx::query_as::<_, (String,)>("SELECT snapshot FROM nodes")
+                .fetch_all(&state.db)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("edge rate sampler db error: {e}");
+                    continue;
+                }
+            };
+            let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (snapshot,) in rows {
+                let Ok(value) = serde_json::from_str::<Value>(&snapshot) else { continue };
+                let Some(instances) = value.get("instances").and_then(|v| v.as_array()) else { continue };
+                for inst in instances {
+                    let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+                    let Some(edges) = inst.pointer("/topology/edges").and_then(|v| v.as_array()) else { continue };
+                    for e in edges {
+                        let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let pair = if a < b { (a, b) } else { (b, a) };
+                        let Some(tunnels) = e.get("tunnels").and_then(|v| v.as_array()) else { continue };
+                        for (idx, tunnel) in tunnels.iter().enumerate() {
+                            let ident = tunnel
+                                .get("remote_addr")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("t{}", idx));
+                            let rx = tunnel.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let tx = tunnel.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let key = format!("{}|{}|{}|{}", network, pair.0, pair.1, ident);
+                            if !seen_keys.insert(key.clone()) {
+                                continue;
+                            }
+                            if let Some(prev) = state.edge_traffic.get(&key) {
+                                let (ts, prx, ptx) = *prev;
+                                let elapsed = ((now_ms - ts) as f64 / 1000.0).max(0.2);
+                                let drx = rx.saturating_sub(prx) as f64 / elapsed;
+                                let dtx = tx.saturating_sub(ptx) as f64 / elapsed;
+                                state.edge_rates.insert(key.clone(), (drx, dtx));
+                            }
+                            state.edge_traffic.insert(key, (now_ms, rx, tx));
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filter: Option<&str>) -> Value {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    // nodes are keyed by (network, peer_id): the same peer exists independently
+    // in every network instance and must not collapse into one row.
+    let mut nodes: std::collections::BTreeMap<(String, u32), Value> = std::collections::BTreeMap::new();
+    let mut edges: std::collections::BTreeMap<(u32, u32, String), Value> = std::collections::BTreeMap::new();
+    let mut peer_owner: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    // p2p group per (node_id, network) from the config the console pushed; the
+    // agent snapshot does not carry it, so the topology view resolves it here.
+    let version_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT node_id, network, toml FROM config_versions ORDER BY id DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut cv_groups: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for (node_id, network, toml) in version_rows {
+        let key = (node_id.clone(), network);
+        if cv_groups.contains_key(&key) {
+            continue; // rows are newest-first
+        }
+        if let Ok(value) = toml::from_str::<toml::Value>(&toml) {
+            let group = value
+                .get("network_identity")
+                .and_then(|v| v.get("p2p_group"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            cv_groups.insert(key, group);
+        }
+    }
+    // instance uuid -> p2p group: network_instances is the authoritative
+    // node/network -> instance_id mapping the console assigns on apply.
+    let mut instance_groups: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let inst_rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT node_id, network, instance_id FROM network_instances")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+    for (node_id, network, instance_id) in inst_rows {
+        if let Some(group) = cv_groups.get(&(node_id, network)) {
+            if !group.is_empty() {
+                instance_groups.insert(instance_id, group.clone());
+            }
+        }
+    }
+    for (node_id, snapshot) in &rows {
+        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
+        for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            if let Some(pid) = inst.get("peer_id").and_then(|v| v.as_u64()) {
+                peer_owner.insert(pid as u32, node_id.clone());
+            }
+            let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+            let p2p_group = inst.get("p2p_group").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(topo) = inst.get("topology") else { continue };
+            for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
+                if let Some(peer_id) = n.get("peer_id").and_then(|v| v.as_u64()) {
+                    let local = n.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let mut node = n.clone();
+                    node["network_name"] = json!(network);
+                    let resolved_group = n
+                        .get("instance_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|uuid| instance_groups.get(uuid).cloned())
+                        .unwrap_or_else(|| if local { p2p_group.to_string() } else { String::new() });
+                    node["p2p_group"] = json!(resolved_group);
+                    node["agent_node_id"] = json!(node_id);
+                    match nodes.entry((network.to_string(), peer_id as u32)) {
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            if local && !resolved_group.is_empty() {
+                                e.get_mut()["p2p_group"] = json!(resolved_group);
+                            }
+                        }
+                        std::collections::btree_map::Entry::Vacant(v) => {
+                            v.insert(node);
+                        }
+                    }
+                }
+            }
+            for e in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
+                let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let key = (a.min(b), a.max(b), network.to_string());
+                if let Some(existing) = edges.get_mut(&key) {
+                    let existing_probe = existing
+                        .get("tunnels")
+                        .and_then(|v| v.as_array())
+                        .map(|tunnels| tunnels.iter().any(|t| t.get("capacity_source").and_then(|v| v.as_str()) == Some("probe")))
+                        .unwrap_or(false);
+                    let new_probe = e
+                        .get("tunnels")
+                        .and_then(|v| v.as_array())
+                        .map(|tunnels| tunnels.iter().any(|t| t.get("capacity_source").and_then(|v| v.as_str()) == Some("probe")))
+                        .unwrap_or(false);
+                    if new_probe && !existing_probe {
+                        let mut replacement = e.clone();
+                        replacement["network_name"] = json!(network);
+                        let tunnel_types: Vec<Value> = replacement
+                            .get("tunnels")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|t| t.get("type").cloned())
+                            .collect();
+                        replacement["tunnel_types"] = json!(tunnel_types);
+                        *existing = replacement;
+                    }
+                    continue;
+                }
+                let mut edge = e.clone();
+                edge["network_name"] = json!(network);
+                let tunnel_types: Vec<Value> = e.get("tunnels").and_then(|v| v.as_array()).into_iter().flatten()
+                    .filter_map(|t| t.get("type").cloned()).collect();
+                edge["tunnel_types"] = json!(tunnel_types);
+                edges.insert(key, edge);
+            }
+        }
+    }
+    let meta_rows: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT node_id, alias, country_code FROM nodes")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut countries: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (id, alias, country) in meta_rows {
+        if let Some(alias) = alias.filter(|a| !a.is_empty()) {
+            aliases.insert(id.clone(), alias);
+        }
+        if let Some(country) = country.filter(|c| !c.is_empty()) {
+            countries.insert(id, country);
+        }
+    }
+    for (pid, owner) in &peer_owner {
+        for ((_net, node_pid), node) in nodes.iter_mut() {
+            if node_pid != pid { continue; }
+            if let Some(alias) = aliases.get(owner) {
+                node["alias"] = json!(alias);
+            }
+            if let Some(country) = countries.get(owner) {
+                node["country_code"] = json!(country);
+            }
+        }
+    }
+    for ((a, b, network), edge) in edges.iter_mut() {
         let mut edge_rx = 0.0f64;
         let mut edge_tx = 0.0f64;
         if let Some(tunnels) = edge.get_mut("tunnels").and_then(|v| v.as_array_mut()) {
@@ -2813,8 +3016,6 @@ fn spawn_edge_rate_sampler(state: AppState) {
             json!({"name": name, "count": members.len(), "members": members})
         })
         .collect();
-
-    // ---- server-side data scoping: network and/or p2p group ------------------
     let mut node_list: Vec<Value> = nodes.values().cloned().collect();
     let mut edge_list: Vec<Value> = edges.values().cloned().collect();
     let mut cross_links: Vec<Value> = Vec::new();
@@ -2822,17 +3023,12 @@ fn spawn_edge_rate_sampler(state: AppState) {
         .iter()
         .filter_map(|n| {
             let id = n.get("peer_id").and_then(|v| v.as_u64())?;
-            let g = n
-                .get("p2p_group")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let g = n.get("p2p_group").and_then(|v| v.as_str()).unwrap_or("").to_string();
             Some((id, g))
         })
         .collect();
-    let scoped = net_filter.is_some() || group_filter.is_some();
-    if scoped {
-        let allowed: std::collections::HashSet<u64> = node_list
+    if net_filter.is_some() || group_filter.is_some() {
+        let allowed: std::collections::HashSet<(String, u64)> = node_list
             .iter()
             .filter(|n| {
                 let net_ok = net_filter
@@ -2843,38 +3039,40 @@ fn spawn_edge_rate_sampler(state: AppState) {
                     .unwrap_or(true);
                 net_ok && grp_ok
             })
-            .filter_map(|n| n.get("peer_id").and_then(|v| v.as_u64()))
+            .filter_map(|n| {
+                let id = n.get("peer_id").and_then(|v| v.as_u64())?;
+                let net = n.get("network_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                Some((net, id))
+            })
             .collect();
         if group_filter.is_some() {
             let mut seen: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
             for e in &edge_list {
                 let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
                 let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
-                let in_a = allowed.contains(&a);
-                let in_b = allowed.contains(&b);
+                let net = e.get("network_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let in_a = allowed.contains(&(net.clone(), a));
+                let in_b = allowed.contains(&(net, b));
                 if in_a == in_b {
                     continue;
                 }
                 let (inner, outer) = if in_a { (a, b) } else { (b, a) };
                 let target = peer_group.get(&outer).cloned().unwrap_or_default();
-                if target.is_empty() {
-                    continue;
-                }
-                if seen.insert((inner, target.clone())) {
+                if !target.is_empty() && seen.insert((inner, target.clone())) {
                     cross_links.push(json!({"peer_id": inner, "group": target}));
                 }
             }
         }
         node_list.retain(|n| {
-            n.get("peer_id")
-                .and_then(|v| v.as_u64())
-                .map(|id| allowed.contains(&id))
-                .unwrap_or(false)
+            let Some(id) = n.get("peer_id").and_then(|v| v.as_u64()) else { return false };
+            let net = n.get("network_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            allowed.contains(&(net, id))
         });
         edge_list.retain(|e| {
             let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
             let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
-            if !allowed.contains(&a) || !allowed.contains(&b) {
+            let net = e.get("network_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !allowed.contains(&(net.clone(), a)) || !allowed.contains(&(net, b)) {
                 return false;
             }
             net_filter
