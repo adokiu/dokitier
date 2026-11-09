@@ -869,47 +869,74 @@ function computeLayout(force = false) {
   // Preferred flat arrangement: cn on the left, IX groups in the middle
   // column, overseas on the right (other groups fill the middle).
   const rank = (g) => (g === 'cn' ? 0 : g === 'overseas' ? 2 : g.startsWith('ix') ? 1 : 1)
-  // ---- column arrangement: the two largest groups anchor the left/right
-  // sides; groups that relay between them stay in the middle column.
-  let cols
+  // ---- group placement: the two largest groups anchor the left/right edges,
+  // every bridging group stays in the middle, vertically centred and stacked.
+  // Column positions are derived from the estimated width of each group's
+  // degree-bucket grid, so a wide group can never push the middle column away.
+  const ROW_GAP = Math.round(Math.max(130, Math.min(180, height * 0.24)))
+  const COL_W = 300
+  const estimateExtent = (c) => {
+    const inGroup = new Set(c.list.map((n) => n.peer_id))
+    const deg = new Map(c.list.map((n) => [n.peer_id, 0]))
+    for (const e of edges) {
+      if (!inGroup.has(e.a) || !inGroup.has(e.b)) continue
+      deg.set(e.a, (deg.get(e.a) || 0) + 1)
+      deg.set(e.b, (deg.get(e.b) || 0) + 1)
+    }
+    const buckets = [0, 0, 0, 0]
+    for (const n of c.list) {
+      const d = deg.get(n.peer_id) || 0
+      buckets[d <= 1 ? 0 : d <= 3 ? 1 : d <= 5 ? 2 : 3]++
+    }
+    let colsN = 0
+    let rows = 1
+    for (const len of buckets) {
+      if (!len) continue
+      const sub = Math.ceil(len / 5)
+      colsN += sub
+      rows = Math.max(rows, Math.ceil(len / sub))
+    }
+    if (!colsN) colsN = 1
+    return { w: Math.max(COL_W, (colsN - 1) * COL_W + 200), h: Math.max(ROW_GAP, rows * ROW_GAP) }
+  }
+  const extents = new Map(clusters.map((c) => [c, estimateExtent(c)]))
+  let layoutCols
   if (relays.length) {
-    cols = [others.filter((_, i) => i % 2 === 0), relays, others.filter((_, i) => i % 2 === 1)].filter((c) => c.length)
+    layoutCols = [others.filter((_, i) => i % 2 === 0), relays, others.filter((_, i) => i % 2 === 1)].filter((c) => c.length)
   } else if (others.length >= 3) {
     const [left, right, ...mid] = others
-    cols = [[left], mid, [right]].filter((c) => c.length)
+    layoutCols = [[left], mid, [right]].filter((c) => c.length)
   } else if (others.length === 2) {
-    cols = [[others[0]], [others[1]]]
+    layoutCols = [[others[0]], [others[1]]]
   } else {
-    cols = others.length ? [[others[0]]] : []
+    layoutCols = others.length ? [[others[0]]] : []
   }
-  const ROW_GAP = Math.round(Math.max(130, Math.min(180, height * 0.24)))
-  const nCols = cols.length
-  const fractions = nCols >= 5
-    ? Array.from({ length: nCols }, (_, i) => 0.08 + (0.84 * i) / (nCols - 1))
-    : nCols === 4
-      ? [0.12, 0.4, 0.6, 0.88]
-      : nCols === 3
-        ? [0.2, 0.5, 0.8]
-        : nCols === 2
-          ? [0.3, 0.7]
-          : [0.5]
-  const colXs = fractions.map((f) => width * f)
-  const clusterSize = (c) => {
-    const n = c.list.length
-    const colsN = n <= 1 ? 1 : 2
-    const rows = Math.ceil(n / colsN)
-    return { colsN, rows, h: rows * ROW_GAP }
+  const margin = 70
+  const gapX = 150
+  const colWidth = (col) => Math.max(...col.map((c) => extents.get(c).w), 220)
+  // lay the columns out sequentially in world space and centre the whole block;
+  // if the groups need more width than the viewport they simply extend beyond it
+  // (the canvas is pannable/zoomable) instead of being squashed together.
+  const nCols = layoutCols.length
+  const widths = layoutCols.map(colWidth)
+  const contentW = widths.reduce((a, w) => a + w, 0) + gapX * Math.max(0, nCols - 1)
+  const startX = (width - contentW) / 2
+  const colCx = new Array(nCols).fill(width / 2)
+  let cursor = startX
+  for (let i = 0; i < nCols; i++) {
+    colCx[i] = cursor + widths[i] / 2
+    cursor += widths[i] + gapX
   }
   const cy = height / 2
-  cols.forEach((col, ci) => {
-    const sizes = col.map(clusterSize)
-    const gap = 70
-    const total = sizes.reduce((a, sz) => a + sz.h, 0) + gap * (col.length - 1)
+  layoutCols.forEach((col, ci) => {
+    const sizes = col.map((c) => extents.get(c))
+    const vgap = 90
+    const total = sizes.reduce((a, sz) => a + sz.h, 0) + vgap * (col.length - 1)
     let y = cy - total / 2
     col.forEach((c, i) => {
-      c.cx = colXs[ci]
+      c.cx = colCx[ci]
       c.cy = y + sizes[i].h / 2
-      y += sizes[i].h + gap
+      y += sizes[i].h + vgap
     })
   })
 
