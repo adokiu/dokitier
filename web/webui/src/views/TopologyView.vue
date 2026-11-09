@@ -869,17 +869,31 @@ function computeLayout(force = false) {
   // Preferred flat arrangement: cn on the left, IX groups in the middle
   // column, overseas on the right (other groups fill the middle).
   const rank = (g) => (g === 'cn' ? 0 : g === 'overseas' ? 2 : g.startsWith('ix') ? 1 : 1)
-  const cols = relays.length
-    ? [others.filter((_, i) => i % 2 === 0), relays, others.filter((_, i) => i % 2 === 1)].filter((c) => c.length)
-    : [0, 1, 2]
-        .map((k) => others.filter((c) => rank(c.g) === k))
-        .filter((c) => c.length)
-  const COL_GAP = Math.round(Math.max(240, Math.min(330, width * 0.13)))
+  // ---- column arrangement: the two largest groups anchor the left/right
+  // sides; groups that relay between them stay in the middle column.
+  let cols
+  if (relays.length) {
+    cols = [others.filter((_, i) => i % 2 === 0), relays, others.filter((_, i) => i % 2 === 1)].filter((c) => c.length)
+  } else if (others.length >= 3) {
+    const [left, right, ...mid] = others
+    cols = [[left], mid, [right]].filter((c) => c.length)
+  } else if (others.length === 2) {
+    cols = [[others[0]], [others[1]]]
+  } else {
+    cols = others.length ? [[others[0]]] : []
+  }
   const ROW_GAP = Math.round(Math.max(130, Math.min(180, height * 0.24)))
-  const clusterW = COL_GAP + 170
   const nCols = cols.length
-  const spacing = nCols <= 1 ? 0 : Math.min(clusterW / 2 + 85 + 150, Math.max(300, (width - clusterW - 80) / (nCols - 1)))
-  const colXs = Array.from({ length: nCols }, (_, i) => width / 2 + (i - (nCols - 1) / 2) * spacing)
+  const fractions = nCols >= 5
+    ? Array.from({ length: nCols }, (_, i) => 0.08 + (0.84 * i) / (nCols - 1))
+    : nCols === 4
+      ? [0.12, 0.4, 0.6, 0.88]
+      : nCols === 3
+        ? [0.2, 0.5, 0.8]
+        : nCols === 2
+          ? [0.3, 0.7]
+          : [0.5]
+  const colXs = fractions.map((f) => width * f)
   const clusterSize = (c) => {
     const n = c.list.length
     const colsN = n <= 1 ? 1 : 2
