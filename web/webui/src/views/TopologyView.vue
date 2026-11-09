@@ -1513,6 +1513,27 @@ function groupLinkStats() {
   return { groups, byGroup, nodeGroup, agg }
 }
 
+// Anchor a link on the card side of a FIXED orientation axis. Using the same
+// axis at both ends keeps the two outward normals anti-parallel, which is what
+// makes the port-local curve monotone (no belly / no S bend).
+function anchorAxis(from, to, axis) {
+  if (axis === 'h') {
+    const sign = to.x >= from.x ? 1 : -1
+    return { x: from.x + sign * 88, y: from.y, side: 'h', sign }
+  }
+  const sign = to.y >= from.y ? 1 : -1
+  return { x: from.x, y: from.y + sign * 31, side: 'v', sign }
+}
+
+function groupAnchorAxis(from, to, axis) {
+  if (axis === 'h') {
+    const sign = to.x >= from.x ? 1 : -1
+    return { x: from.x + sign * (GROUP_BOX_W / 2 + 3), y: from.y, nx: sign, ny: 0 }
+  }
+  const sign = to.y >= from.y ? 1 : -1
+  return { x: from.x, y: from.y + sign * (GROUP_BOX_H / 2 + 3), nx: 0, ny: sign }
+}
+
 function groupAnchor(from, to) {
   const dx = to.x - from.x
   const dy = to.y - from.y
@@ -1556,8 +1577,9 @@ function buildGroupLevelOption() {
     if (!wa || !wb) return null
     const pa = toScreen(wa)
     const pb = toScreen(wb)
-    const p0 = groupAnchor(pa, pb)
-    const p1 = groupAnchor(pb, pa)
+    const axis = Math.abs(pb.x - pa.x) >= Math.abs(pb.y - pa.y) ? 'h' : 'v'
+    const p0 = groupAnchorAxis(pa, pb, axis)
+    const p1 = groupAnchorAxis(pb, pa, axis)
     const dx = p1.x - p0.x
     const dy = p1.y - p0.y
     const seg = Math.hypot(dx, dy) || 1
@@ -1735,8 +1757,10 @@ function buildDetailOption() {
           rx_bps: m.rx_bps,
           tx_bps: m.tx_bps,
         }]
-    const p0 = anchor(a, b, na)
-    const p1 = anchor(b, a, nb)
+    // one orientation axis for both ports -> anti-parallel normals
+    const axis = Math.abs(b.x - a.x) >= Math.abs(b.y - a.y) ? 'h' : 'v'
+    const p0 = anchorAxis(a, b, axis)
+    const p1 = anchorAxis(b, a, axis)
     const seg = Math.hypot(p1.x - p0.x, p1.y - p0.y)
     const n0 = p0.side === 'h' ? { x: p0.sign, y: 0 } : { x: 0, y: p0.sign }
     const n1 = p1.side === 'h' ? { x: p1.sign, y: 0 } : { x: 0, y: p1.sign }
