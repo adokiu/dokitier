@@ -1346,9 +1346,6 @@ async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
                 controller_config_path = Some(config_file.clone());
             }
         }
-        if let Some(group) = cfg.get_p2p_group() {
-            dokitier_core::peers::p2p_group::set_group(Some(group));
-        }
 
         #[cfg(feature = "web-console")]
         {

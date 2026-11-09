@@ -2051,23 +2051,6 @@ impl PeerConnectionAdmission {
             origin,
         );
         peer.do_handshake_as_client().await?;
-        let local_group = self
-            .context
-            .network_identity()
-            .p2p_group
-            .clone()
-            .unwrap_or_default();
-        if origin.is_auto_p2p()
-            && crate::peers::p2p_group::is_cross_group_for(
-                Some(local_group.as_str()),
-                peer.get_remote_p2p_group(),
-            )
-        {
-            return Err(Error::SecretKeyError(format!(
-                "p2p group mismatch: local={local_group:?}, remote={:?}",
-                peer.get_remote_p2p_group()
-            )));
-        }
         let conn_id = peer.get_conn_id();
         let peer_id = peer.get_peer_id();
         let local_identity = self.context.network_identity();
@@ -2160,23 +2143,6 @@ impl PeerConnectionAdmission {
                 self.release_reserved_peer_id(&network_name);
             }
             return Err(err);
-        }
-        let local_group = self
-            .context
-            .network_identity()
-            .p2p_group
-            .clone()
-            .unwrap_or_default();
-        if origin.is_auto_p2p()
-            && crate::peers::p2p_group::is_cross_group_for(
-                Some(local_group.as_str()),
-                conn.get_remote_p2p_group(),
-            )
-        {
-            return Err(Error::SecretKeyError(format!(
-                "p2p group mismatch: local={local_group:?}, remote={:?}",
-                conn.get_remote_p2p_group()
-            )));
         }
 
         let peer_identity = conn.get_network_identity();

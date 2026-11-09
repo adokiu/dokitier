@@ -754,15 +754,6 @@ static FORCE_USE_CONN_LIST: AtomicBool = AtomicBool::new(false);
 //    in another zone when two zone restore the conneciton.
 static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(10);
 
-fn route_id_from_instance_id(instance_id: uuid::Uuid) -> u64 {
-    let mut value: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in instance_id.as_bytes() {
-        value ^= *byte as u64;
-        value = value.wrapping_mul(0x100_0000_01b3);
-    }
-    value
-}
-
 fn route_peer_inst_id(info: &RoutePeerInfo) -> Option<uuid::Uuid> {
     info.inst_id.map(Into::into)
 }
@@ -2527,10 +2518,13 @@ impl Debug for PeerRouteServiceImpl {
 #[allow(dead_code)]
 impl PeerRouteServiceImpl {
     fn new(my_peer_id: PeerId, context: ArcPeerContext) -> Self {
-        // Route id identifies the instance, not the process incarnation: it is
-        // derived from the stable instance uuid so a restarted agent does not
-        // look like a duplicate peer id to its neighbours.
-        let my_peer_route_id = route_id_from_instance_id(context.instance_id());
+        // Route id is the *process incarnation* id: it must change on restart so
+        // neighbours can tell that the same peer id has a new incarnation and
+        // adopt its info even though the version counter restarted.
+        let mut my_peer_route_id: u64 = rand::random();
+        if my_peer_route_id == 0 {
+            my_peer_route_id = 1;
+        }
         PeerRouteServiceImpl {
             my_peer_id,
             my_peer_route_id,

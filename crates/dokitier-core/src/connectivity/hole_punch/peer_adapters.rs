@@ -44,12 +44,13 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
     async fn candidates(&self) -> Vec<UdpPunchCandidate> {
         let now = Instant::now();
         let peer_map = self.get_peer_map();
+        let local_group = self.network_identity().p2p_group;
         self.list_route_snapshots()
             .await
             .into_iter()
             .filter(|route| {
                 !crate::peers::p2p_group::is_cross_group_for(
-                    self.network_identity().p2p_group.as_deref(),
+                    local_group.as_deref(),
                     route.p2p_group.as_str(),
                 )
             })

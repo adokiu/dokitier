@@ -254,7 +254,7 @@ fn rt_snapshot_strings(state: &AppState) -> Vec<String> {
     state
         .node_rt
         .iter()
-        .filter(|e| now_ts - e.value().ts <= 30)
+        .filter(|e| now_ts - e.value().ts <= RT_FRESH_SECS)
         .map(|e| e.value().snapshot.to_string())
         .collect()
 }
@@ -267,7 +267,14 @@ fn rt_nodes_status_snapshot(state: &AppState) -> Vec<(String, String, String)> {
         .iter()
         .map(|e| {
             let rt = e.value();
-            let status = if now_ts - rt.ts <= 30 && rt.online { "online" } else { "offline" };
+            let status = if now_ts - rt.ts <= RT_FRESH_SECS
+                && rt.online
+                && agent_channel_present(state, e.key())
+            {
+                "online"
+            } else {
+                "offline"
+            };
             (e.key().clone(), status.to_string(), rt.snapshot.to_string())
         })
         .collect()
@@ -281,13 +288,32 @@ fn rt_nodes_full(state: &AppState) -> Vec<(String, String, String, String)> {
         .iter()
         .map(|e| {
             let rt = e.value();
-            let status = if now_ts - rt.ts <= 30 && rt.online { "online" } else { "offline" };
+            let status = if now_ts - rt.ts <= RT_FRESH_SECS
+                && rt.online
+                && agent_channel_present(state, e.key())
+            {
+                "online"
+            } else {
+                "offline"
+            };
             (e.key().clone(), status.to_string(), rt.snapshot.to_string(), rt.traffic.to_string())
         })
         .collect()
 }
 
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
+
+/// Agents send a snapshot every second; a node counts as live only while its
+/// latest snapshot is at most this old.
+const RT_FRESH_SECS: i64 = 5;
+
+/// The control plane can only push commands while the agent session is
+/// registered. Online state and command availability must agree, so online
+/// requires both a fresh snapshot and a registered channel.
+fn agent_channel_present(state: &AppState, node_id: &str) -> bool {
+    let prefix = format!("{node_id}:");
+    state.agents.iter().any(|entry| entry.key().starts_with(&prefix))
+}
 
 async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
     let nodes_ddl = if is_mysql() {
@@ -1036,7 +1062,7 @@ fn spawn_bandwidth_sampler(state: AppState) {
             let totals: (f64, f64) = state
                 .node_rt
                 .iter()
-                .filter(|e| e.value().online && now_ts - e.value().ts <= 30)
+                .filter(|e| e.value().online && now_ts - e.value().ts <= RT_FRESH_SECS)
                 .fold((0.0, 0.0), |acc, e| (acc.0 + e.value().rx_bps, acc.1 + e.value().tx_bps));
             let rx = totals.0;
             let tx = totals.1;
@@ -1171,14 +1197,25 @@ async fn apply_new_network(state: &AppState, node_id: &str, network: &str, toml:
             if let Ok(text) = toml::to_string(&value) { toml = text; }
         }
     }
-    let key = format!("{node_id}:{network}");
-    let key = if state.agents.contains_key(&key) {
-        key
-    } else {
+    let key = {
+        let exact = format!("{node_id}:{network}");
         let prefix = format!("{node_id}:");
-        match state.agents.iter().find(|entry| entry.key().starts_with(&prefix)) {
-            Some(entry) => entry.key().clone(),
-            None => return json!({"ok": false, "error": "node is offline"}),
+        let mut found = None;
+        // the agent may be in the middle of reconnecting; give it a few seconds
+        for _ in 0..15 {
+            if state.agents.contains_key(&exact) {
+                found = Some(exact.clone());
+                break;
+            }
+            if let Some(entry) = state.agents.iter().find(|entry| entry.key().starts_with(&prefix)) {
+                found = Some(entry.key().clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        match found {
+            Some(key) => key,
+            None => return json!({"ok": false, "error": "控制面通道不可用：节点实时数据在线，但 agent 会话未建立（可能正在重连）"}),
         }
     };
     let Some(tx) = state.agents.get(&key).map(|v| v.clone()) else {
@@ -1268,7 +1305,11 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
     for (node_id,) in &node_ids {
         let (status, snapshot, system_info) = match state.node_rt.get(node_id) {
             Some(rt) => (
-                if now_ts - rt.ts <= 30 && rt.online { "online".to_string() } else { "offline".to_string() },
+                if now_ts - rt.ts <= RT_FRESH_SECS && rt.online && agent_channel_present(&state, node_id) {
+                    "online".to_string()
+                } else {
+                    "offline".to_string()
+                },
                 rt.snapshot.to_string(),
                 rt.system.to_string(),
             ),
@@ -2048,7 +2089,7 @@ async fn set_routing_settings(State(state): State<AppState>, Json(body): Json<Va
     let nodes: Vec<String> = state
         .node_rt
         .iter()
-        .filter(|e| e.value().online && now_ts - e.value().ts <= 30)
+        .filter(|e| e.value().online && now_ts - e.value().ts <= RT_FRESH_SECS)
         .map(|e| e.key().clone())
         .collect();
     for node_id in nodes {
@@ -2596,8 +2637,13 @@ async fn nodes_payload(state: &AppState) -> Value {
     for node_id in ids {
         let meta = statics.get(&node_id);
         let rt = state.node_rt.get(&node_id).map(|r| r.clone());
-        let live = rt.filter(|r| now_ts - r.ts <= 30);
-        let status = if live.is_some() { "online".to_string() } else { "offline".to_string() };
+        let live = rt.filter(|r| now_ts - r.ts <= RT_FRESH_SECS);
+        let channel_online = agent_channel_present(state, &node_id);
+        let status = if live.is_some() && channel_online {
+            "online".to_string()
+        } else {
+            "offline".to_string()
+        };
         let system_info = match meta.map(|m| m.system.clone()) {
             Some(value) if !value.is_null() => value,
             _ => live.as_ref().map(|r| r.system.clone()).unwrap_or(Value::Null),
@@ -4610,7 +4656,7 @@ async fn board_overview(State(state): State<AppState>) -> Json<Value> {
     let mut rows: Vec<(bool, Value)> = Vec::new();
     for e in state.node_rt.iter() {
         let rt = e.value();
-        let fresh = now_ts - rt.ts <= 30;
+        let fresh = now_ts - rt.ts <= RT_FRESH_SECS;
         rows.push((fresh && rt.online, rt.snapshot.clone()));
     }
     let total = rows.len();
