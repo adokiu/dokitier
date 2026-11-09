@@ -243,6 +243,45 @@ fn sql_for(postgres: bool, sql: &str) -> String {
     out
 }
 
+/// Fresh snapshots (JSON strings) from the in-memory runtime registry.
+fn rt_snapshot_strings(state: &AppState) -> Vec<String> {
+    let now_ts = now();
+    state
+        .node_rt
+        .iter()
+        .filter(|e| now_ts - e.value().ts <= 30)
+        .map(|e| e.value().snapshot.to_string())
+        .collect()
+}
+
+/// (node_id, status, snapshot_json) for realtime endpoints.
+fn rt_nodes_status_snapshot(state: &AppState) -> Vec<(String, String, String)> {
+    let now_ts = now();
+    state
+        .node_rt
+        .iter()
+        .map(|e| {
+            let rt = e.value();
+            let status = if now_ts - rt.ts <= 30 && rt.online { "online" } else { "offline" };
+            (e.key().clone(), status.to_string(), rt.snapshot.to_string())
+        })
+        .collect()
+}
+
+/// (node_id, status, snapshot_json, traffic_json) for realtime endpoints.
+fn rt_nodes_full(state: &AppState) -> Vec<(String, String, String, String)> {
+    let now_ts = now();
+    state
+        .node_rt
+        .iter()
+        .map(|e| {
+            let rt = e.value();
+            let status = if now_ts - rt.ts <= 30 && rt.online { "online" } else { "offline" };
+            (e.key().clone(), status.to_string(), rt.snapshot.to_string(), rt.traffic.to_string())
+        })
+        .collect()
+}
+
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 }
 
 async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
@@ -1065,15 +1104,23 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
     if existing.iter().any(|(network,)| network == &name) {
         return Json(json!({"ok": false, "error": "网络名称已存在"}));
     }
-    // Collect used /24 subnets from all node snapshots.
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT node_id, status, COALESCE(snapshot, ''), COALESCE(system_info, '{}') FROM nodes",
-    ).fetch_all(&state.db).await.unwrap_or_default();
+    // Collect used /24 subnets from the in-memory runtime snapshots.
+    let node_ids: Vec<(String,)> = sqlx::query_as("SELECT node_id FROM nodes")
+        .fetch_all(&state.db).await.unwrap_or_default();
+    let now_ts = now();
     let mut used_subnets = std::collections::HashSet::new();
     let mut node_info: std::collections::HashMap<String, (String, String, String)> = std::collections::HashMap::new();
-    for (node_id, status, snapshot, system_info) in &rows {
-        node_info.insert(node_id.clone(), (status.clone(), snapshot.clone(), system_info.clone()));
-        if let Ok(value) = serde_json::from_str::<Value>(snapshot) {
+    for (node_id,) in &node_ids {
+        let (status, snapshot, system_info) = match state.node_rt.get(node_id) {
+            Some(rt) => (
+                if now_ts - rt.ts <= 30 && rt.online { "online".to_string() } else { "offline".to_string() },
+                rt.snapshot.to_string(),
+                rt.system.to_string(),
+            ),
+            None => ("offline".to_string(), "null".to_string(), "{}".to_string()),
+        };
+        node_info.insert(node_id.clone(), (status, snapshot.clone(), system_info));
+        if let Ok(value) = serde_json::from_str::<Value>(&snapshot) {
             for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
                 if let Some(ip) = inst.get("ipv4").and_then(|v| v.as_str()) {
                     if let Some((a, b, c, _)) = parse_ipv4(ip) {
@@ -1083,6 +1130,11 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
             }
         }
     }
+    // downstream code works on the same row shape as before
+    let rows: Vec<(String, String, String, String)> = node_info
+        .iter()
+        .map(|(id, (status, snapshot, system))| (id.clone(), status.clone(), snapshot.clone(), system.clone()))
+        .collect();
     let mode = body.ip_mode.as_str();
     let subnet = if mode == "manual" {
         None
@@ -1335,10 +1387,9 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
         loop {
             let mut all_connected = true;
             for node in &applied {
-                let snapshot: Option<String> = sqlx::query_scalar(&q("SELECT snapshot FROM nodes WHERE node_id = ?"))
-                    .bind(node).fetch_optional(&state.db).await.ok().flatten();
+                let snapshot = state.node_rt.get(node).map(|rt| rt.snapshot.clone());
                 let connected = snapshot
-                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .and_then(|value| Ok::<Value, ()>(value).ok())
                     .map(|value| {
                         value.get("instances").and_then(|v| v.as_array()).into_iter().flatten().any(|inst| {
                             inst.get("network_name").and_then(|v| v.as_str()) == Some(name.as_str())
@@ -1412,11 +1463,7 @@ fn existing_link_quality(rows: &[(String, String, String, String)], a: &str, b: 
 }
 
 async fn board_networks(State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String, String, String)> =
-        sqlx::query_as("SELECT node_id, COALESCE(status, 'offline'), COALESCE(snapshot, ''), COALESCE(traffic, '{}') FROM nodes")
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
+    let rows: Vec<(String, String, String, String)> = rt_nodes_full(&state);
     let versions: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT node_id, network, toml FROM config_versions ORDER BY id DESC",
     )
@@ -1534,10 +1581,7 @@ async fn board_networks(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn board_drift(State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT node_id, status, snapshot FROM nodes")
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    let rows: Vec<(String, String, String)> = rt_nodes_status_snapshot(&state);
     let instances: Vec<(String, String, String)> =
         sqlx::query_as("SELECT node_id, network, instance_id FROM network_instances")
             .fetch_all(&state.db)
@@ -1959,12 +2003,10 @@ fn spawn_reconcile_inner(state: AppState, node_id: String, force: bool) {
         .await
         .ok()
         .flatten();
-        let snapshot: String = sqlx::query_scalar(&q("SELECT snapshot FROM nodes WHERE node_id = ?"))
-            .bind(&node_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
+        let snapshot: String = state
+            .node_rt
+            .get(&node_id)
+            .map(|rt| rt.snapshot.to_string())
             .unwrap_or_default();
         let current: std::collections::HashMap<String, String> = serde_json::from_str::<Value>(&snapshot)
             .ok()
@@ -2090,11 +2132,14 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
                 return Err("unknown node or invalid token".into());
             }
             eprintln!("HELLO {node_id} v4={:?} v6={:?}", public_ipv4, public_ipv6);
-            let hostname_opt = (!hostname.is_empty()).then_some(hostname.as_str());
-            let version_opt = (!version.is_empty()).then_some(version.as_str());
-            let networks_value = Value::Array(networks.clone());
-            let networks_opt = (!networks.is_empty()).then_some(&networks_value);
-            touch_node(&state.db, &node_id, hostname_opt, version_opt, networks_opt, None, "online").await;
+            {
+                let mut rt = state.node_rt.entry(node_id.clone()).or_default();
+                if !hostname.is_empty() { rt.hostname = hostname.clone(); }
+                if !version.is_empty() { rt.version = version.clone(); }
+                if !networks.is_empty() { rt.networks = Value::Array(networks.clone()); }
+                rt.online = true;
+                rt.last_seen = now();
+            }
             if let Some(info) = system.as_ref().filter(|v| !v.is_null()) {
                 let _ = sqlx::query(&q("UPDATE nodes SET system_info = ? WHERE node_id = ?"))
                     .bind(info.to_string()).bind(&node_id).execute(&state.db).await;
@@ -2163,7 +2208,11 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
             Ok(())
         }
         AgentFrame::Result { node_id, .. } => {
-            touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
+            if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+                rt.online = true;
+                rt.last_seen = now();
+            }
+            Ok(())
         }
     }
 }
@@ -2369,11 +2418,10 @@ async fn nodes_payload(state: &AppState) -> Value {
             bandwidth_down_mbps: meta.and_then(|m| m.bw_down),
             bandwidth_intranet_down_mbps: meta.and_then(|m| m.bw_intra),
             bandwidth_internet_down_mbps: meta.and_then(|m| m.bw_inet),
-            shared_listeners: live
-                .as_ref()
-                .map(|r| r.listeners.join(","))
-                .filter(|v| !v.is_empty())
-                .or_else(|| meta.and_then(|m| m.listeners.clone())),
+            shared_listeners: meta
+                .and_then(|m| m.listeners.clone())
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| live.as_ref().map(|r| r.listeners.join(",")).filter(|v| !v.is_empty())),
             instance_ids: json!(instance_map.get(&node_id).cloned().unwrap_or_default()),
         });
     }
@@ -2475,18 +2523,21 @@ async fn set_alias(State(state): State<AppState>, Path(node_id): Path<String>, J
 }
 
 async fn get_node(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
-    let row: Option<(String, String, String, String, String, i64, String, Option<String>, Option<String>, Option<String>, Option<f32>, Option<f32>)> = sqlx::query_as(&q(
-        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps FROM nodes WHERE node_id = ?",
-    )).bind(&node_id).fetch_optional(&state.db).await.ok().flatten();
-    match row {
-        Some((node_id, hostname, version, networks, snapshot, last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps)) => Json(json!({
-            "node_id": node_id, "hostname": hostname, "version": version,
-            "networks": serde_json::from_str::<Value>(&networks).unwrap_or(Value::Null),
-            "snapshot": serde_json::from_str::<Value>(&snapshot).unwrap_or(Value::Null),
-            "last_seen": last_seen, "status": status,
-        })),
-        None => Json(json!({"error": "not found"})),
+    // same memory-backed payload as the node list; no realtime SQL read
+    let payload = nodes_payload(&state).await;
+    if let Some(node) = payload
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|n| n.get("node_id").and_then(|v| v.as_str()) == Some(node_id.as_str()))
+                .cloned()
+        })
+    {
+        return Json(node);
     }
+    Json(json!({"error": "not found"}))
 }
 
 #[derive(serde::Deserialize)]
@@ -2833,7 +2884,14 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
             let network = networks.first().and_then(|n| n.get("name")).and_then(|v| v.as_str()).unwrap_or("default");
             state.agents.insert(format!("{node_id}:{network}"), tx);
-            touch_node(&state.db, node_id, Some(hostname), Some(version), Some(&Value::Array(networks.clone())), None, "online").await;
+            {
+                let mut rt = state.node_rt.entry(node_id.clone()).or_default();
+                if !hostname.is_empty() { rt.hostname = hostname.clone(); }
+                if !version.is_empty() { rt.version = version.clone(); }
+                if !networks.is_empty() { rt.networks = Value::Array(networks.clone()); }
+                rt.online = true;
+                rt.last_seen = now();
+            }
             let writer_cipher = SessionCipher::new(&token, &nonce, ts);
             let writer = tokio::spawn(async move {
                 while let Some(value) = rx.recv().await {
@@ -2861,10 +2919,72 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
     }
 }
 
+/// Persist one node's runtime state to SQL in a short transaction. Runs in a
+/// background task with bounded concurrency: nothing here ever blocks the agent
+/// websocket, the topology API or any other request (they all read memory).
+async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return false,
+    };
+    let st = if rt.online { "online" } else { "offline" };
+    let res = sqlx::query(&q("UPDATE nodes SET last_seen = ?, status = ?, \
+            hostname = COALESCE(NULLIF(?, ''), hostname), \
+            version = COALESCE(NULLIF(?, ''), version), \
+            networks = COALESCE(?, networks), snapshot = ?, \
+            system_info = COALESCE(?, system_info), \
+            public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6), \
+            cpu_pct = ?, mem_pct = ?, mem_used = ?, mem_total = ?, \
+            rx_bps = ?, tx_bps = ?, traffic = ?, \
+            shared_listeners = COALESCE(NULLIF(?, ''), shared_listeners) WHERE node_id = ?"))
+        .bind(rt.last_seen)
+        .bind(st)
+        .bind(rt.hostname.clone())
+        .bind(rt.version.clone())
+        .bind(if rt.networks.is_null() { None } else { Some(rt.networks.to_string()) })
+        .bind(rt.snapshot.to_string())
+        .bind(if rt.system.is_null() { None } else { Some(rt.system.to_string()) })
+        .bind(rt.public_ipv4.clone())
+        .bind(rt.public_ipv6.clone())
+        .bind(rt.cpu_pct)
+        .bind(rt.mem_pct)
+        .bind(rt.mem_used)
+        .bind(rt.mem_total)
+        .bind(rt.rx_bps)
+        .bind(rt.tx_bps)
+        .bind(rt.traffic.to_string())
+        .bind(&node_id)
+        .execute(&mut *tx)
+        .await;
+    if res.is_err() {
+        let _ = tx.rollback().await;
+        return false;
+    }
+    for (network, a, b, a_uuid, b_uuid, ts, latency, loss) in &rt.pending_links {
+        let ins = sqlx::query(&q("INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
+            .bind(network)
+            .bind(a)
+            .bind(b)
+            .bind(a_uuid.clone())
+            .bind(b_uuid.clone())
+            .bind(ts)
+            .bind(latency)
+            .bind(loss)
+            .execute(&mut *tx)
+            .await;
+        if ins.is_err() {
+            let _ = tx.rollback().await;
+            return false;
+        }
+    }
+    tx.commit().await.is_ok()
+}
+
 fn spawn_snapshot_flusher(state: AppState) {
     tokio::spawn(async move {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             let now_ts = now();
             let due: Vec<(String, NodeRt)> = state
                 .node_rt
@@ -2872,82 +2992,27 @@ fn spawn_snapshot_flusher(state: AppState) {
                 .filter(|e| now_ts - state.rt_flush.get(e.key()).map(|v| *v).unwrap_or(0) >= 60)
                 .map(|e| (e.key().clone(), e.value().clone()))
                 .collect();
-            if due.is_empty() {
-                continue;
-            }
-            let mut tx = match state.db.begin().await {
-                Ok(tx) => tx,
-                Err(_) => continue,
-            };
-            let mut ok = true;
-            let mut flushed: Vec<(String, i64)> = Vec::new();
             for (node_id, rt) in due {
-                let st = if rt.online { "online" } else { "offline" };
-                let res = sqlx::query(&q("UPDATE nodes SET last_seen = ?, status = ?, \
-                        hostname = COALESCE(NULLIF(?, ''), hostname), \
-                        version = COALESCE(NULLIF(?, ''), version), \
-                        networks = COALESCE(?, networks), snapshot = ?, \
-                        system_info = COALESCE(?, system_info), \
-                        public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6), \
-                        cpu_pct = ?, mem_pct = ?, mem_used = ?, mem_total = ?, \
-                        rx_bps = ?, tx_bps = ?, traffic = ?, \
-                        shared_listeners = COALESCE(NULLIF(?, ''), shared_listeners) WHERE node_id = ?"))
-                    .bind(rt.last_seen)
-                    .bind(st)
-                    .bind(rt.hostname.clone())
-                    .bind(rt.version.clone())
-                    .bind(if rt.networks.is_null() { None } else { Some(rt.networks.to_string()) })
-                    .bind(rt.snapshot.to_string())
-                    .bind(if rt.system.is_null() { None } else { Some(rt.system.to_string()) })
-                    .bind(rt.public_ipv4.clone())
-                    .bind(rt.public_ipv6.clone())
-                    .bind(rt.cpu_pct)
-                    .bind(rt.mem_pct)
-                    .bind(rt.mem_used)
-                    .bind(rt.mem_total)
-                    .bind(rt.rx_bps)
-                    .bind(rt.tx_bps)
-                    .bind(rt.traffic.to_string())
-                    .bind(rt.listeners.join(","))
-                    .bind(&node_id)
-                    .execute(&mut *tx)
-                    .await;
-                if res.is_err() {
-                    ok = false;
+                let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                    // keep it for the next cycle instead of blocking the tick
                     continue;
-                }
-                for (network, a, b, a_uuid, b_uuid, ts, latency, loss) in &rt.pending_links {
-                    let ins = sqlx::query(&q("INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
-                        .bind(network)
-                        .bind(a)
-                        .bind(b)
-                        .bind(a_uuid.clone())
-                        .bind(b_uuid.clone())
-                        .bind(ts)
-                        .bind(latency)
-                        .bind(loss)
-                        .execute(&mut *tx)
-                        .await;
-                    if ins.is_err() {
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok {
-                    flushed.push((node_id, rt.ts));
-                }
-            }
-            if ok {
-                if tx.commit().await.is_ok() {
-                    for (node_id, up_to) in flushed {
-                        if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
-                            rt.pending_links.retain(|row| row.5 > up_to);
+                };
+                // mark as in-flight so the next cycle does not enqueue it twice
+                state.rt_flush.insert(node_id.clone(), now_ts);
+                let state_clone = state.clone();
+                let id = node_id.clone();
+                let flushed_ts = rt.ts;
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if flush_one_node(state_clone.clone(), id.clone(), rt).await {
+                        if let Some(mut live) = state_clone.node_rt.get_mut(&id) {
+                            live.pending_links.retain(|row| row.5 > flushed_ts);
                         }
-                        state.rt_flush.insert(node_id, now_ts);
+                    } else {
+                        // retry in the next cycle
+                        state_clone.rt_flush.insert(id, 0);
                     }
-                }
-            } else {
-                let _ = tx.rollback().await;
+                });
             }
         }
     });
@@ -3418,12 +3483,15 @@ struct HistoryQuery {
 
 fn default_range() -> String { "24h".to_string() }
 
-async fn resolve_peer_uuid(db: &AnyPool, network: &str, peer: i64) -> Option<String> {
-    let rows: Vec<(String,)> = sqlx::query_as(&q("SELECT snapshot FROM nodes"))
-        .fetch_all(db)
-        .await
-        .ok()?;
-    for (snapshot,) in rows {
+fn resolve_peer_uuid(state: &AppState, network: &str, peer: i64) -> Option<String> {
+    let now_ts = now();
+    let rows: Vec<String> = state
+        .node_rt
+        .iter()
+        .filter(|e| now_ts - e.value().ts <= 120)
+        .map(|e| e.value().snapshot.to_string())
+        .collect();
+    for snapshot in rows {
         let Ok(value) = serde_json::from_str::<Value>(&snapshot) else { continue };
         let Some(instances) = value.get("instances").and_then(|v| v.as_array()) else { continue };
         for inst in instances {
@@ -3454,8 +3522,8 @@ async fn board_history(State(state): State<AppState>, axum::extract::Query(query
         "30d" => (7200, now() - 30 * 24 * 3600),
         _ => (600, now() - 24 * 3600),
     };
-    let a_uuid = resolve_peer_uuid(&state.db, &query.network, query.a).await;
-    let b_uuid = resolve_peer_uuid(&state.db, &query.network, query.b).await;
+    let a_uuid = resolve_peer_uuid(&state, &query.network, query.a);
+    let b_uuid = resolve_peer_uuid(&state, &query.network, query.b);
     let rows: Result<Vec<(i64, Option<f64>, Option<f64>)>, sqlx::Error> = match (a_uuid, b_uuid) {
         (Some(ua), Some(ub)) => {
             let (lo, hi) = if ua <= ub { (ua, ub) } else { (ub, ua) };
@@ -3479,10 +3547,9 @@ async fn board_history(State(state): State<AppState>, axum::extract::Query(query
 }
 
 async fn board_routes(State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
-        .fetch_all(&state.db).await.unwrap_or_default();
+    let rows: Vec<String> = rt_snapshot_strings(&state);
     let mut routes = Vec::new();
-    for (_, snapshot) in &rows {
+    for snapshot in &rows {
         let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
         for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
             let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
@@ -3504,11 +3571,10 @@ async fn board_routes(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn board_links(State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
-        .fetch_all(&state.db).await.unwrap_or_default();
+    let rows: Vec<String> = rt_snapshot_strings(&state);
     let mut names: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
     let mut links_map: std::collections::BTreeMap<(u32, u32, String), Value> = std::collections::BTreeMap::new();
-    for (_, snapshot) in &rows {
+    for snapshot in &rows {
         let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
         for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
             let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
