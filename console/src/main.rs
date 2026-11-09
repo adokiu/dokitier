@@ -3080,6 +3080,60 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
                 .unwrap_or(true)
         });
     }
+    if net_filter.is_none() {
+        // aggregate view: one node per peer, one edge per pair (summed rates)
+        let mut merged_nodes: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+        for n in node_list {
+            let Some(pid) = n.get("peer_id").and_then(|v| v.as_u64()) else { continue };
+            let net = n.get("network_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            match merged_nodes.entry(pid) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    let node = e.get_mut();
+                    let mut nets = node.get("networks").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    if !net.is_empty() && !nets.iter().any(|x| x.as_str() == Some(net.as_str())) {
+                        nets.push(json!(net));
+                    }
+                    node["networks"] = json!(nets);
+                }
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    let mut node = n;
+                    node["networks"] = json!([net]);
+                    v.insert(node);
+                }
+            }
+        }
+        let mut merged_edges: std::collections::BTreeMap<(u64, u64), Value> = std::collections::BTreeMap::new();
+        for e in edge_list {
+            let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
+            let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
+            let key = if a < b { (a, b) } else { (b, a) };
+            let net = e.get("network_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let rx = e.get("rx_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let tx = e.get("tx_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            match merged_edges.entry(key) {
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    let edge = o.get_mut();
+                    let erx = edge.get("rx_bps").and_then(|v| v.as_f64()).unwrap_or(0.0) + rx;
+                    let etx = edge.get("tx_bps").and_then(|v| v.as_f64()).unwrap_or(0.0) + tx;
+                    edge["rx_bps"] = json!(erx);
+                    edge["tx_bps"] = json!(etx);
+                    edge["bandwidth_bps"] = json!(erx + etx);
+                    let mut nets = edge.get("networks").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    if !net.is_empty() && !nets.iter().any(|x| x.as_str() == Some(net.as_str())) {
+                        nets.push(json!(net));
+                    }
+                    edge["networks"] = json!(nets);
+                }
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    let mut edge = e;
+                    edge["networks"] = json!([net]);
+                    v.insert(edge);
+                }
+            }
+        }
+        node_list = merged_nodes.into_values().collect();
+        edge_list = merged_edges.into_values().collect();
+    }
     json!({"graph": {
         "nodes": node_list,
         "edges": edge_list,

@@ -253,7 +253,6 @@ let flowTimer = null
 let flowOffset = 0
 let nodesTimer = null
 let refreshTick = 0
-const latencyCache = new Map()
 let lastSampleTs = 0
 const prevTraffic = new Map()
 const edgeSamples = {}
@@ -368,30 +367,12 @@ function nodeLabel(pid) {
 }
 
 function applyNetworkFilter() {
-  const drill = drillGroup.value
-  const net = drill || viewMode.value === 'detail' ? '' : networkFilter.value
-  const seen = new Set()
-  const nodes = []
-  for (const n of allGraph.nodes || []) {
-    if (seen.has(n.peer_id)) continue
-    if (drill) {
-      if (groupOf(n) !== drill) continue
-    } else if (net && n.network_name !== net) continue
-    seen.add(n.peer_id)
-    nodes.push(n)
+  // Scope filtering happens on the server (?network=&group=); the client only
+  // renders the payload it received.
+  graph = { nodes: allGraph.nodes || [], edges: allGraph.edges || [] }
+  if (hoverFocus.value != null && !graph.nodes.some((n) => n.peer_id === hoverFocus.value)) {
+    hoverFocus.value = null
   }
-  const ids = new Set(nodes.map((n) => n.peer_id))
-  const edgeSeen = new Set()
-  const edges = []
-  for (const e of allGraph.edges || []) {
-    if (!ids.has(e.a) || !ids.has(e.b)) continue
-    const k = keyOf(e.a, e.b)
-    if (edgeSeen.has(k)) continue
-    edgeSeen.add(k)
-    edges.push(e)
-  }
-  graph = { nodes, edges }
-  if (hoverFocus.value != null && !ids.has(hoverFocus.value)) hoverFocus.value = null
 }
 
 function nodeBox(n) {
@@ -2175,73 +2156,16 @@ const PREFERRED_GROUP_ORDER = ['cn', 'ix-sh', 'ix-sz', 'overseas']
 let circleGeom = null
 let matrixGeom = null
 
-// The console board can omit a link for a frame (probe/snapshot timing). Keep a
-// short-lived cache so cells/labels do not blink in and out while the link stays up.
-// Entities are kept for a few *reports* (not wall-clock time): the console board
-// can omit a link for one or two frames, but a longer absence really means gone.
-const overviewNodeSeen = new Map()
-const overviewEdgeSeen = new Map()
-const OVERVIEW_MISS_LIMIT = 5
-let overviewReportId = 0
-
 function overviewData() {
-  const seenNodes = new Set()
-  for (const n of allGraph.nodes || []) {
-    seenNodes.add(n.peer_id)
-    const rec = overviewNodeSeen.get(n.peer_id)
-    if (rec) {
-      rec.node = n
-      rec.lastReport = overviewReportId
-    } else {
-      overviewNodeSeen.set(n.peer_id, { node: n, lastReport: overviewReportId })
-    }
-  }
-  const nodes = []
-  for (const [id, rec] of overviewNodeSeen) {
-    if (overviewReportId - rec.lastReport > OVERVIEW_MISS_LIMIT) {
-      overviewNodeSeen.delete(id)
-      continue
-    }
-    nodes.push(rec.node)
-  }
-  const seenEdges = new Set()
-  for (const e of allGraph.edges || []) {
-    const k = keyOf(e.a, e.b)
-    if (seenEdges.has(k)) continue
-    seenEdges.add(k)
-    const m = metrics[k] || {}
-    const tunnels = e.tunnels || []
-    const lats = tunnels.map((t) => t.latency_ms).filter((v) => v != null)
-    const losses = tunnels.map((t) => t.loss_pct).filter((v) => v != null)
-    let lat = m.latency_ms != null ? m.latency_ms : (lats.length ? Math.min(...lats) : null)
-    const latRec = latencyCache.get(k)
-    if (lat != null) {
-      latencyCache.set(k, { lat, lastReport: overviewReportId })
-    } else if (latRec) {
-      if (overviewReportId - latRec.lastReport > OVERVIEW_MISS_LIMIT) latencyCache.delete(k)
-      else lat = latRec.lat
-    }
-    const prev = overviewEdgeSeen.get(k)
-    overviewEdgeSeen.set(k, {
-      a: e.a,
-      b: e.b,
-      network_name: e.network_name || '',
-      traffic: (m.rx_bps || 0) + (m.tx_bps || 0),
-      latency: lat != null ? lat : (prev ? prev.latency : null),
-      loss: m.loss_pct != null
-        ? m.loss_pct
-        : (losses.length ? losses.reduce((x, y) => x + y, 0) / losses.length : (prev ? prev.loss : null)),
-      lastReport: overviewReportId,
-    })
-  }
-  const pairs = []
-  for (const [k, rec] of overviewEdgeSeen) {
-    if (overviewReportId - rec.lastReport > OVERVIEW_MISS_LIMIT) {
-      overviewEdgeSeen.delete(k)
-      continue
-    }
-    pairs.push(rec)
-  }
+  const nodes = allGraph.nodes || []
+  const pairs = (allGraph.edges || []).map((e) => ({
+    a: e.a,
+    b: e.b,
+    traffic: Number(e.rx_bps || 0) + Number(e.tx_bps || 0),
+    latency: e.latency_ms != null ? Number(e.latency_ms) : null,
+    loss: e.loss_pct != null ? Number(e.loss_pct) : null,
+    network_name: e.network_name || '',
+  }))
   const byGroup = new Map()
   for (const n of nodes) {
     const g = groupOf(n) || 'default'
@@ -2860,8 +2784,7 @@ function matrixHoverAt(x, y) {
   const b = matrixGeom.ordered[j].node
   const key = keyOf(a.peer_id, b.peer_id)
   const m = metrics[key] || {}
-  const latRec = latencyCache.get(key)
-  const lat = m.latency_ms != null ? m.latency_ms : (latRec ? latRec.lat : null)
+  const lat = m.latency_ms != null ? m.latency_ms : null
   const rect = chartEl.value.getBoundingClientRect()
   hover.value = {
     visible: true,
