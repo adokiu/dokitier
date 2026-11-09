@@ -3445,6 +3445,59 @@ impl PeerRouteServiceImpl {
         self.synced_route_info
             .remove_peers(to_remove.iter().copied());
 
+        // A restarted node comes back with a fresh peer_id but the same instance
+        // id. Its old incarnation stays in the flooded route info set (other
+        // peers keep re-advertising it), so it never ages out and the topology
+        // shows the node twice - with enough churn it never converges at all.
+        // Keep the reachable / newest incarnation of each instance id and evict
+        // + disconnect the stale one so routes converge on their own.
+        let mut incarnations: std::collections::HashMap<uuid::Uuid, Vec<(PeerId, i64, bool)>> =
+            std::collections::HashMap::new();
+        {
+            let peer_infos = self.synced_route_info.peer_infos.read();
+            for (peer_id, info) in peer_infos.iter() {
+                let Some(inst_id) = info.inst_id.as_ref() else { continue };
+                let inst_uuid: uuid::Uuid = (*inst_id).into();
+                if inst_uuid.is_nil() {
+                    continue;
+                }
+                let updated = info.last_update.as_ref().map(|ts| ts.seconds).unwrap_or(0);
+                let reachable = self.route_table.topology_peer_reachable(*peer_id);
+                incarnations
+                    .entry(inst_uuid)
+                    .or_default()
+                    .push((*peer_id, updated, reachable));
+            }
+        }
+        let mut stale = Vec::new();
+        for peers in incarnations.values_mut() {
+            if peers.len() < 2 {
+                continue;
+            }
+            peers.sort_by_key(|(peer, updated, reachable)| {
+                (!*reachable, std::cmp::Reverse(*updated), *peer)
+            });
+            let keep = peers[0].0;
+            for (peer, _, _) in peers.iter().skip(1) {
+                if *peer != keep {
+                    stale.push(*peer);
+                }
+            }
+        }
+        if !stale.is_empty() {
+            tracing::warn!(
+                ?stale,
+                "evicting stale peer incarnations sharing one instance id"
+            );
+            self.synced_route_info.remove_peers(stale.iter().copied());
+            let interface = self.interface.lock().await;
+            if let Some(interface) = interface.as_ref() {
+                for peer_id in &stale {
+                    interface.close_peer(*peer_id).await;
+                }
+            }
+        }
+
         // clear expired foreign network info
         let mut to_remove = Vec::new();
         for item in self.synced_route_info.foreign_network.iter() {

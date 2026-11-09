@@ -11,6 +11,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 const props = defineProps({
   geo: { type: Object, default: () => ({ cities: [], links: [] }) },
 })
+const emit = defineEmits(['select-city'])
 
 const EARTH_NIGHT = '/images/earth/earth-night.jpg'
 const EARTH_DAY = '/images/earth/earth-blue-marble.jpg'
@@ -56,15 +57,43 @@ function arcActive(link) {
 }
 
 function arcColor(link) {
-  return arcActive(link) ? 'rgba(80, 220, 160, 0.92)' : 'rgba(150, 175, 205, 0.42)'
+  const bps = Number(link.traffic || 0)
+  if (bps >= 4 * 1024 * 1024) return 'rgba(120, 255, 190, 0.98)'
+  if (bps >= 1024 * 1024) return 'rgba(70, 225, 175, 0.92)'
+  if (bps >= 128 * 1024) return 'rgba(66, 190, 210, 0.85)'
+  if (bps >= 8 * 1024) return 'rgba(90, 150, 200, 0.62)'
+  return 'rgba(150, 175, 205, 0.35)'
 }
 
 function arcStroke(link) {
-  return 0.22 + Math.min(0.85, Math.log10(Math.max(10, link.traffic || 10)) * 0.12)
+  const bps = Math.max(1, Number(link.traffic || 0))
+  // 1 KB/s -> thin, 10 MB/s -> thick, log-scaled
+  return 0.18 + Math.min(1.15, Math.log10(bps / 1024 + 1) * 0.42)
 }
 
-function pointRadius(city) {
-  return 0.45 + Math.min(1.1, Math.log2((city.nodes || 1) + 1) * 0.42)
+// Half sphere sitting on the globe surface (globe radius is 100 units), with a
+// hard upper bound so a single-node region cannot become a giant dot.
+function domeRadius(city) {
+  return Math.min(1.35, 0.5 + Math.log2((city.nodes || 1) + 1) * 0.34)
+}
+
+function createCityDome(city) {
+  const radius = domeRadius(city)
+  const geometry = new three.SphereGeometry(radius, 24, 12, 0, Math.PI * 2, 0, Math.PI / 2)
+  const color = colorOf(city.group)
+  const material = new three.MeshPhongMaterial({
+    color,
+    emissive: color,
+    emissiveIntensity: 0.35,
+    shininess: 26,
+    transparent: true,
+    opacity: 0.96,
+  })
+  const mesh = new three.Mesh(geometry, material)
+  mesh.renderOrder = 2
+  mesh.userData.city = city
+  domeObjects.set(mesh, city)
+  return mesh
 }
 
 function applyMaterial() {
@@ -81,14 +110,48 @@ function applyMaterial() {
     .atmosphereAltitude(dark ? 0.14 : 0.11)
 }
 
+let lastPointsSig = ''
+let lastArcsSig = ''
+let lastArcUpdate = 0
+const domeObjects = new Map()
+let clickStart = null
+
 function updateData() {
   if (!globe) return
   const cities = (props.geo.cities || []).filter((c) => Number.isFinite(c.lat) && Number.isFinite(c.lon))
   const links = (props.geo.links || []).filter((l) => Number.isFinite(l.a_lat) && Number.isFinite(l.a_lon) && Number.isFinite(l.b_lat) && Number.isFinite(l.b_lon))
-  globe
-    .pointsData(cities)
-    .labelsData(cities)
-    .arcsData(links)
+  // The globe must not rebuild its objects every second: points/labels only
+  // change when the city set changes, arcs refresh at most every ~1.5s and
+  // only when the traffic bucket changed.
+  const pointsSig = cities.map((c) => `${c.city}:${c.lat.toFixed(3)},${c.lon.toFixed(3)}:${c.nodes}:${c.group}`).join('|')
+  if (pointsSig !== lastPointsSig) {
+    lastPointsSig = pointsSig
+    domeObjects.clear()
+    globe.customLayerData(cities).htmlElementsData(cities)
+  }
+  const arcsSig = links
+    .map((l) => `${l.a_city}>${l.b_city}:${Math.round((l.traffic || 0) / 1024)}:${Math.round((l.latency_ms || 0) * 10)}`)
+    .join('|')
+  const now = Date.now()
+  if (arcsSig !== lastArcsSig && now - lastArcUpdate > 1500) {
+    lastArcsSig = arcsSig
+    lastArcUpdate = now
+    globe.arcsData(links)
+  }
+}
+
+function createLabelElement(city) {
+  const root = document.createElement('div')
+  root.className = 'geo-city-label'
+  const name = document.createElement('span')
+  name.className = 'geo-city-label__name'
+  name.textContent = city.city || ''
+  const count = document.createElement('span')
+  count.className = 'geo-city-label__count'
+  count.textContent = String(city.nodes || 0)
+  root.appendChild(name)
+  root.appendChild(count)
+  return root
 }
 
 function stopAutoRotate() {
@@ -150,24 +213,24 @@ async function startGlobe() {
     .atmosphereAltitude(0.14)
     .globeImageUrl(isDark() ? EARTH_NIGHT : EARTH_DAY)
     .bumpImageUrl(EARTH_BUMP)
-    .pointsData([])
-    .pointLat('lat')
-    .pointLng('lon')
-    .pointAltitude(0.012)
-    .pointRadius(pointRadius)
-    .pointColor((city) => colorOf(city.group))
-    .pointsMerge(false)
-    .pointsTransitionDuration(600)
-    .pointLabel(pointLabel)
-    .labelsData([])
-    .labelLat('lat')
-    .labelLng('lon')
-    .labelText((city) => `${city.city} ${city.nodes}`)
-    .labelSize(0.62)
-    .labelDotRadius(0)
-    .labelAltitude(0.014)
-    .labelColor(() => (isDark() ? 'rgba(219, 234, 254, 0.95)' : 'rgba(15, 32, 48, 0.95)'))
-    .labelResolution(2)
+    .customLayerData([])
+    .customThreeObject((city) => createCityDome(city))
+    .customThreeObjectUpdate((object, city) => {
+      const coords = globe.getCoords(city.lat, city.lon, 0.005)
+      Object.assign(object.position, coords)
+      const normal = object.position.clone().normalize()
+      object.quaternion.setFromUnitVectors(new three.Vector3(0, 1, 0), normal)
+    })
+    .customLayerLabel(pointLabel)
+    .htmlElementsData([])
+    .htmlLat('lat')
+    .htmlLng('lon')
+    .htmlAltitude(0.012)
+    .htmlElement(createLabelElement)
+    .htmlElementVisibilityModifier((el, visible) => {
+      el.style.opacity = visible ? '1' : '0'
+    })
+    .htmlTransitionDuration(0)
     .arcsData([])
     .arcStartLat('a_lat')
     .arcStartLng('a_lon')
@@ -176,10 +239,12 @@ async function startGlobe() {
     .arcColor(arcColor)
     .arcStroke(arcStroke)
     .arcAltitudeAutoScale(0.38)
-    .arcDashLength((link) => (arcActive(link) ? 0.32 : 0.5))
-    .arcDashGap(0.5)
-    .arcDashAnimateTime((link) => (arcActive(link) ? 2200 : 0))
-    .arcsTransitionDuration(500)
+    // traffic is encoded in colour + width; arcs are solid so they never look
+    // broken in the middle (dash length 1, no gap, no animation)
+    .arcDashLength(1)
+    .arcDashGap(0)
+    .arcDashAnimateTime(0)
+    .arcsTransitionDuration(0)
 
   const renderer = globe.renderer()
   renderer.setClearColor(0x000000, 0)
@@ -202,6 +267,29 @@ async function startGlobe() {
   const rearLight = new three.DirectionalLight(0xe0f2fe, 0.45)
   rearLight.position.set(-1.0, -0.8, -1.2)
   globe.lights([new three.AmbientLight(0xffffff, 1.8), frontLight, fillLight, rearLight])
+
+  const canvas = renderer.domElement
+  canvas.addEventListener('pointerdown', (event) => {
+    clickStart = { x: event.clientX, y: event.clientY }
+  })
+  canvas.addEventListener('click', (event) => {
+    if (!clickStart) return
+    const moved = Math.hypot(event.clientX - clickStart.x, event.clientY - clickStart.y)
+    clickStart = null
+    if (moved > 5) return
+    const rect = canvas.getBoundingClientRect()
+    const mouse = new three.Vector2(
+      ((event.clientX - rect.left) / rect.width) * 2 - 1,
+      -((event.clientY - rect.top) / rect.height) * 2 + 1,
+    )
+    const raycaster = new three.Raycaster()
+    raycaster.setFromCamera(mouse, globe.camera())
+    const hits = raycaster.intersectObjects([...domeObjects.keys()], false)
+    if (hits.length) {
+      const city = hits[0].object.userData.city
+      if (city) emit('select-city', city)
+    }
+  })
 
   applyMaterial()
   attachControls()
@@ -237,6 +325,26 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.geo-globe-host :deep(.geo-city-label) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transform: translate(-50%, -140%);
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(10, 16, 24, 0.72);
+  border: 1px solid rgba(120, 180, 230, 0.28);
+  color: #e8f1fb;
+  font: 600 12px/1.4 'Noto Sans', sans-serif;
+  white-space: nowrap;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(2px);
+}
+.geo-globe-host :deep(.geo-city-label__count) {
+  color: #7fe0b8;
+  font-weight: 700;
+}
 .geo-globe-host {
   position: absolute;
   inset: 0;

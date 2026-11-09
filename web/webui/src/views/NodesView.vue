@@ -43,14 +43,22 @@
         <template #item.vpnIp="{ item }">
           <div class="ip-cell">
             <div v-if="ipInfo(item, 'vpn').v4">{{ ipInfo(item, 'vpn').v4 }}</div>
-            <div v-if="ipInfo(item, 'vpn').v6" class="ip-v6">{{ ipInfo(item, 'vpn').v6 }}</div>
+            <v-tooltip v-if="ipInfo(item, 'vpn').v6" location="top" :text="ipInfo(item, 'vpn').v6full">
+              <template #activator="{ props }">
+                <div v-bind="props" class="ip-v6">{{ ipInfo(item, 'vpn').v6 }}</div>
+              </template>
+            </v-tooltip>
             <div v-if="!ipInfo(item, 'vpn').v4 && !ipInfo(item, 'vpn').v6">-</div>
           </div>
         </template>
         <template #item.publicIp="{ item }">
           <div class="ip-cell">
             <div v-if="ipInfo(item, 'public').v4">{{ ipInfo(item, 'public').v4 }}</div>
-            <div v-if="ipInfo(item, 'public').v6" class="ip-v6">{{ ipInfo(item, 'public').v6 }}</div>
+            <v-tooltip v-if="ipInfo(item, 'public').v6" location="top" :text="ipInfo(item, 'public').v6full">
+              <template #activator="{ props }">
+                <div v-bind="props" class="ip-v6">{{ ipInfo(item, 'public').v6 }}</div>
+              </template>
+            </v-tooltip>
             <div v-if="!ipInfo(item, 'public').v4 && !ipInfo(item, 'public').v6">-</div>
           </div>
         </template>
@@ -66,7 +74,7 @@
             <div class="meter-track"><div class="meter-fill" :style="{ width: barWidth(memPct(item)), background: usageColor(memPct(item)) }" /></div>
           </div>
         </template>
-        <template #item.version="{ item }"><span class="text-caption">{{ item.version || '-' }}</span></template>
+        <template #item.version="{ item }"><span class="text-caption version-cell">{{ item.version || '-' }}</span></template>
         <template #item.traffic="{ item }">
           <div class="traffic">
             <span class="up">↑ {{ bps(item.tx_bps) }}</span>
@@ -133,28 +141,52 @@
 
           <div v-show="drawerTab === 'node'">
             <div class="node-settings">
-              <div class="stat-label mb-1">节点名称</div>
-              <div class="node-field-hint">留空显示主机名，用于列表和拓扑展示</div>
+              <div class="stat-label mb-1 d-flex align-center">
+                节点名称
+                <v-tooltip location="top" text="留空显示主机名，用于列表和拓扑展示">
+                  <template #activator="{ props }"><v-icon v-bind="props" size="14" class="ml-1 info-icon">mdi-information-outline</v-icon></template>
+                </v-tooltip>
+              </div>
               <v-text-field v-model="nodeAlias" density="compact" variant="outlined" hide-details placeholder="留空显示主机名" class="mb-4" />
-              <div class="stat-label mb-1">上行带宽（Mbps）</div>
-              <div class="node-field-hint">节点上行能力，参与链路容量 min(up(src), down(dst))</div>
+              <div class="stat-label mb-1 d-flex align-center">
+                上行带宽（Mbps）
+                <v-tooltip location="top" text="节点上行能力，参与链路容量 min(up(src), down(dst))">
+                  <template #activator="{ props }"><v-icon v-bind="props" size="14" class="ml-1 info-icon">mdi-information-outline</v-icon></template>
+                </v-tooltip>
+              </div>
               <v-text-field v-model.number="nodeBandwidthUp" type="number" density="compact" variant="outlined" hide-details placeholder="例如 500" class="mb-4" />
-              <div class="stat-label mb-1">下行带宽（Mbps）</div>
-              <div class="node-field-hint">节点下行能力，作为对端看到的链路容量上限</div>
+              <div class="stat-label mb-1 d-flex align-center">
+                下行带宽（Mbps）
+                <v-tooltip location="top" text="节点下行能力，作为对端看到的链路容量上限">
+                  <template #activator="{ props }"><v-icon v-bind="props" size="14" class="ml-1 info-icon">mdi-information-outline</v-icon></template>
+                </v-tooltip>
+              </div>
               <v-text-field v-model.number="nodeBandwidthDown" type="number" density="compact" variant="outlined" hide-details placeholder="例如 100" class="mb-4" />
-              <div class="stat-label mb-1">内网下行上限（Mbps）</div>
-              <div class="node-field-hint">对端为内网地址时额外施加的容量上限，留空继承下行带宽</div>
+              <div class="stat-label mb-1 d-flex align-center">
+                内网下行上限（Mbps）
+                <v-tooltip location="top" text="对端为内网地址时额外施加的容量上限，留空继承下行带宽">
+                  <template #activator="{ props }"><v-icon v-bind="props" size="14" class="ml-1 info-icon">mdi-information-outline</v-icon></template>
+                </v-tooltip>
+              </div>
               <v-text-field v-model.number="nodeIntranetCap" type="number" density="compact" variant="outlined" hide-details placeholder="留空使用下行带宽" class="mb-4" />
-              <div class="stat-label mb-1">共享监听地址（core 级）</div>
-              <div class="node-field-hint">所有网络共用；保存后原子热更新，已有连接不断开。可添加多个监听（TCP 与 QUIC 可使用同一端口）。</div>
+              <div class="stat-label mb-1 d-flex align-center">
+                共享监听地址（core 级）
+                <v-tooltip location="top" text="所有网络共用；保存后原子热更新，已有连接不断开。可添加多个监听（TCP 与 QUIC 可使用同一端口）。">
+                  <template #activator="{ props }"><v-icon v-bind="props" size="14" class="ml-1 info-icon">mdi-information-outline</v-icon></template>
+                </v-tooltip>
+              </div>
               <div v-for="(l, i) in nodeSharedListeners" :key="'sl' + i" class="shared-listener-row">
                 <v-select v-model="l.proto" :items="sharedProtoOptions" density="compact" variant="outlined" hide-details class="proto-select" />
                 <v-text-field v-model="l.addr" density="compact" variant="outlined" hide-details placeholder="0.0.0.0:12401" />
                 <v-btn size="small" variant="text" icon="mdi-delete-outline" @click="nodeSharedListeners.splice(i, 1)" />
               </div>
               <v-btn size="small" variant="text" prepend-icon="mdi-plus" class="mb-4" @click="nodeSharedListeners.push({ proto: 'tcp', addr: '0.0.0.0:12401' })">添加共享监听</v-btn>
-              <div class="stat-label mb-1">公网下行上限（Mbps）</div>
-              <div class="node-field-hint">对端为公网地址时额外施加的容量上限，留空继承下行带宽</div>
+              <div class="stat-label mb-1 d-flex align-center">
+                公网下行上限（Mbps）
+                <v-tooltip location="top" text="对端为公网地址时额外施加的容量上限，留空继承下行带宽">
+                  <template #activator="{ props }"><v-icon v-bind="props" size="14" class="ml-1 info-icon">mdi-information-outline</v-icon></template>
+                </v-tooltip>
+              </div>
               <v-text-field v-model.number="nodeInternetCap" type="number" density="compact" variant="outlined" hide-details placeholder="留空使用下行带宽" class="mb-4" />
               <v-btn color="primary" :loading="savingNodeSettings" @click="saveNodeSettings">保存</v-btn>
             </div>
@@ -331,7 +363,7 @@ const headers = computed(() => [
   { title: t('nodes.columns.name'), key: 'alias', width: 220 },
   { title: t('nodes.columns.vpnIp'), key: 'vpnIp', width: 132 },
   { title: t('nodes.columns.publicIp'), key: 'publicIp', width: 180 },
-  { title: t('nodes.columns.version'), key: 'version', width: 100 },
+  { title: t('nodes.columns.version'), key: 'version', width: 190 },
   { title: t('nodes.columns.cpu'), key: 'cpu', width: 160 },
   { title: t('nodes.columns.mem'), key: 'mem', width: 160 },
   { title: t('nodes.columns.network'), key: 'traffic', sortable: false, width: 200 },
@@ -365,6 +397,9 @@ const nodeAlias = ref('')
 const nodeBandwidthUp = ref('')
 const nodeBandwidthDown = ref('')
 const nodeIntranetCap = ref('')
+const nodeCountry = ref('')
+const nodeLat = ref('')
+const nodeLon = ref('')
 const nodeInternetCap = ref('')
 const nodeSharedListeners = ref([])
 const sharedProtoOptions = ['tcp', 'udp', 'quic', 'ws', 'wss']
@@ -547,6 +582,9 @@ async function saveNodeSettings() {
     const internet = nodeInternetCap.value === '' ? null : Number(nodeInternetCap.value)
     const res = await api.setNodeSettings(detail.value.node_id, {
       alias: nodeAlias.value,
+      country_code: nodeCountry.value,
+      latitude: nodeLat.value,
+      longitude: nodeLon.value,
       bandwidth_up_mbps: up,
       bandwidth_down_mbps: down,
       bandwidth_intranet_down_mbps: intranet,
@@ -558,6 +596,9 @@ async function saveNodeSettings() {
     })
     if (!res.ok) throw new Error(res.error || 'save failed')
     detail.value.alias = nodeAlias.value
+    detail.value.country_code = nodeCountry.value
+    detail.value.latitude = nodeLat.value === '' ? detail.value.latitude : Number(nodeLat.value)
+    detail.value.longitude = nodeLon.value === '' ? detail.value.longitude : Number(nodeLon.value)
     detail.value.bandwidth_up_mbps = up
     detail.value.bandwidth_down_mbps = down
     detail.value.bandwidth_intranet_down_mbps = intranet
@@ -656,7 +697,7 @@ function ipInfo(item, kind) {
   const inst = networksOf(item)[0]
   const v4 = kind === 'vpn' ? inst?.ipv4 : item.public_ipv4
   const v6 = kind === 'vpn' ? inst?.ipv6 : item.public_ipv6
-  return { v4: v4 || '', v6: shortIp(v6) }
+  return { v4: v4 || '', v6: shortIp(v6), v6full: v6 || '' }
 }
 
 function flagUrl(item) {
@@ -700,6 +741,9 @@ async function open(item) {
   nodeBandwidthUp.value = item.bandwidth_up_mbps ?? item.bandwidth_mbps ?? ''
   nodeBandwidthDown.value = item.bandwidth_down_mbps ?? item.bandwidth_mbps ?? ''
   nodeIntranetCap.value = item.bandwidth_intranet_down_mbps ?? ''
+  nodeCountry.value = item.country_code || ''
+  nodeLat.value = item.latitude ?? ''
+  nodeLon.value = item.longitude ?? ''
   nodeSharedListeners.value = String(item.shared_listeners || '')
     .split(',')
     .map((url) => url.trim())
@@ -882,6 +926,8 @@ onBeforeUnmount(() => {
 .meter-track { display: block; width: 120px; height: 4px; margin-top: 3px; border-radius: 999px; background: rgba(var(--v-theme-on-surface), .14); overflow: hidden; }
 .meter-value { white-space: nowrap; }
 .meter-fill { height: 100%; border-radius: 999px; transition: width .3s ease, background .3s ease; }
+.version-cell { white-space: nowrap; }
+.info-icon { color: rgba(var(--v-theme-on-surface), .45); cursor: help; }
 .ip-v6 { color: var(--dok-subtle); }
 .node-flag { width: 24px; height: 16px; border-radius: 2px; object-fit: cover; flex: 0 0 auto; }
 .node-host { font-weight: 500; }

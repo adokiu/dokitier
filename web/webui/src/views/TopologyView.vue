@@ -33,7 +33,7 @@
     </div>
     <v-card ref="cardEl" class="pa-2 topology-card">
       <div v-show="viewMode !== 'traffic' && viewMode !== 'latency' && viewMode !== 'loss' && viewMode !== 'geo'" ref="chartEl" class="topology-chart"></div>
-      <GeoGlobe v-if="viewMode === 'geo'" :geo="geoModel" />
+      <GeoGlobe v-if="viewMode === 'geo'" :geo="geoModel" @select-city="openGeoCity" />
       <div v-if="viewMode === 'traffic' || viewMode === 'latency' || viewMode === 'loss'" class="matrix-view">
         <div class="matrix-inner">
           <div class="matrix-scale">
@@ -79,11 +79,15 @@
           </div>
         </div>
       </div>
-      <div v-if="viewMode === 'detail' && routePath.length" class="route-panel">
+      <div v-if="viewMode === 'detail' && routeMode" class="route-panel">
         <div class="route-title">
-          路由路径 ({{ routePath.length - 1 }} 跳 / {{ routeLatency != null ? routeLatency.toFixed(2) + ' ms' : '-' }})
+          <template v-if="routePath.length">
+            路由路径 ({{ routePath.length - 1 }} 跳 / {{ routeLatency != null ? routeLatency.toFixed(2) + ' ms' : '-' }})
+          </template>
+          <template v-else>{{ routeStart == null ? '点击起点节点' : '点击终点节点' }}</template>
+          <v-btn size="x-small" variant="text" class="ml-2" @click="toggleRoute">清除</v-btn>
         </div>
-        <div class="route-path">{{ routePath.map(nodeLabel).join(' → ') }}</div>
+        <div v-if="routePath.length" class="route-path">{{ routePath.map(nodeLabel).join(' → ') }}</div>
       </div>
     </v-card>
 
@@ -189,6 +193,23 @@
       </template>
     </DetailDrawer>
 
+    <DetailDrawer v-model="geoDrawer" :title="geoCity ? geoCity.city : ''" :subtitle="geoCity ? `${geoCity.nodes} 台节点` : ''" :width="420">
+      <div v-if="geoCity" class="geo-city-list">
+        <button
+          v-for="member in geoCity.members || []"
+          :key="member.peer_id"
+          class="geo-city-item"
+          @click="openGeoMember(member)"
+        >
+          <span class="geo-city-item__name">{{ geoMemberLabel(member) }}</span>
+          <span class="geo-city-item__meta">
+            <span>{{ member.ipv4 || '-' }}</span>
+            <span class="geo-city-item__group">{{ member.group || 'default' }}</span>
+          </span>
+        </button>
+      </div>
+    </DetailDrawer>
+
     <HoverCard :visible="hover.visible" :x="hover.x" :y="hover.y">
       <template #title>{{ hover.title }}</template>
       <div v-for="row in hover.rows" :key="row.label" class="dok-hover-card__row">
@@ -227,6 +248,8 @@ let height = 640
 const networkFilter = ref(null)
 const networkOptions = ref([{ title: '全部网络', value: '' }])
 const routeMode = ref(false)
+const geoDrawer = ref(false)
+const geoCity = ref(null)
 const routeStart = ref(null)
 const routeEnd = ref(null)
 const routePath = ref([])
@@ -342,6 +365,22 @@ const nodeNeighbors = computed(() => {
 function openNode(node) {
   selected.value = { ...node, kind: 'node' }
   drawer.value = true
+}
+
+function openGeoCity(city) {
+  geoCity.value = city
+  geoDrawer.value = true
+}
+
+function geoMemberLabel(member) {
+  return member.alias || member.hostname || String(member.peer_id)
+}
+
+function openGeoMember(member) {
+  const peer = Number(member.peer_id)
+  const node = (graph.nodes || []).find((n) => n.peer_id === peer) || { ...member, peer_id: peer }
+  geoDrawer.value = false
+  openNode(node)
 }
 
 function nodeName(id) {
@@ -2082,6 +2121,8 @@ function buildDetailOption() {
     dim: false,
     selected: focusId != null && n.peer_id === focusId,
     route: routeNodes.has(n.peer_id),
+    routeStart: n.peer_id === routeStart.value,
+    routeEnd: n.peer_id === routeEnd.value,
     multi: multiSelected.value.includes(n.peer_id),
   }))
 
@@ -2220,6 +2261,23 @@ function buildDetailOption() {
           const r = 12 * view.scale
           const dark = document.querySelector('.v-application')?.classList.contains('v-theme--PurpleThemeDark')
           const children = [
+            ...(d.routeStart || d.routeEnd
+              ? [{
+                  type: 'rect',
+                  shape: {
+                    x: d.p.x - w / 2 - 5,
+                    y: d.p.y - h / 2 - 5,
+                    width: w + 10,
+                    height: h + 10,
+                    r: r + 4,
+                  },
+                  style: {
+                    stroke: d.routeStart ? '#f2c94c' : '#eb5757',
+                    lineWidth: 2.5,
+                    fill: 'none',
+                  },
+                }]
+              : []),
             {
               type: 'rect',
               shape: { x: d.p.x - w / 2, y: d.p.y - h / 2, width: w, height: h, r },
@@ -2988,6 +3046,9 @@ function apply() {
     buildMatrixModel()
     return
   }
+  // the globe renders itself from geoModel; do not rebuild the empty echarts
+  // option on every realtime tick
+  if (viewMode.value === 'geo') return
   if (chart) chart.setOption(buildOption(), true)
 }
 
@@ -3357,8 +3418,24 @@ function setupDrag() {
     zr.setCursorStyle('default')
   }
 
+  zr.on('click', (e) => {
+    if (viewMode.value !== 'detail' || !routeMode.value) return
+    const id = hitNode(e.offsetX, e.offsetY)
+    if (id == null) return
+    const node = (graph.nodes || []).find((n) => n.peer_id === id)
+    if (!node) return
+    pickRouteNode({ ...node, peer_id: id })
+    suppressClick = true
+  })
+
   zr.on('mousedown', (e) => {
     if (viewMode.value !== 'detail') return
+    // while routing, clicks only pick endpoints - do not drag/pan/select
+    if (routeMode.value) {
+      zr.setCursorStyle('crosshair')
+      suppressClick = true
+      return
+    }
     const native = e.event || {}
     const id = hitNode(e.offsetX, e.offsetY)
     const world = toWorld(e.offsetX, e.offsetY)
@@ -3401,7 +3478,7 @@ function setupDrag() {
       zr.setCursorStyle('grabbing')
     } else {
       pan = { x: e.offsetX, y: e.offsetY, tx: view.tx, ty: view.ty }
-      zr.setCursorStyle('grabbing')
+      zr.setCursorStyle(routeMode.value ? 'crosshair' : 'grabbing')
     }
   })
 
@@ -3643,7 +3720,7 @@ function connectBoardEvents() {
       const data = JSON.parse(ev.data)
       if (!data.graph || !(data.graph.nodes || []).length) return
       const wasEmpty = !(graph.nodes || []).length
-      ingestBoard({ graph: data.graph })
+      ingestBoard({ graph: data.graph, geo: data.geo })
       if (wasEmpty) computeLayout()
       apply()
       if (selected.value && selected.value.kind === 'edge') {
@@ -3701,10 +3778,7 @@ onMounted(async () => {
       hoverFocus.value = null
       openEdge(data)
     } else if (series === 'nodes') {
-      if (routeMode.value) {
-        pickRouteNode(data)
-        return
-      }
+      if (routeMode.value) return
       hoverFocus.value = data.peer_id
       openNode(data)
     } else {
@@ -3793,6 +3867,12 @@ onBeforeUnmount(() => {
 }
 
 .topology-chart { width:100%;height:100% }
+.geo-city-list { display:flex; flex-direction:column; gap:6px }
+.geo-city-item { display:flex; flex-direction:column; align-items:flex-start; gap:2px; width:100%; text-align:left; padding:8px 10px; border-radius:8px; border:1px solid rgba(var(--v-theme-on-surface),.10); background:transparent; color:inherit; cursor:pointer }
+.geo-city-item:hover { background:rgba(var(--v-theme-on-surface),.06) }
+.geo-city-item__name { font-weight:600; font-size:13px }
+.geo-city-item__meta { display:flex; gap:8px; font-size:11.5px; color:rgba(var(--v-theme-on-surface),.6) }
+.geo-city-item__group { color:rgb(var(--v-theme-primary)) }
 .route-panel { position:absolute;right:12px;top:12px;max-width:60%;padding:10px 12px;border:1px solid rgba(var(--v-theme-on-surface),.16);border-radius:12px;background:rgba(var(--v-theme-surface),.82);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);z-index:4 }
 .route-title { font-size:11px;font-weight:600;color:rgba(var(--v-theme-on-surface),.55);margin-bottom:4px }
 .route-path { font-size:12.5px;color:rgba(var(--v-theme-on-surface),.86) }

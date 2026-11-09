@@ -662,7 +662,7 @@ async fn update_public_ip(db: &AnyPool, node_id: &str, v4: Option<&str>, v6: Opt
         .bind(v4).bind(v6).bind(node_id).execute(db).await;
 }
 
-const GEO_PROVIDERS: [&str; 4] = ["ipwho.is", "ip.sb", "ipinfo.io", "ipapi.co"];
+const GEO_PROVIDERS: [&str; 5] = ["ip9.com.cn", "ipwho.is", "ipinfo.io", "ip.sb", "ipapi.co"];
 
 async fn get_setting(db: &AnyPool, key: &str) -> Option<String> {
     let row: Option<(String,)> = sqlx::query_as(&q("SELECT v FROM settings WHERE k = ?"))
@@ -759,22 +759,53 @@ fn geo_str(value: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-async fn fetch_geo(client: &reqwest::Client, provider: &str, ip: &str) -> Option<GeoInfo> {
-    let url = match provider {
-        "ip.sb" => format!("https://api.ip.sb/geoip/{ip}"),
+const GEO_RESOLVER_VERSION: &str = "ip9-v1";
+const DEFAULT_GEO_PROVIDER: &str = "ip9.com.cn";
+
+fn provider_url(provider: &str, ip: &str) -> String {
+    match provider {
+        "ip9.com.cn" => format!("https://ip9.com.cn/get?ip={ip}"),
         "ipinfo.io" => format!("https://ipinfo.io/{ip}/json"),
+        "ip.sb" => format!("https://api.ip.sb/geoip/{ip}"),
         "ipapi.co" => format!("https://ipapi.co/{ip}/json/"),
         _ => format!("https://ipwho.is/{ip}"),
-    };
-    let response = client.get(url).send().await.ok()?;
-    let value: Value = response.json().await.ok()?;
-    // ipwho.is signals failures with success=false
-    if value.get("success").and_then(|v| v.as_bool()) == Some(false) {
-        return None;
     }
-    let country = geo_str(&value, &["country_code", "country", "countryCode"]).map(|s| s.to_lowercase());
-    let city = geo_str(&value, &["city", "region", "region_name"]);
-    let (mut lat, mut lon) = (geo_f64(&value, &["latitude", "lat"]), geo_f64(&value, &["longitude", "lon"]));
+}
+
+/// Location from the configured provider. ip9.com.cn is the default because it
+/// resolves Chinese cities at city level (e.g. Qingdao instead of Jinan).
+async fn fetch_geo(client: &reqwest::Client, provider: &str, ip: &str) -> Option<GeoInfo> {
+    let value: Value = client
+        .get(provider_url(provider, ip))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    if let Some(success) = value.get("success").and_then(|v| v.as_bool()) {
+        if !success {
+            return None;
+        }
+    }
+    if provider == "ip9.com.cn" {
+        if value.get("ret").and_then(|v| v.as_i64()) != Some(200) {
+            return None;
+        }
+        let data = value.get("data")?;
+        return Some(GeoInfo {
+            country: geo_str(data, &["country_code"]).map(|s| s.to_lowercase()),
+            city: geo_str(data, &["city"]),
+            lat: geo_f64(data, &["lat", "latitude"]),
+            lon: geo_f64(data, &["lng", "longitude", "lon"]),
+        });
+    }
+    let country = geo_str(&value, &["country_code", "countryCode", "country"]).map(|s| s.to_lowercase());
+    let city = geo_str(&value, &["city"]);
+    let (mut lat, mut lon) = (
+        geo_f64(&value, &["latitude", "lat"]),
+        geo_f64(&value, &["longitude", "lon", "lng"]),
+    );
     if lat.is_none() || lon.is_none() {
         if let Some(loc) = value.get("loc").and_then(|v| v.as_str()) {
             let mut parts = loc.split(',');
@@ -789,35 +820,35 @@ async fn fetch_geo(client: &reqwest::Client, provider: &str, ip: &str) -> Option
 }
 
 async fn lookup_and_store_geo(state: AppState, node_id: String, ip: String) {
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(6)).build() {
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(8)).build() {
         Ok(client) => client,
         Err(_) => return,
     };
-    let configured = get_setting(&state.db, "geo_provider").await.unwrap_or_else(|| "ipwho.is".to_string());
-    let mut order = vec![configured.clone()];
-    for provider in GEO_PROVIDERS {
-        if provider != configured {
-            order.push(provider.to_string());
+    let provider = get_setting(&state.db, "geo_provider")
+        .await
+        .unwrap_or_else(|| DEFAULT_GEO_PROVIDER.to_string());
+    let Some(info) = fetch_geo(&client, &provider, &ip).await else { return };
+    if let Some(code) = info.country.clone() {
+        if code.len() == 2 {
+            let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
+                .bind(&code).bind(&node_id).execute(&state.db).await;
         }
     }
-    for provider in order {
-        if let Some(info) = fetch_geo(&client, &provider, &ip).await {
-            if let Some(code) = info.country.clone() {
-                if code.len() == 2 {
-                    let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
-                        .bind(&code).bind(&node_id).execute(&state.db).await;
-                }
-            }
-            let _ = sqlx::query(&q("UPDATE nodes SET city = COALESCE(?, city), latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude) WHERE node_id = ?"))
-                .bind(info.city.clone()).bind(info.lat).bind(info.lon).bind(&node_id)
-                .execute(&state.db).await;
-            if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
-                if info.country.is_some() { rt.country_code = info.country.clone(); }
-                if info.city.is_some() { rt.city = info.city.clone(); }
-                if info.lat.is_some() { rt.lat = info.lat; }
-                if info.lon.is_some() { rt.lon = info.lon; }
-            }
-            return;
+    let _ = sqlx::query(&q("UPDATE nodes SET city = COALESCE(?, city), latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude) WHERE node_id = ?"))
+        .bind(info.city.clone()).bind(info.lat).bind(info.lon).bind(&node_id)
+        .execute(&state.db).await;
+    if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+        if info.country.is_some() {
+            rt.country_code = info.country.clone();
+        }
+        if info.city.is_some() {
+            rt.city = info.city.clone();
+        }
+        if info.lat.is_some() {
+            rt.lat = info.lat;
+        }
+        if info.lon.is_some() {
+            rt.lon = info.lon;
         }
     }
 }
@@ -2006,7 +2037,9 @@ async fn set_routing_settings(State(state): State<AppState>, Json(body): Json<Va
 }
 
 async fn get_geo_setting(State(state): State<AppState>) -> Json<Value> {
-    let provider = get_setting(&state.db, "geo_provider").await.unwrap_or_else(|| "ipwho.is".to_string());
+    let provider = get_setting(&state.db, "geo_provider")
+        .await
+        .unwrap_or_else(|| DEFAULT_GEO_PROVIDER.to_string());
     Json(json!({"provider": provider, "options": GEO_PROVIDERS}))
 }
 
@@ -2021,6 +2054,7 @@ async fn set_geo_setting(State(state): State<AppState>, Json(body): Json<GeoSett
     }
     set_setting(&state.db, "geo_provider", &body.provider).await;
     state.geo_attempts.clear();
+    spawn_geo_reresolve_all(state.clone());
     Json(json!({"ok": true, "provider": body.provider}))
 }
 
@@ -2630,6 +2664,9 @@ async fn list_nodes(State(state): State<AppState>) -> Json<Value> {
 #[derive(serde::Deserialize)]
 struct NodeSettingsBody {
     alias: Option<String>,
+    country_code: Option<String>,
+    latitude: Option<String>,
+    longitude: Option<String>,
     bandwidth_mbps: Option<f32>,
     bandwidth_up_mbps: Option<f32>,
     bandwidth_down_mbps: Option<f32>,
@@ -2663,6 +2700,24 @@ async fn send_shared_listeners(state: &AppState, node_id: &str, listeners: Vec<S
     }
 }
 
+fn spawn_node_geo_refresh(state: AppState, node_id: String) {
+    tokio::spawn(async move {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT public_ipv4, public_ipv6 FROM nodes WHERE node_id = ?",
+        )
+        .bind(&node_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        if let Some((v4, v6)) = row {
+            if let Some(ip) = v4.or(v6) {
+                lookup_and_store_geo(state, node_id, ip).await;
+            }
+        }
+    });
+}
+
 async fn set_node_settings(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
@@ -2671,6 +2726,45 @@ async fn set_node_settings(
     if let Some(alias) = body.alias.as_deref() {
         let _ = sqlx::query(&q("UPDATE nodes SET alias = ? WHERE node_id = ?"))
             .bind(alias.trim()).bind(&node_id).execute(&state.db).await;
+    }
+    if let Some(country) = body.country_code.as_deref() {
+        let code = country.trim().to_lowercase();
+        if code.is_empty() {
+            spawn_node_geo_refresh(state.clone(), node_id.clone());
+        } else if code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic()) {
+            let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
+                .bind(&code).bind(&node_id).execute(&state.db).await;
+            if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+                rt.country_code = Some(code);
+            }
+        } else {
+            return Json(json!({"ok": false, "error": "国家代码必须是两位字母"}));
+        }
+    }
+    if body.latitude.is_some() || body.longitude.is_some() {
+        let parse = |value: &Option<String>| -> Result<Option<f64>, ()> {
+            match value.as_deref().map(str::trim) {
+                None | Some("") => Ok(None),
+                Some(text) => text.parse::<f64>().map(Some).map_err(|_| ()),
+            }
+        };
+        let (Ok(lat), Ok(lon)) = (parse(&body.latitude), parse(&body.longitude)) else {
+            return Json(json!({"ok": false, "error": "经纬度必须是数字"}));
+        };
+        if lat.is_none() && lon.is_none() {
+            spawn_node_geo_refresh(state.clone(), node_id.clone());
+        } else {
+            let _ = sqlx::query(&q("UPDATE nodes SET latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude) WHERE node_id = ?"))
+                .bind(lat).bind(lon).bind(&node_id).execute(&state.db).await;
+            if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+                if lat.is_some() {
+                    rt.lat = lat;
+                }
+                if lon.is_some() {
+                    rt.lon = lon;
+                }
+            }
+        }
     }
     if let Some(bw) = body.bandwidth_mbps {
         let _ = sqlx::query(&q("UPDATE nodes SET bandwidth_mbps = ?, bandwidth_up_mbps = ?, bandwidth_down_mbps = ? WHERE node_id = ?"))
@@ -3262,6 +3356,26 @@ fn spawn_history_maintenance(state: AppState) {
 /// Load persisted geolocation into the runtime registry and resolve any node
 /// that still lacks country/city. This keeps flags for nodes that connected in
 /// the past (including offline ones) and prevents "UN" right after a restart.
+/// Re-run IP geolocation for every node that has a known public address. Used
+/// when the provider changes and once on startup when the resolver version is
+/// newer than the data already stored.
+fn spawn_geo_reresolve_all(state: AppState) {
+    tokio::spawn(async move {
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT node_id, public_ipv4, public_ipv6 FROM nodes WHERE public_ipv4 IS NOT NULL OR public_ipv6 IS NOT NULL",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        for (node_id, v4, v6) in rows {
+            if let Some(ip) = v4.or(v6) {
+                let state_clone = state.clone();
+                tokio::spawn(async move { lookup_and_store_geo(state_clone, node_id, ip).await });
+            }
+        }
+    });
+}
+
 fn spawn_geo_backfill(state: AppState) {
     tokio::spawn(async move {
         #[allow(clippy::type_complexity)]
@@ -3271,6 +3385,11 @@ fn spawn_geo_backfill(state: AppState) {
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
+        let stored_version = get_setting(&state.db, "geo_resolver").await;
+        let resolve_all = stored_version.as_deref() != Some(GEO_RESOLVER_VERSION);
+        if resolve_all {
+            let _ = set_setting(&state.db, "geo_resolver", GEO_RESOLVER_VERSION).await;
+        }
         for (node_id, country, city, lat, lon, v4, v6) in rows {
             if country.is_some() || city.is_some() {
                 let mut rt = state.node_rt.entry(node_id.clone()).or_default();
@@ -3287,7 +3406,7 @@ fn spawn_geo_backfill(state: AppState) {
                     rt.lon = lon;
                 }
             }
-            if country.is_none() || city.is_none() {
+            if resolve_all || country.is_none() || city.is_none() {
                 if let Some(ip) = v4.or(v6) {
                     let state_clone = state.clone();
                     let id = node_id.clone();
@@ -3431,8 +3550,19 @@ fn build_geo_view(node_list: &[Value], edge_list: &[Value]) -> Value {
         peer_city.insert(peer, (key.clone(), lat, lon, city.to_string()));
         let entry = cities.entry(key).or_insert_with(|| json!({
             "city": city, "lat": lat, "lon": lon, "nodes": 0, "group": group,
+            "members": [],
         }));
         entry["nodes"] = json!(entry["nodes"].as_u64().unwrap_or(0) + 1);
+        if let Some(members) = entry["members"].as_array_mut() {
+            members.push(json!({
+                "peer_id": peer as u64,
+                "hostname": n.get("hostname").cloned().unwrap_or(Value::Null),
+                "alias": n.get("alias").cloned().unwrap_or(Value::Null),
+                "ipv4": n.get("ipv4").cloned().unwrap_or(Value::Null),
+                "instance_id": n.get("instance_id").cloned().unwrap_or(Value::Null),
+                "group": n.get("p2p_group").cloned().unwrap_or(Value::Null),
+            }));
+        }
     }
     let mut links: std::collections::BTreeMap<(String, String), Value> = std::collections::BTreeMap::new();
     for e in edge_list {
@@ -4827,4 +4957,5 @@ mod runtime_tests {
         let frame: Value = serde_json::from_str(&topology_event_json(body)).unwrap();
         assert_eq!(frame["geo"]["cities"].as_array().unwrap().len(), 1, "SSE frame lost geo: {frame}");
     }
+
 }
