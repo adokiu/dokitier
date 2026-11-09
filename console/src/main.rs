@@ -193,6 +193,9 @@ struct NodeRt {
     public_ipv4: Option<String>,
     public_ipv6: Option<String>,
     country_code: Option<String>,
+    city: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
     cpu_pct: f32,
     mem_pct: f32,
     mem_used: i64,
@@ -299,6 +302,9 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
             public_ipv4 VARCHAR(64),
             public_ipv6 VARCHAR(128),
             country_code VARCHAR(8),
+            city VARCHAR(128),
+            latitude DOUBLE,
+            longitude DOUBLE,
             rx_bps DOUBLE,
             tx_bps DOUBLE,
             alias VARCHAR(255),
@@ -321,6 +327,9 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
             public_ipv4 TEXT,
             public_ipv6 TEXT,
             country_code TEXT,
+            city TEXT,
+            latitude REAL,
+            longitude REAL,
             rx_bps REAL,
             tx_bps REAL,
             alias TEXT,
@@ -345,11 +354,27 @@ async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
     sqlx::query(instances_ddl).execute(db).await?;
     let _ = sqlx::query("ALTER TABLE nodes ADD COLUMN token TEXT").execute(db).await;
     for column in [
-        "public_ipv4 TEXT", "public_ipv6 TEXT", "country_code TEXT", "rx_bps REAL", "tx_bps REAL", "node_uuid TEXT", "system_info TEXT", "traffic TEXT", "bandwidth_mbps REAL", "bandwidth_up_mbps REAL", "bandwidth_down_mbps REAL", "bandwidth_intranet_down_mbps REAL", "bandwidth_internet_down_mbps REAL", "shared_listeners TEXT",
+        "public_ipv4 TEXT", "public_ipv6 TEXT", "country_code TEXT", "city TEXT", "rx_bps REAL", "tx_bps REAL", "node_uuid TEXT", "system_info TEXT", "traffic TEXT", "bandwidth_mbps REAL", "bandwidth_up_mbps REAL", "bandwidth_down_mbps REAL", "bandwidth_intranet_down_mbps REAL", "bandwidth_internet_down_mbps REAL", "shared_listeners TEXT",
         "alias TEXT", "cpu_pct REAL", "mem_pct REAL", "mem_used BIGINT", "mem_total BIGINT",
     ] {
         let _ = sqlx::query(&format!("ALTER TABLE nodes ADD COLUMN {column}")).execute(db).await;
     }
+    // geolocation columns: postgres needs double precision (REAL decodes as f32
+    // and would break f64 deserialisation), sqlite/mysql are fine with REAL/DOUBLE
+    if POSTGRES.load(Ordering::Relaxed) {
+        for column in ["city TEXT", "latitude DOUBLE PRECISION", "longitude DOUBLE PRECISION"] {
+            let _ = sqlx::query(&format!("ALTER TABLE nodes ADD COLUMN {column}")).execute(db).await;
+        }
+        // migrate the earlier REAL columns if they already exist
+        for column in ["latitude", "longitude"] {
+            let _ = sqlx::query(&format!("ALTER TABLE nodes ALTER COLUMN {column} TYPE DOUBLE PRECISION")).execute(db).await;
+        }
+    } else {
+        for column in ["city TEXT", "latitude REAL", "longitude REAL"] {
+            let _ = sqlx::query(&format!("ALTER TABLE nodes ADD COLUMN {column}")).execute(db).await;
+        }
+    }
+
     for column in ["a_uuid TEXT", "b_uuid TEXT"] {
         let _ = sqlx::query(&format!("ALTER TABLE link_metrics ADD COLUMN {column}")).execute(db).await;
     }
@@ -699,24 +724,76 @@ fn inject_instance_id(text: &str, instance_id: &str) -> String {
     toml::to_string(&value).unwrap_or_else(|_| text.to_string())
 }
 
-async fn fetch_country(client: &reqwest::Client, provider: &str, ip: &str) -> Option<String> {
-    let (url, field) = match provider {
-        "ip.sb" => (format!("https://api.ip.sb/geoip/{ip}"), "country_code"),
-        "ipinfo.io" => (format!("https://ipinfo.io/{ip}/json"), "country"),
-        "ipapi.co" => (format!("https://ipapi.co/{ip}/json/"), "country_code"),
-        _ => (format!("https://ipwho.is/{ip}"), "country_code"),
+#[derive(Clone, Debug)]
+struct GeoInfo {
+    country: Option<String>,
+    city: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+}
+
+fn geo_f64(value: &Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Some(v) = value.get(*key) {
+            if let Some(n) = v.as_f64() {
+                return Some(n);
+            }
+            if let Some(text) = v.as_str() {
+                if let Ok(n) = text.parse::<f64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn geo_str(value: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(s.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn fetch_geo(client: &reqwest::Client, provider: &str, ip: &str) -> Option<GeoInfo> {
+    let url = match provider {
+        "ip.sb" => format!("https://api.ip.sb/geoip/{ip}"),
+        "ipinfo.io" => format!("https://ipinfo.io/{ip}/json"),
+        "ipapi.co" => format!("https://ipapi.co/{ip}/json/"),
+        _ => format!("https://ipwho.is/{ip}"),
     };
     let response = client.get(url).send().await.ok()?;
     let value: Value = response.json().await.ok()?;
-    value.get(field).and_then(|v| v.as_str()).map(|s| s.to_lowercase())
+    // ipwho.is signals failures with success=false
+    if value.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        return None;
+    }
+    let country = geo_str(&value, &["country_code", "country", "countryCode"]).map(|s| s.to_lowercase());
+    let city = geo_str(&value, &["city", "region", "region_name"]);
+    let (mut lat, mut lon) = (geo_f64(&value, &["latitude", "lat"]), geo_f64(&value, &["longitude", "lon"]));
+    if lat.is_none() || lon.is_none() {
+        if let Some(loc) = value.get("loc").and_then(|v| v.as_str()) {
+            let mut parts = loc.split(',');
+            lat = parts.next().and_then(|v| v.trim().parse::<f64>().ok());
+            lon = parts.next().and_then(|v| v.trim().parse::<f64>().ok());
+        }
+    }
+    if country.is_none() && city.is_none() && lat.is_none() {
+        return None;
+    }
+    Some(GeoInfo { country, city, lat, lon })
 }
 
-async fn lookup_and_store_country(db: AnyPool, node_id: String, ip: String) {
+async fn lookup_and_store_geo(state: AppState, node_id: String, ip: String) {
     let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(6)).build() {
         Ok(client) => client,
         Err(_) => return,
     };
-    let configured = get_setting(&db, "geo_provider").await.unwrap_or_else(|| "ipwho.is".to_string());
+    let configured = get_setting(&state.db, "geo_provider").await.unwrap_or_else(|| "ipwho.is".to_string());
     let mut order = vec![configured.clone()];
     for provider in GEO_PROVIDERS {
         if provider != configured {
@@ -724,12 +801,23 @@ async fn lookup_and_store_country(db: AnyPool, node_id: String, ip: String) {
         }
     }
     for provider in order {
-        if let Some(code) = fetch_country(&client, &provider, &ip).await {
-            if code.len() == 2 {
-                let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
-                    .bind(code).bind(&node_id).execute(&db).await;
-                return;
+        if let Some(info) = fetch_geo(&client, &provider, &ip).await {
+            if let Some(code) = info.country.clone() {
+                if code.len() == 2 {
+                    let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
+                        .bind(&code).bind(&node_id).execute(&state.db).await;
+                }
             }
+            let _ = sqlx::query(&q("UPDATE nodes SET city = COALESCE(?, city), latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude) WHERE node_id = ?"))
+                .bind(info.city.clone()).bind(info.lat).bind(info.lon).bind(&node_id)
+                .execute(&state.db).await;
+            if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+                if info.country.is_some() { rt.country_code = info.country.clone(); }
+                if info.city.is_some() { rt.city = info.city.clone(); }
+                if info.lat.is_some() { rt.lat = info.lat; }
+                if info.lon.is_some() { rt.lon = info.lon; }
+            }
+            return;
         }
     }
 }
@@ -2194,7 +2282,8 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
             if let Some(ip) = public_ipv4.clone().or(public_ipv6.clone()) {
                 let db = state.db.clone();
                 let id = node_id.clone();
-                tokio::spawn(async move { lookup_and_store_country(db, id, ip).await });
+                let state_for_geo = state.clone();
+                tokio::spawn(async move { lookup_and_store_geo(state_for_geo, id, ip).await });
             }
             Ok(())
         }
@@ -2220,7 +2309,8 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
                         state.geo_attempts.insert(node_id.clone(), now());
                         let db = state.db.clone();
                         let id = node_id.clone();
-                        tokio::spawn(async move { lookup_and_store_country(db, id, ip).await });
+                        let state_for_geo = state.clone();
+                tokio::spawn(async move { lookup_and_store_geo(state_for_geo, id, ip).await });
                     }
                 }
             }
@@ -2350,6 +2440,9 @@ struct NodeView {
     public_ipv4: Option<String>,
     public_ipv6: Option<String>,
     country_code: Option<String>,
+    city: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
     rx_bps: Option<f32>,
     tx_bps: Option<f32>,
     alias: Option<String>,
@@ -2370,12 +2463,25 @@ struct NodeView {
 }
 
 async fn nodes_payload(state: &AppState) -> Value {
-    // Static inventory (alias, uuid, configured bandwidth, listeners) comes from
-    // SQL; every realtime field comes from the in-memory runtime registry.
-    #[allow(clippy::type_complexity)]
-    let static_rows: Vec<(String, Option<String>, Option<String>, Option<String>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<String>)> = sqlx::query_as(&q(
-        "SELECT node_id, alias, country_code, node_uuid, bandwidth_mbps, bandwidth_up_mbps, bandwidth_down_mbps, bandwidth_intranet_down_mbps, bandwidth_internet_down_mbps, shared_listeners FROM nodes",
-    )).fetch_all(&state.db).await.unwrap_or_default();
+    // Static inventory (alias, uuid, country, geo, system info, configured
+    // bandwidth/listeners) comes from SQL; every realtime field comes from the
+    // in-memory runtime registry. Columns are read one by one so a single
+    // unknown/legacy column can never blank the whole node list.
+    let static_rows = match sqlx::query(&q(
+        "SELECT node_id, alias, country_code, node_uuid, city, latitude, longitude, \
+                bandwidth_mbps, bandwidth_up_mbps, bandwidth_down_mbps, \
+                bandwidth_intranet_down_mbps, bandwidth_internet_down_mbps, \
+                shared_listeners, system_info FROM nodes",
+    ))
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(?err, "node static metadata query failed");
+            Vec::new()
+        }
+    };
     let instance_rows = sqlx::query(&q("SELECT node_id, network, instance_id FROM network_instances"))
         .fetch_all(&state.db)
         .await
@@ -2391,16 +2497,42 @@ async fn nodes_payload(state: &AppState) -> Value {
         alias: Option<String>,
         country: Option<String>,
         uuid: Option<String>,
+        city: Option<String>,
+        lat: Option<f64>,
+        lon: Option<f64>,
         bw: Option<f32>,
         bw_up: Option<f32>,
         bw_down: Option<f32>,
         bw_intra: Option<f32>,
         bw_inet: Option<f32>,
         listeners: Option<String>,
+        system: Value,
     }
     let mut statics: std::collections::BTreeMap<String, Static> = std::collections::BTreeMap::new();
-    for (node_id, alias, country, uuid, bw, bw_up, bw_down, bw_intra, bw_inet, listeners) in static_rows {
-        statics.insert(node_id, Static { alias, country, uuid, bw, bw_up, bw_down, bw_intra, bw_inet, listeners });
+    for row in static_rows {
+        let node_id: String = row.try_get("node_id").unwrap_or_default();
+        if node_id.is_empty() {
+            continue;
+        }
+        let system_info: String = row.try_get("system_info").unwrap_or_default();
+        statics.insert(
+            node_id,
+            Static {
+                alias: row.try_get("alias").ok(),
+                country: row.try_get("country_code").ok(),
+                uuid: row.try_get("node_uuid").ok(),
+                city: row.try_get("city").ok(),
+                lat: row.try_get("latitude").ok().flatten(),
+                lon: row.try_get("longitude").ok().flatten(),
+                bw: row.try_get("bandwidth_mbps").ok().flatten(),
+                bw_up: row.try_get("bandwidth_up_mbps").ok().flatten(),
+                bw_down: row.try_get("bandwidth_down_mbps").ok().flatten(),
+                bw_intra: row.try_get("bandwidth_intranet_down_mbps").ok().flatten(),
+                bw_inet: row.try_get("bandwidth_internet_down_mbps").ok().flatten(),
+                listeners: row.try_get("shared_listeners").ok().flatten(),
+                system: serde_json::from_str(&system_info).unwrap_or(Value::Null),
+            },
+        );
     }
     let mut ids: std::collections::BTreeSet<String> = statics.keys().cloned().collect();
     ids.extend(state.node_rt.iter().map(|e| e.key().clone()));
@@ -2411,6 +2543,10 @@ async fn nodes_payload(state: &AppState) -> Value {
         let rt = state.node_rt.get(&node_id).map(|r| r.clone());
         let live = rt.filter(|r| now_ts - r.ts <= 30);
         let status = if live.is_some() { "online".to_string() } else { "offline".to_string() };
+        let system_info = match meta.map(|m| m.system.clone()) {
+            Some(value) if !value.is_null() => value,
+            _ => live.as_ref().map(|r| r.system.clone()).unwrap_or(Value::Null),
+        };
         nodes.push(NodeView {
             node_id: node_id.clone(),
             hostname: live.as_ref().map(|r| r.hostname.clone()).unwrap_or_default(),
@@ -2421,7 +2557,18 @@ async fn nodes_payload(state: &AppState) -> Value {
             status,
             public_ipv4: live.as_ref().and_then(|r| r.public_ipv4.clone()),
             public_ipv6: live.as_ref().and_then(|r| r.public_ipv6.clone()),
-            country_code: meta.and_then(|m| m.country.clone()),
+            country_code: meta
+                .and_then(|m| m.country.clone())
+                .or_else(|| live.as_ref().and_then(|r| r.country_code.clone())),
+            city: meta
+                .and_then(|m| m.city.clone())
+                .or_else(|| live.as_ref().and_then(|r| r.city.clone())),
+            latitude: meta
+                .and_then(|m| m.lat)
+                .or_else(|| live.as_ref().and_then(|r| r.lat)),
+            longitude: meta
+                .and_then(|m| m.lon)
+                .or_else(|| live.as_ref().and_then(|r| r.lon)),
             rx_bps: live.as_ref().map(|r| r.rx_bps as f32),
             tx_bps: live.as_ref().map(|r| r.tx_bps as f32),
             alias: meta.and_then(|m| m.alias.clone()),
@@ -2430,7 +2577,7 @@ async fn nodes_payload(state: &AppState) -> Value {
             mem_used: live.as_ref().map(|r| r.mem_used),
             mem_total: live.as_ref().map(|r| r.mem_total),
             node_uuid: meta.and_then(|m| m.uuid.clone()),
-            system_info: live.as_ref().map(|r| r.system.clone()).unwrap_or(Value::Null),
+            system_info,
             traffic: live.as_ref().map(|r| r.traffic.clone()).unwrap_or(Value::Null),
             bandwidth_mbps: meta.and_then(|m| m.bw),
             bandwidth_up_mbps: meta.and_then(|m| m.bw_up),
@@ -2447,8 +2594,37 @@ async fn nodes_payload(state: &AppState) -> Value {
     json!({"nodes": nodes})
 }
 
+/// Lightweight node list for the 1s realtime channel: identical live fields,
+/// but the per-node snapshot (full topology) and system info are fetched on
+/// demand by the detail endpoint. Keeps the list page smooth without slowing
+/// the refresh cadence.
+async fn nodes_payload_lite(state: &AppState) -> Value {
+    let mut full = nodes_payload(state).await;
+    let Some(nodes) = full.get_mut("nodes").and_then(|v| v.as_array_mut()) else { return full };
+    for node in nodes.iter_mut() {
+        let snapshot = node.get("snapshot").cloned().unwrap_or(Value::Null);
+        node.as_object_mut().map(|obj| obj.remove("snapshot"));
+        node.as_object_mut().map(|obj| obj.remove("system_info"));
+        let mut instances = Vec::new();
+        for inst in snapshot.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            let topo = inst.get("topology");
+            instances.push(json!({
+                "network_name": inst.get("network_name"),
+                "instance_id": inst.get("instance_id"),
+                "ipv4": inst.get("ipv4"),
+                "ipv6": inst.get("ipv6"),
+                "p2p_group": inst.get("p2p_group"),
+                "peer_count": topo.and_then(|t| t.get("nodes")).and_then(|v| v.as_array()).map(|v| v.len()).unwrap_or(0),
+                "edge_count": topo.and_then(|t| t.get("edges")).and_then(|v| v.as_array()).map(|v| v.len()).unwrap_or(0),
+            }));
+        }
+        node["instances"] = json!(instances);
+    }
+    full
+}
+
 async fn list_nodes(State(state): State<AppState>) -> Json<Value> {
-    Json(nodes_payload(&state).await)
+    Json(nodes_payload_lite(&state).await)
 }
 
 #[derive(serde::Deserialize)]
@@ -3083,6 +3259,45 @@ fn spawn_history_maintenance(state: AppState) {
     });
 }
 
+/// Load persisted geolocation into the runtime registry and resolve any node
+/// that still lacks country/city. This keeps flags for nodes that connected in
+/// the past (including offline ones) and prevents "UN" right after a restart.
+fn spawn_geo_backfill(state: AppState) {
+    tokio::spawn(async move {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<f64>, Option<f64>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT node_id, country_code, city, latitude, longitude, public_ipv4, public_ipv6 FROM nodes",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        for (node_id, country, city, lat, lon, v4, v6) in rows {
+            if country.is_some() || city.is_some() {
+                let mut rt = state.node_rt.entry(node_id.clone()).or_default();
+                if rt.country_code.is_none() {
+                    rt.country_code = country.clone();
+                }
+                if rt.city.is_none() {
+                    rt.city = city.clone();
+                }
+                if rt.lat.is_none() {
+                    rt.lat = lat;
+                }
+                if rt.lon.is_none() {
+                    rt.lon = lon;
+                }
+            }
+            if country.is_none() || city.is_none() {
+                if let Some(ip) = v4.or(v6) {
+                    let state_clone = state.clone();
+                    let id = node_id.clone();
+                    tokio::spawn(async move { lookup_and_store_geo(state_clone, id, ip).await });
+                }
+            }
+        }
+    });
+}
+
 fn spawn_snapshot_flusher(state: AppState) {
     tokio::spawn(async move {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
@@ -3197,6 +3412,58 @@ fn spawn_edge_rate_sampler(state: AppState) {
     });
 }
 
+/// Aggregate the scoped topology into the geographic model the globe renders:
+/// one point per city (real lat/lon from the geo API) and one arc per city pair.
+fn build_geo_view(node_list: &[Value], edge_list: &[Value]) -> Value {
+    let mut peer_city: std::collections::HashMap<u64, (String, f64, f64, String)> = std::collections::HashMap::new();
+    let mut cities: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for n in node_list {
+        let Some(peer) = n.get("peer_id").and_then(|v| v.as_u64()) else { continue };
+        let (Some(city), Some(lat), Some(lon)) = (
+            n.get("city").and_then(|v| v.as_str()),
+            n.get("lat").and_then(|v| v.as_f64()),
+            n.get("lon").and_then(|v| v.as_f64()),
+        ) else {
+            continue;
+        };
+        let group = n.get("p2p_group").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let key = format!("{}|{:.2}|{:.2}", city, lat, lon);
+        peer_city.insert(peer, (key.clone(), lat, lon, city.to_string()));
+        let entry = cities.entry(key).or_insert_with(|| json!({
+            "city": city, "lat": lat, "lon": lon, "nodes": 0, "group": group,
+        }));
+        entry["nodes"] = json!(entry["nodes"].as_u64().unwrap_or(0) + 1);
+    }
+    let mut links: std::collections::BTreeMap<(String, String), Value> = std::collections::BTreeMap::new();
+    for e in edge_list {
+        let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or(0);
+        let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
+        let (Some(ca), Some(cb)) = (peer_city.get(&a), peer_city.get(&b)) else { continue };
+        if ca.0 == cb.0 {
+            continue;
+        }
+        let key = if ca.0 < cb.0 { (ca.0.clone(), cb.0.clone()) } else { (cb.0.clone(), ca.0.clone()) };
+        let rx = e.get("rx_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let tx = e.get("tx_bps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let latency = e.get("latency_ms").and_then(|v| v.as_f64());
+        let entry = links.entry(key).or_insert_with(|| json!({
+            "a_city": ca.3, "a_lat": ca.1, "a_lon": ca.2,
+            "b_city": cb.3, "b_lat": cb.1, "b_lon": cb.2,
+            "traffic": 0.0, "latency_ms": latency,
+        }));
+        entry["traffic"] = json!(entry["traffic"].as_f64().unwrap_or(0.0) + rx + tx);
+        if let Some(lat) = latency {
+            let current = entry["latency_ms"].as_f64();
+            entry["latency_ms"] = json!(Some(current.map_or(lat, |c| c.min(lat))));
+        }
+    }
+    json!({
+        "cities": cities.values().cloned().collect::<Vec<_>>(),
+        "links": links.values().cloned().collect::<Vec<_>>(),
+        "has_geo": !cities.is_empty(),
+    })
+}
+
 async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filter: Option<&str>) -> Value {
     // realtime data comes exclusively from the in-memory runtime registry
     let fresh_before = now() - 30;
@@ -3245,11 +3512,28 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
             .fetch_all(&state.db)
             .await
             .unwrap_or_default();
+    let mut instance_nodes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (node_id, network, instance_id) in inst_rows {
-        if let Some(group) = cv_groups.get(&(node_id, network)) {
+        if let Some(group) = cv_groups.get(&(node_id.clone(), network)) {
             if !group.is_empty() {
-                instance_groups.insert(instance_id, group.clone());
+                instance_groups.insert(instance_id.clone(), group.clone());
             }
+        }
+        instance_nodes.insert(instance_id, node_id);
+    }
+    // real geolocation (city + lat/lon) resolved from the node public IP by the
+    // geo API; nodes without it simply do not appear on the globe
+    let geo_rows: Vec<(String, Option<String>, Option<String>, Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT node_id, country_code, city, latitude, longitude FROM nodes",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut node_geo: std::collections::HashMap<String, (String, String, f64, f64)> =
+        std::collections::HashMap::new();
+    for (node_id, country, city, lat, lon) in geo_rows {
+        if let (Some(city), Some(lat), Some(lon)) = (city, lat, lon) {
+            node_geo.insert(node_id, (country.unwrap_or_default(), city, lat, lon));
         }
     }
     for (node_id, snapshot) in &rows {
@@ -3273,6 +3557,18 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
                         .unwrap_or_else(|| if local { p2p_group.to_string() } else { String::new() });
                     node["p2p_group"] = json!(resolved_group);
                     node["agent_node_id"] = json!(node_id);
+                    let geo_owner = n
+                        .get("instance_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|uuid| instance_nodes.get(uuid))
+                        .cloned()
+                        .unwrap_or_else(|| node_id.clone());
+                    if let Some((country, city, lat, lon)) = node_geo.get(&geo_owner) {
+                        node["country_code"] = json!(country);
+                        node["city"] = json!(city);
+                        node["lat"] = json!(lat);
+                        node["lon"] = json!(lon);
+                    }
                     match nodes.entry((network.to_string(), peer_id as u32)) {
                         std::collections::btree_map::Entry::Occupied(mut e) => {
                             if local && !resolved_group.is_empty() {
@@ -3532,12 +3828,14 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
         node_list = merged_nodes.into_values().collect();
         edge_list = merged_edges.into_values().collect();
     }
+    let geo = build_geo_view(&node_list, &edge_list);
     json!({"graph": {
         "nodes": node_list,
         "edges": edge_list,
         "groups": groups,
         "cross_links": cross_links,
-    }})
+    },
+    "geo": geo})
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -3557,6 +3855,17 @@ async fn board_topology(
     Json(topology_payload(&state, net.as_deref(), grp.as_deref()).await)
 }
 
+/// Realtime topology frame: the HTTP endpoint and the SSE stream must carry the
+/// exact same model (graph + geo) or the globe loses its data on the next tick.
+fn topology_event_json(payload: &Value) -> String {
+    json!({
+        "type": "topology",
+        "graph": payload.get("graph").cloned().unwrap_or(Value::Null),
+        "geo": payload.get("geo").cloned().unwrap_or(Value::Null),
+    })
+    .to_string()
+}
+
 async fn board_events(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<TopologyQuery>,
@@ -3566,10 +3875,10 @@ async fn board_events(
     let stream = futures::stream::unfold((state, net, grp), |(state, net, grp)| async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let payload = topology_payload(&state, net.as_deref(), grp.as_deref()).await;
-        let nodes = nodes_payload(&state).await;
-        let topology = Event::default().event("topology").data(
-            json!({"type": "topology", "graph": payload.get("graph").cloned().unwrap_or(Value::Null)}).to_string(),
-        );
+        let nodes = nodes_payload_lite(&state).await;
+        // the realtime frame must carry the same model as the HTTP endpoint,
+        // including the geo aggregation the globe renders
+        let topology = Event::default().event("topology").data(topology_event_json(&payload));
         let nodes = Event::default().event("nodes").data(
             json!({"type": "nodes", "nodes": nodes.get("nodes").cloned().unwrap_or(Value::Null)}).to_string(),
         );
@@ -4173,6 +4482,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_edge_rate_sampler(state.clone());
     spawn_snapshot_flusher(state.clone());
     spawn_history_maintenance(state.clone());
+    spawn_geo_backfill(state.clone());
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
@@ -4378,7 +4688,7 @@ mod runtime_tests {
         assert!(other["graph"]["edges"].as_array().unwrap().is_empty());
 
         // 4) node list merges DB static metadata with memory telemetry
-        let nodes = nodes_payload(&state).await;
+        let nodes = nodes_payload_lite(&state).await;
         let node = &nodes["nodes"].as_array().unwrap()[0];
         assert_eq!(node["status"].as_str(), Some("online"));
         assert_eq!(node["alias"].as_str(), Some("alias-n1"));
@@ -4440,5 +4750,81 @@ mod runtime_tests {
             .await
             .unwrap();
         assert_eq!(expired, 0, "rows older than 30 days must be deleted");
+    }
+
+    #[tokio::test]
+    async fn topology_geo_uses_node_coordinates() {
+        let state = test_state().await;
+        sqlx::query("UPDATE nodes SET city = 'Chengdu', latitude = 30.66, longitude = 104.06 WHERE node_id = 'n1'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO network_instances (node_id, network, instance_id, created) VALUES ('n1', 'netA', 'uuid-1', 0)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut frame = frame(1_000_000);
+        frame["instances"][0]["instance_id"] = json!("uuid-1");
+        apply_snapshot_to_rt(&state, "n1", &frame);
+
+        let topo = topology_payload(&state, None, None).await;
+        let geo = &topo["geo"];
+        let cities = geo["cities"].as_array().unwrap();
+        assert_eq!(cities.len(), 1, "one city expected: {geo}");
+        assert_eq!(cities[0]["city"].as_str(), Some("Chengdu"));
+        assert_eq!(cities[0]["nodes"].as_u64(), Some(2));
+        assert!((cities[0]["lat"].as_f64().unwrap() - 30.66).abs() < 1e-6);
+        // the node itself carries the coordinates too
+        let node = topo["graph"]["nodes"].as_array().unwrap().iter()
+            .find(|n| n["peer_id"].as_u64() == Some(11))
+            .expect("local node");
+        assert_eq!(node["city"].as_str(), Some("Chengdu"));
+    }
+
+    #[tokio::test]
+    async fn country_and_geo_survive_restart_without_agent() {
+        let state = test_state().await;
+        sqlx::query("UPDATE nodes SET country_code = 'cn', city = 'Chengdu', latitude = 30.66, longitude = 104.06, system_info = '{\"cpu_cores\": 8, \"os_name\": \"Linux\"}' WHERE node_id = 'n1'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        // a console restart leaves the database intact but wipes the runtime
+        // registry: flags/geo must still resolve from persistence
+        state.node_rt.clear();
+        let payload = nodes_payload(&state).await;
+        let node = &payload["nodes"].as_array().unwrap()[0];
+        assert_eq!(node["country_code"].as_str(), Some("cn"), "flag must survive restart: {payload}");
+        assert_eq!(node["city"].as_str(), Some("Chengdu"));
+        assert_eq!(node["node_id"].as_str(), Some("n1"));
+        assert_eq!(node["system_info"]["cpu_cores"].as_i64(), Some(8), "system info must come back after restart: {payload}");
+    }
+
+    #[tokio::test]
+    async fn board_topology_returns_geo_model() {
+        let state = test_state().await;
+        sqlx::query("UPDATE nodes SET country_code = 'cn', city = 'Chengdu', latitude = 30.66, longitude = 104.06 WHERE node_id = 'n1'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO network_instances (node_id, network, instance_id, created) VALUES ('n1', 'netA', 'uuid-1', 0)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut snapshot = frame(1_000_000);
+        snapshot["instances"][0]["instance_id"] = json!("uuid-1");
+        apply_snapshot_to_rt(&state, "n1", &snapshot);
+        let response = board_topology(
+            State(state.clone()),
+            axum::extract::Query(TopologyQuery { network: None, group: None }),
+        )
+        .await;
+        let body = &response.0;
+        let cities = body["geo"]["cities"].as_array().unwrap();
+        assert_eq!(cities.len(), 1, "globe needs cities: {body}");
+        assert_eq!(cities[0]["city"].as_str(), Some("Chengdu"));
+        assert!(cities[0]["lat"].as_f64().is_some());
+        // the SSE frame must include the same geo model
+        let frame: Value = serde_json::from_str(&topology_event_json(body)).unwrap();
+        assert_eq!(frame["geo"]["cities"].as_array().unwrap().len(), 1, "SSE frame lost geo: {frame}");
     }
 }

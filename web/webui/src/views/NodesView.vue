@@ -25,6 +25,7 @@
         class="nodes-table"
         :headers="headers"
         :items="filteredNodes"
+        :items-per-page="20"
         :loading="loading"
         item-value="node_id"
         hover
@@ -312,7 +313,7 @@
   </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, markRaw, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api } from '@/api'
 import DetailDrawer from '@/components/DetailDrawer.vue'
@@ -338,7 +339,8 @@ const headers = computed(() => [
   { title: t('nodes.columns.actions'), key: 'actions', sortable: false },
 ])
 
-const nodes = ref([])
+const nodes = shallowRef([])
+const nodeRows = new Map()
 const loading = ref(false)
 const drawer = ref(false)
 const detail = ref(null)
@@ -486,12 +488,36 @@ function memText(item) {
 let events = null
 let retry = null
 
-function mapNodes(list) {
-  return (list || []).map((n) => ({
-    ...n,
-    hostname: n.hostname || n.snapshot?.instances?.[0]?.hostname,
-    version: n.version || n.snapshot?.instances?.[0]?.version,
-  }))
+// Merge the 1s payload into stable row objects instead of rebuilding the whole
+// reactive array: the table re-renders from triggerRef, but no deep proxies or
+// clones are created for the (large) snapshot/system-info objects.
+function mergeNodes(list) {
+  const next = []
+  const seen = new Set()
+  for (const n of list || []) {
+    const id = n.node_id
+    if (!id) continue
+    seen.add(id)
+    let row = nodeRows.get(id)
+    if (!row) {
+      row = {}
+      nodeRows.set(id, row)
+    }
+    for (const key of Object.keys(n)) {
+      if (key === 'snapshot' || key === 'system_info') {
+        row[key] = n[key] == null ? n[key] : markRaw(n[key])
+      } else {
+        row[key] = n[key]
+      }
+    }
+    row.hostname = n.hostname || row.hostname || ''
+    next.push(row)
+  }
+  for (const id of [...nodeRows.keys()]) {
+    if (!seen.has(id)) nodeRows.delete(id)
+  }
+  nodes.value = next
+  triggerRef(nodes)
 }
 
 function connectEvents() {
@@ -500,7 +526,7 @@ function connectEvents() {
   events.addEventListener('nodes', (ev) => {
     try {
       const data = JSON.parse(ev.data)
-      if (Array.isArray(data.nodes)) nodes.value = mapNodes(data.nodes)
+      if (Array.isArray(data.nodes)) mergeNodes(data.nodes)
     } catch {}
   })
   events.onerror = () => {
@@ -643,7 +669,7 @@ async function load() {
   loading.value = true
   try {
     const data = await api.boardNodes()
-    nodes.value = mapNodes(data.nodes)
+    mergeNodes(data.nodes)
   } finally {
     loading.value = false
   }
@@ -658,6 +684,18 @@ async function refreshItem(item) {
 
 async function open(item) {
   detail.value = item
+  // the realtime list omits snapshot/system_info; load the full record here
+  void (async () => {
+    try {
+      const fresh = await api.boardNode(item.node_id)
+      if (fresh && !fresh.error) {
+        Object.assign(item, fresh)
+        item.snapshot = fresh.snapshot == null ? fresh.snapshot : markRaw(fresh.snapshot)
+        item.system_info = fresh.system_info == null ? fresh.system_info : markRaw(fresh.system_info)
+        triggerRef(nodes)
+      }
+    } catch {}
+  })()
   nodeAlias.value = item.alias || ''
   nodeBandwidthUp.value = item.bandwidth_up_mbps ?? item.bandwidth_mbps ?? ''
   nodeBandwidthDown.value = item.bandwidth_down_mbps ?? item.bandwidth_mbps ?? ''

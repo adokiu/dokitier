@@ -3,6 +3,8 @@
     v-bind="$attrs"
     :headers="headers"
     :items="items"
+    :items-per-page="20"
+    :items-per-page-options="[10, 20, 50, 100]"
     class="dok-table"
   >
     <template v-for="(_, name) in $slots" #[name]="slotProps">

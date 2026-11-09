@@ -32,7 +32,8 @@
       </v-btn-toggle>
     </div>
     <v-card ref="cardEl" class="pa-2 topology-card">
-      <div v-show="viewMode !== 'traffic' && viewMode !== 'latency' && viewMode !== 'loss'" ref="chartEl" class="topology-chart"></div>
+      <div v-show="viewMode !== 'traffic' && viewMode !== 'latency' && viewMode !== 'loss' && viewMode !== 'geo'" ref="chartEl" class="topology-chart"></div>
+      <GeoGlobe v-if="viewMode === 'geo'" :geo="geoModel" />
       <div v-if="viewMode === 'traffic' || viewMode === 'latency' || viewMode === 'loss'" class="matrix-view">
         <div class="matrix-inner">
           <div class="matrix-scale">
@@ -206,6 +207,7 @@ import { api } from '@/api'
 import HoverCard from '@/components/HoverCard.vue'
 import { protocolClass, protocolLabel, protocolRaw } from '@/utils/protocol'
 import DetailDrawer from '@/components/DetailDrawer.vue'
+import GeoGlobe from '../components/GeoGlobe.vue'
 
 const { t } = useI18n()
 
@@ -214,6 +216,7 @@ let chart = null
 let ws = null
 let graph = { nodes: [], edges: [] }
 let allGraph = { nodes: [], edges: [] }
+const geoModel = ref({ cities: [], links: [] })
 let metrics = {}
 let layout = {}
 let layoutTarget = null
@@ -2378,295 +2381,6 @@ function orderedNodes(byGroup, groups) {
 }
 
 
-// ---------------------------------------------------------------- geo arcs view
-// City of a node from its hostname/alias; fall back to the country centroid.
-const CITY_GEO = {
-  chengdu: { name: '成都', lon: 104.07, lat: 30.67 }, chongqing: { name: '重庆', lon: 106.55, lat: 29.56 },
-  yibin: { name: '宜宾', lon: 104.62, lat: 28.77 }, beijing: { name: '北京', lon: 116.40, lat: 39.90 },
-  shanghai: { name: '上海', lon: 121.47, lat: 31.23 }, shenzhen: { name: '深圳', lon: 114.06, lat: 22.54 },
-  guangzhou: { name: '广州', lon: 113.26, lat: 23.13 }, qingdao: { name: '青岛', lon: 120.38, lat: 36.07 },
-  xian: { name: '西安', lon: 108.94, lat: 34.34 }, nanjing: { name: '南京', lon: 118.80, lat: 32.06 },
-  hangzhou: { name: '杭州', lon: 120.15, lat: 30.27 }, wuhan: { name: '武汉', lon: 114.30, lat: 30.59 },
-  tianjin: { name: '天津', lon: 117.20, lat: 39.13 }, suzhou: { name: '苏州', lon: 120.58, lat: 31.30 },
-  changsha: { name: '长沙', lon: 112.94, lat: 28.23 }, zhengzhou: { name: '郑州', lon: 113.62, lat: 34.75 },
-  hongkong: { name: '香港', lon: 114.17, lat: 22.32 }, hk: { name: '香港', lon: 114.17, lat: 22.32 },
-  macau: { name: '澳门', lon: 113.54, lat: 22.20 }, taipei: { name: '台北', lon: 121.57, lat: 25.03 },
-  tokyo: { name: '东京', lon: 139.69, lat: 35.68 }, osaka: { name: '大阪', lon: 135.50, lat: 34.69 },
-  seoul: { name: '首尔', lon: 126.98, lat: 37.57 }, singapore: { name: '新加坡', lon: 103.82, lat: 1.35 },
-  singpore: { name: '新加坡', lon: 103.82, lat: 1.35 }, bangkok: { name: '曼谷', lon: 100.50, lat: 13.75 },
-  sanjose: { name: '圣何塞', lon: -121.89, lat: 37.34 }, 'san-jose': { name: '圣何塞', lon: -121.89, lat: 37.34 },
-  fremont: { name: '弗里蒙特', lon: -121.99, lat: 37.55 }, losangeles: { name: '洛杉矶', lon: -118.24, lat: 34.05 },
-  'los-angeles': { name: '洛杉矶', lon: -118.24, lat: 34.05 }, newyork: { name: '纽约', lon: -74.00, lat: 40.71 },
-  frankfurt: { name: '法兰克福', lon: 8.68, lat: 50.11 }, london: { name: '伦敦', lon: -0.13, lat: 51.51 },
-  moscow: { name: '莫斯科', lon: 37.62, lat: 55.76 }, sydney: { name: '悉尼', lon: 151.21, lat: -33.87 },
-}
-const COUNTRY_GEO = {
-  cn: { name: '中国', lon: 105, lat: 33 }, hk: { name: '香港', lon: 114.17, lat: 22.32 },
-  mo: { name: '澳门', lon: 113.54, lat: 22.2 }, tw: { name: '台湾', lon: 121.0, lat: 23.7 },
-  jp: { name: '日本', lon: 138, lat: 36 }, sg: { name: '新加坡', lon: 103.82, lat: 1.35 },
-  us: { name: '美国', lon: -98, lat: 39 }, gb: { name: '英国', lon: -2, lat: 54 },
-  de: { name: '德国', lon: 10, lat: 51 }, fr: { name: '法国', lon: 2, lat: 46 },
-  ru: { name: '俄罗斯', lon: 100, lat: 60 }, kr: { name: '韩国', lon: 127.5, lat: 37.5 },
-  au: { name: '澳大利亚', lon: 134, lat: -25 }, ca: { name: '加拿大', lon: -106, lat: 56 },
-}
-
-function geoOf(node) {
-  const text = String(node.alias || node.hostname || '').toLowerCase()
-  const tokens = text.split(/[^a-z0-9]+/).filter(Boolean)
-  for (const key of Object.keys(CITY_GEO)) {
-    if (tokens.includes(key) || text.includes(key)) return { key, ...CITY_GEO[key] }
-  }
-  const cc = String(node.country_code || '').toLowerCase()
-  const base = COUNTRY_GEO[cc] || { name: cc || '未知', lon: 0, lat: 0 }
-  return { key: `${cc}:${base.lon}`, ...base }
-}
-
-// schematic globe: equirectangular projection, then a relax pass so nearby
-// cities (Chengdu/Chongqing/Yibin) do not overlap. Not to scale by design.
-function geoLayout(nodes, R, cx, cy) {
-  const byCity = new Map()
-  for (const n of nodes) {
-    const g = geoOf(n)
-    const rec = byCity.get(g.key) || { ...g, nodes: [] }
-    rec.nodes.push(n)
-    byCity.set(g.key, rec)
-  }
-  const cities = [...byCity.values()]
-  const scale = R / 130
-  for (const c of cities) {
-    c.x = cx + c.lon * scale
-    c.y = cy - c.lat * scale * 1.05
-    c.count = c.nodes.length
-    const groups = new Map()
-    for (const n of c.nodes) {
-      const grp = groupOf(n) || 'default'
-      groups.set(grp, (groups.get(grp) || 0) + 1)
-    }
-    c.group = [...groups.entries()].sort((a, b) => b[1] - a[1])[0][0]
-    c.r = 7 + Math.min(14, Math.log2(c.count + 1) * 6)
-  }
-  for (let iter = 0; iter < 260; iter++) {
-    for (let i = 0; i < cities.length; i++) {
-      for (let j = i + 1; j < cities.length; j++) {
-        const a = cities[i]
-        const b = cities[j]
-        let dx = b.x - a.x
-        let dy = b.y - a.y
-        let d = Math.hypot(dx, dy) || 0.01
-        const need = a.r + b.r + 26
-        if (d < need) {
-          const push = (need - d) / 2
-          dx /= d
-          dy /= d
-          a.x -= dx * push
-          a.y -= dy * push
-          b.x += dx * push
-          b.y += dy * push
-        }
-      }
-    }
-    for (const c of cities) {
-      const dx = c.x - cx
-      const dy = c.y - cy
-      const d = Math.hypot(dx, dy) || 0.01
-      const max = R - c.r - 18
-      if (d > max) {
-        c.x = cx + (dx / d) * max
-        c.y = cy + (dy / d) * max
-      }
-    }
-  }
-  return cities
-}
-
-function buildGeoOption() {
-  // only the current scope's live nodes take part; offline ones have no city dot
-  const nodes = allGraph.nodes || []
-  const pairs = (allGraph.edges || []).map((e) => ({
-    a: e.a,
-    b: e.b,
-    traffic: Number(e.rx_bps || 0) + Number(e.tx_bps || 0),
-    latency: e.latency_ms != null ? Number(e.latency_ms) : null,
-  }))
-  const dark = document.querySelector('.v-application')?.classList.contains('v-theme--PurpleThemeDark')
-  const cx = width / 2
-  const cy = height / 2
-  const R = Math.min(width, height) * 0.42
-  const cities = geoLayout(nodes, R, cx, cy)
-  const byKey = new Map(cities.map((c) => [c.key, c]))
-  const cityOfNode = new Map()
-  for (const c of cities) for (const n of c.nodes) cityOfNode.set(n.peer_id, c)
-  const agg = new Map()
-  for (const pr of pairs) {
-    const a = cityOfNode.get(pr.a)
-    const b = cityOfNode.get(pr.b)
-    if (!a || !b || a === b) continue
-    const key = a.key < b.key ? `${a.key}|${b.key}` : `${b.key}|${a.key}`
-    const rec = agg.get(key) || { a: a.key < b.key ? a : b, b: a.key < b.key ? b : a, traffic: 0, latency: [] }
-    rec.traffic += pr.traffic || 0
-    if (pr.latency != null) rec.latency.push(pr.latency)
-    agg.set(key, rec)
-  }
-  const arcs = [...agg.values()].map((rec) => {
-    const mx = (rec.a.x + rec.b.x) / 2
-    const my = (rec.a.y + rec.b.y) / 2
-    const dx = rec.b.x - rec.a.x
-    const dy = rec.b.y - rec.a.y
-    const dist = Math.hypot(dx, dy) || 1
-    const bend = Math.min(160, dist * 0.28)
-    // bend away from the globe centre so arcs read as flights
-    const ox = mx - cx
-    const oy = my - cy
-    const olen = Math.hypot(ox, oy) || 1
-    const ctrl = { x: mx - (ox / olen) * bend - (dy / dist) * 0, y: my - (oy / olen) * bend }
-    const active = rec.traffic >= 102400
-    const lat = rec.latency.length ? rec.latency.reduce((x, y) => x + y, 0) / rec.latency.length : null
-    return {
-      a: rec.a, b: rec.b, ctrl,
-      width: 1.2 + Math.min(6, Math.log10(Math.max(10, rec.traffic)) * 0.9),
-      color: active ? '#5fd0a8' : (dark ? 'rgba(190,205,220,0.35)' : 'rgba(70,90,110,0.35)'),
-      opacity: active ? 0.9 : 0.45,
-      active,
-      label: bps(rec.traffic) + (lat != null ? ' · ' + lat.toFixed(0) + 'ms' : ''),
-      lx: (rec.a.x + rec.b.x) / 2,
-      ly: (rec.a.y + rec.b.y) / 2,
-    }
-  })
-  const globe = {
-    cx,
-    cy,
-    r: R,
-    grid: Array.from({ length: 5 }, (_, i) => -60 + i * 30),
-  }
-  const darkStroke = dark ? 'rgba(150,180,220,0.10)' : 'rgba(30,70,110,0.10)'
-  return {
-    animation: false,
-    tooltip: { show: false },
-    series: [
-      {
-        id: 'geo-globe',
-        type: 'custom',
-        coordinateSystem: 'none',
-        z: 0,
-        silent: true,
-        data: [globe],
-        renderItem: () => {
-          const rings = []
-          rings.push({
-            type: 'circle',
-            shape: { cx, cy, r: R },
-            style: {
-              fill: dark ? 'rgba(20,32,48,0.75)' : 'rgba(232,242,252,0.85)',
-              stroke: 'rgba(120,170,220,0.35)',
-              lineWidth: 1.5,
-            },
-          })
-          rings.push({
-            type: 'circle',
-            shape: { cx, cy, r: R - 6 },
-            style: { fill: 'none', stroke: dark ? 'rgba(120,170,220,0.12)' : 'rgba(60,120,180,0.12)', lineWidth: 1 },
-          })
-          // latitude lines
-          for (const lat of globe.grid) {
-            const y = cy - (lat * R * 1.05) / 130
-            const half = Math.sqrt(Math.max(0, R * R - (y - cy) * (y - cy)))
-            if (half < 4) continue
-            rings.push({
-              type: 'line',
-              shape: { x1: cx - half, y1: y, x2: cx + half, y2: y },
-              style: { stroke: darkStroke, lineWidth: 1 },
-            })
-          }
-          // longitude lines (ellipses)
-          for (let lon = -120; lon <= 120; lon += 40) {
-            const rx = Math.abs((lon * R) / 130)
-            rings.push({
-              type: 'ellipse',
-              shape: { cx, cy, rx: Math.max(6, rx), ry: R },
-              style: { fill: 'none', stroke: darkStroke, lineWidth: 1 },
-            })
-          }
-          return { type: 'group', children: rings }
-        },
-      },
-      {
-        id: 'geo-arcs',
-        type: 'custom',
-        coordinateSystem: 'none',
-        z: 2,
-        data: arcs,
-        renderItem: (params) => {
-          const d = arcs[params.dataIndex]
-          const path = `M ${d.a.x.toFixed(1)} ${d.a.y.toFixed(1)} Q ${d.ctrl.x.toFixed(1)} ${d.ctrl.y.toFixed(1)} ${d.b.x.toFixed(1)} ${d.b.y.toFixed(1)}`
-          return {
-            type: 'path',
-            shape: { d: path },
-            style: {
-              stroke: d.color,
-              lineWidth: d.width,
-              fill: 'none',
-              opacity: d.opacity,
-              lineCap: 'round',
-              lineDash: d.active ? [7 + d.width, 6 + d.width * 1.5] : undefined,
-              lineDashOffset: d.active ? -flowOffset : 0,
-            },
-          }
-        },
-      },
-      {
-        id: 'geo-cities',
-        type: 'custom',
-        coordinateSystem: 'none',
-        z: 3,
-        data: cities,
-        renderItem: (params) => {
-          const d = cities[params.dataIndex]
-          return {
-            type: 'group',
-            children: [
-              {
-                type: 'circle',
-                shape: { cx: d.x, cy: d.y, r: d.r + 5 },
-                style: { fill: groupColor(d.group), opacity: 0.12 },
-              },
-              {
-                type: 'circle',
-                shape: { cx: d.x, cy: d.y, r: d.r },
-                style: { fill: groupColor(d.group), stroke: dark ? 'rgba(10,18,28,0.9)' : 'rgba(255,255,255,0.9)', lineWidth: 2 },
-              },
-              {
-                type: 'text',
-                style: {
-                  text: d.name,
-                  x: d.x,
-                  y: d.y - d.r - 9,
-                  align: 'center',
-                  verticalAlign: 'middle',
-                  fill: dark ? '#dbe6f2' : '#1f2a30',
-                  font: '12px "Noto Sans", sans-serif',
-                },
-              },
-              {
-                type: 'text',
-                style: {
-                  text: String(d.count),
-                  x: d.x,
-                  y: d.y,
-                  align: 'center',
-                  verticalAlign: 'middle',
-                  fill: dark ? '#0d141c' : '#ffffff',
-                  font: '11px "Noto Sans", sans-serif',
-                  fontWeight: 600,
-                },
-              },
-            ],
-          }
-        },
-      },
-    ],
-  }
-}
-
 function buildCircleOption() {
   const { pairs, groups, byGroup } = overviewData()
   const dark = document.querySelector('.v-application')?.classList.contains('v-theme--PurpleThemeDark')
@@ -3181,7 +2895,7 @@ function onMatrixCell(cell, ev) {
 }
 
 function buildOption() {
-  if (viewMode.value === 'geo') return buildGeoOption()
+  if (viewMode.value === 'geo') return { animation: false, tooltip: { show: false }, series: [] }
   if (viewMode.value === 'circle') return buildCircleOption()
   if (viewMode.value === 'traffic' || viewMode.value === 'latency' || viewMode.value === 'loss') return { animation: false, tooltip: { show: false }, series: [] }
   return buildDetailOption()
@@ -3806,6 +3520,7 @@ function ingestBoard(board) {
   const dt = lastSampleTs ? Math.max(0.5, now - lastSampleTs) : 1
   const raw = board.graph || { nodes: [], edges: [] }
   allGraph = raw
+  geoModel.value = board.geo || { cities: [], links: [] }
   const present = new Set()
   for (const n of raw.nodes || []) {
     present.add(n.peer_id)
@@ -4023,7 +3738,7 @@ onMounted(async () => {
   connectBoardEvents()
   let animTick = 0
   flowTimer = setInterval(() => {
-    if (viewMode.value === 'circle' || viewMode.value === 'geo') {
+    if (viewMode.value === 'circle') {
       flowOffset = (flowOffset + 1.5) % 12
       if (chart) chart.setOption(buildOption(), true)
       return
@@ -4072,6 +3787,11 @@ onBeforeUnmount(() => {
 .network-select { flex:0 0 200px;width:200px;max-width:200px }
 .network-select :deep(.v-field) { border-radius:8px }
 .topology-card { position:relative;flex:1 1 auto;min-height:0;overflow:hidden }
+.geo-globe-host {
+  position: absolute;
+  inset: 0;
+}
+
 .topology-chart { width:100%;height:100% }
 .route-panel { position:absolute;right:12px;top:12px;max-width:60%;padding:10px 12px;border:1px solid rgba(var(--v-theme-on-surface),.16);border-radius:12px;background:rgba(var(--v-theme-surface),.82);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);z-index:4 }
 .route-title { font-size:11px;font-weight:600;color:rgba(var(--v-theme-on-surface),.55);margin-bottom:4px }

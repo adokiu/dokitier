@@ -36,7 +36,7 @@
         :items="filteredRows"
         :loading="loading"
         item-value="peer_id"
-        :items-per-page="15"
+        :items-per-page="20"
         hover
       >
         <template #item.network="{ item }"><span class="net-chip">{{ item.network || '-' }}</span></template>
@@ -64,7 +64,7 @@
 
     <v-card v-if="!boardMode" class="routes-table-card mt-4">
       <div class="routes-table-head"><span>静态路由</span><span class="routes-table-count">{{ staticRoutes.length }} 条</span></div>
-      <DokTable :headers="staticHeaders" :items="staticRoutes" item-value="id" :items-per-page="10" hover>
+      <DokTable :headers="staticHeaders" :items="staticRoutes" item-value="id" :items-per-page="20" hover>
         <template #item.dest_cidr="{ item }"><span class="num">{{ item.dest_cidr }}</span></template>
         <template #item.next_hop_peer_id="{ item }"><span class="num">{{ item.next_hop_peer_id }}</span></template>
         <template #item.metric="{ item }"><span class="num">{{ item.metric }}</span></template>

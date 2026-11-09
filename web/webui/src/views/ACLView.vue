@@ -34,7 +34,7 @@
       </div>
 
     <v-card class="acl-table-card">
-      <DokTable :headers="headers" :items="rules" item-value="key" :items-per-page="15" hover>
+      <DokTable :headers="headers" :items="rules" item-value="key" :items-per-page="20" hover>
         <template #item.action="{ item }">
           <v-chip size="x-small" :color="item.action === 1 ? 'success' : item.action === 2 ? 'error' : 'default'">
             {{ actionLabel(item.action) }}
@@ -60,7 +60,7 @@
     <div v-show="tab === 'chains'" class="acl-panel">
     <v-card v-if="chains.length" class="acl-table-card">
       <div class="acl-table-head"><span>规则链</span><span class="acl-count">{{ chains.length }} 条链</span></div>
-      <DokTable :headers="chainHeaders" :items="chains" item-value="name" :items-per-page="10" hover>
+      <DokTable :headers="chainHeaders" :items="chains" item-value="name" :items-per-page="20" hover>
         <template #item.chain_type="{ item }">{{ chainTypeLabel(item.chain_type) }}</template>
         <template #item.default_action="{ item }">{{ actionLabel(item.default_action) }}</template>
         <template #item.enabled="{ item }">

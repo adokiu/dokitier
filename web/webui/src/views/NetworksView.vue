@@ -16,7 +16,7 @@
     </div>
 
     <v-card class="net-table-card">
-      <DokTable :headers="headers" :items="networks" item-value="network" :items-per-page="15" hover>
+      <DokTable :headers="headers" :items="networks" item-value="network" :items-per-page="20" hover>
         <template #item.network="{ item }"><span class="net-chip">{{ item.network }}</span></template>
         <template #item.status="{ item }">
           <v-chip size="x-small" :color="item.nodes_online === item.nodes_total ? 'success' : item.nodes_online > 0 ? 'warning' : 'error'" variant="tonal">
