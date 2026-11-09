@@ -1433,31 +1433,49 @@ impl SyncedRouteInfo {
             // immediately, so a zombie entry is never produced in the first place
             // instead of waiting for the dead-peer GC timeout.
             if let Some(inst) = route_peer_inst_id(&route_info) {
-                let stale: Vec<PeerId> = guard
-                    .iter()
-                    .filter(|(pid, old)| {
-                        **pid != route_info.peer_id
-                            && route_peer_inst_id(old) == Some(inst)
-                            && old.peer_route_id != route_info.peer_route_id
-                    })
-                    .map(|(pid, _)| *pid)
-                    .collect();
-                for pid in stale {
-                    let is_stale = guard.get(&pid).is_some_and(|old| {
-                        route_peer_inst_id(old) == Some(inst)
-                            && old.peer_route_id != route_info.peer_route_id
-                    });
-                    if is_stale {
-                        guard.remove(&pid);
-                        self.raw_peer_infos.remove(&pid);
-                        self.conn_map.write().remove(&pid);
-                        need_inc_version = true;
-                        tracing::info!(
-                            stale_peer_id = pid,
-                            new_peer_id = route_info.peer_id,
-                            "evicted stale peer incarnation for same instance"
-                        );
+                // A restarted instance has a second peer id with the same
+                // instance id. Only the *newer* incarnation may survive: an
+                // older flooded copy must neither resurrect the dead entry nor
+                // evict the fresh one (that symmetry was flipping the graph
+                // back and forth).
+                let mut evict: Vec<PeerId> = Vec::new();
+                let mut drop_incoming = false;
+                for (pid, old) in guard.iter() {
+                    if *pid == route_info.peer_id
+                        || route_peer_inst_id(old) != Some(inst)
+                        || old.peer_route_id == route_info.peer_route_id
+                    {
+                        continue;
                     }
+                    let incoming_newer = match (route_info.last_update, old.last_update) {
+                        (Some(a), Some(b)) => {
+                            (a.seconds, a.nanos) > (b.seconds, b.nanos)
+                                || ((a.seconds, a.nanos) == (b.seconds, b.nanos)
+                                    && route_info.version >= old.version)
+                        }
+                        (Some(_), None) => true,
+                        (None, Some(_)) => false,
+                        (None, None) => route_info.version >= old.version,
+                    };
+                    if incoming_newer {
+                        evict.push(*pid);
+                    } else {
+                        drop_incoming = true;
+                    }
+                }
+                if drop_incoming {
+                    continue;
+                }
+                for pid in evict {
+                    guard.remove(&pid);
+                    self.raw_peer_infos.remove(&pid);
+                    self.conn_map.write().remove(&pid);
+                    need_inc_version = true;
+                    tracing::info!(
+                        stale_peer_id = pid,
+                        new_peer_id = route_info.peer_id,
+                        "evicted stale peer incarnation for same instance"
+                    );
                 }
             }
             // Preserve the origin's last_update instead of stamping "now" on every
