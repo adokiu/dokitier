@@ -3057,6 +3057,49 @@ async fn set_alias(State(state): State<AppState>, Path(node_id): Path<String>, J
     Json(json!({"ok": true, "node_id": node_id, "alias": alias}))
 }
 
+async fn delete_node(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
+    if node_id.trim().is_empty() {
+        return Json(json!({"ok": false, "error": "invalid node id"}));
+    }
+    // close any live agent channel for this node
+    let prefix = format!("{node_id}:");
+    let keys: Vec<String> = state
+        .agents
+        .iter()
+        .filter(|entry| entry.key().starts_with(&prefix))
+        .map(|entry| entry.key().clone())
+        .collect();
+    for key in keys {
+        state.agents.remove(&key);
+    }
+    let _ = sqlx::query(&q("DELETE FROM config_versions WHERE node_id = ?"))
+        .bind(&node_id)
+        .execute(&state.db)
+        .await;
+    let _ = sqlx::query(&q("DELETE FROM network_instances WHERE node_id = ?"))
+        .bind(&node_id)
+        .execute(&state.db)
+        .await;
+    let deleted = sqlx::query(&q("DELETE FROM nodes WHERE node_id = ?"))
+        .bind(&node_id)
+        .execute(&state.db)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+    state.node_rt.remove(&node_id);
+    state.rt_flush.remove(&node_id);
+    state.geo_attempts.remove(&node_id);
+    if deleted == 0 {
+        return Json(json!({"ok": false, "error": "节点不存在"}));
+    }
+    let _ = sqlx::query(&q("INSERT INTO audit_logs (ts, action, node_id, network, detail) VALUES (?, 'node.delete', ?, '', '')"))
+        .bind(now())
+        .bind(&node_id)
+        .execute(&state.db)
+        .await;
+    Json(json!({"ok": true, "node_id": node_id}))
+}
+
 async fn get_node(State(state): State<AppState>, Path(node_id): Path<String>) -> Json<Value> {
     // same memory-backed payload as the node list; no realtime SQL read
     let payload = nodes_payload(&state).await;
@@ -5004,7 +5047,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/history", get(board_history))
         .route("/api/board/audit", get(list_audit))
         .route("/api/board/nodes", get(list_nodes).post(add_node))
-        .route("/api/board/nodes/{node_id}", get(get_node))
+        .route("/api/board/nodes/{node_id}", get(get_node).delete(delete_node))
         .route("/api/board/nodes/{node_id}/token", get(get_node_token).post(rotate_node_token))
         .route("/api/board/nodes/{node_id}/versions", get(list_versions))
         .route("/api/board/nodes/{node_id}/versions/{version_id}", get(get_version))

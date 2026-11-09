@@ -50,6 +50,7 @@ export const api = {
   nodeToken: (id) => request('/api/board/nodes/' + id + '/token'),
   rotateNodeToken: (id) => request('/api/board/nodes/' + id + '/token', { method: 'POST', headers: jsonHeaders }),
   boardNode: (id) => request('/api/board/nodes/' + id),
+  deleteNode: (id) => request('/api/board/nodes/' + id, { method: 'DELETE' }),
   boardRoutingSettings: () => request('/api/board/settings/routing'),
   setBoardRouting: (params) => request('/api/board/settings/routing', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(params) }),
   boardPerf: () => request('/api/board/system/perf'),

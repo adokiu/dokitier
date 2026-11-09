@@ -20,7 +20,7 @@ const messages = {
     nodes: {
       title: '节点', subtitle: '节点状态、公网出口与网络配置',
       total: '共 {n} 个节点', networkFilter: '网络筛选', networks: '网络',
-      config: '配置', running: '运行中', configFile: '配置文件',
+      config: '配置', running: '运行中', configFile: '配置文件', addNode: '添加节点', install: '安装', delete: '删除',
       history: '历史', download: '下载', saveApply: '保存并应用',
       reload: '重新加载', applied: '已下发并重启该网络实例',
       noVersions: '暂无版本',
@@ -46,7 +46,7 @@ const messages = {
     nodes: {
       title: 'Nodes', subtitle: 'Node status, public egress and network configs',
       total: '{n} nodes', networkFilter: 'Network', networks: 'Networks',
-      config: 'Config', running: 'Running', configFile: 'Config file',
+      config: 'Config', running: 'Running', configFile: 'Config file', addNode: 'Add node', install: 'Install', delete: 'Delete',
       history: 'History', download: 'Download', saveApply: 'Save & apply',
       reload: 'Reload', applied: 'Pushed and restarted this network instance',
       noVersions: 'No versions yet',

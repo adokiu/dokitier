@@ -6,7 +6,7 @@
         <div class="page-sub">{{ t('nodes.subtitle') }}</div>
       </div>
       <v-spacer />
-      <v-btn color="primary" size="small" prepend-icon="mdi-plus" @click="openAddNode">{{ t('nodes.addNode') || '添加节点' }}</v-btn>
+      <v-btn color="primary" size="small" prepend-icon="mdi-plus" @click="openAddNode">{{ t('nodes.addNode') }}</v-btn>
       <v-select
         v-model="networkFilter"
         :items="networkFilterItems"
@@ -85,7 +85,8 @@
         <template #item.actions="{ item }">
           <div class="d-flex gap-1">
             <v-btn size="x-small" variant="text" prepend-icon="mdi-cog" @click.stop="open(item)">{{ t('nodes.config') }}</v-btn>
-            <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click.stop="openInstall(item)">安装</v-btn>
+            <v-btn size="x-small" variant="text" prepend-icon="mdi-download" @click.stop="openInstall(item)">{{ t('nodes.install') }}</v-btn>
+            <v-btn size="x-small" variant="text" color="error" prepend-icon="mdi-delete-outline" @click.stop="askDelete(item)">{{ t('nodes.delete') }}</v-btn>
           </div>
         </template>
       </DokTable>
@@ -349,23 +350,43 @@
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="deleteOpen" max-width="420">
+      <v-card>
+        <v-card-title>删除节点</v-card-title>
+        <v-card-text>
+          确认删除节点 <b>{{ deleteTarget?.node_id }}</b>？该操作会移除其配置版本与网络实例记录，且不可恢复。
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="deleteOpen = false">{{ t('common.cancel') }}</v-btn>
+          <v-btn color="error" :loading="deleting" @click="confirmDelete">{{ t('nodes.delete') }}</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="installOpen" max-width="760">
       <v-card>
         <v-card-title>安装节点 <span class="text-medium-emphasis text-body-2">{{ installNodeId }}</span></v-card-title>
-        <v-card-text>
-          <v-text-field v-model="installEndpoint" density="compact" variant="outlined" label="Console 地址" class="mb-2" />
-          <v-text-field v-model="installToken" density="compact" variant="outlined" label="节点 Token" class="mb-3" />
-          <div class="d-flex flex-wrap gap-2 mb-3">
-            <v-text-field v-model="installVersion" density="compact" variant="outlined" label="安装版本" placeholder="latest" hide-details style="max-width: 180px" />
-            <v-text-field v-model="installProxy" density="compact" variant="outlined" label="GitHub 代理" placeholder="https://ghproxy.example/" hide-details style="max-width: 240px" />
-            <v-text-field v-model="installDir" density="compact" variant="outlined" label="安装目录" placeholder="/opt/dokitier" hide-details style="max-width: 200px" />
-            <v-text-field v-model="installService" density="compact" variant="outlined" label="服务名称" placeholder="dokitier-core" hide-details style="max-width: 200px" />
-            <v-text-field v-model="installInterval" density="compact" variant="outlined" label="采集间隔(秒)" placeholder="1" hide-details style="max-width: 140px" />
-            <v-checkbox v-model="installInsecure" density="compact" label="忽略证书" hide-details style="max-width: 130px" />
+        <v-card-text class="install-body">
+          <div class="install-grid">
+            <v-text-field v-model="installEndpoint" density="compact" variant="outlined" label="Console 地址" hide-details class="span-2" />
+            <v-text-field v-model="installToken" density="compact" variant="outlined" label="节点 Token" hide-details class="span-2" />
+            <v-text-field v-model="installVersion" density="compact" variant="outlined" label="安装版本" placeholder="latest" hide-details />
+            <v-text-field v-model="installProxy" density="compact" variant="outlined" label="GitHub 代理" placeholder="https://ghproxy.example/" hide-details />
+            <v-text-field v-model="installDir" density="compact" variant="outlined" label="安装目录" placeholder="/opt/dokitier" hide-details />
+            <v-text-field v-model="installService" density="compact" variant="outlined" label="服务名称" placeholder="dokitier-core" hide-details />
+            <v-text-field v-model="installInterval" density="compact" variant="outlined" label="采集间隔（秒）" placeholder="1" hide-details />
+            <v-checkbox v-model="installInsecure" density="compact" label="忽略证书" hide-details class="install-insecure" />
           </div>
           <div class="install-command">
+            <div class="install-command__head">
+              <span>一键安装命令</span>
+              <div class="d-flex gap-2">
+                <v-btn size="small" variant="text" prepend-icon="mdi-refresh" :loading="rotating" @click="rotateToken">重置 Token</v-btn>
+                <v-btn size="small" variant="tonal" prepend-icon="mdi-content-copy" @click="copyInstallCommand">{{ copied ? '已复制' : '复制命令' }}</v-btn>
+              </div>
+            </div>
             <pre>{{ installCommand }}</pre>
-            <v-btn size="small" variant="tonal" prepend-icon="mdi-content-copy" @click="copyInstallCommand">{{ copied ? '已复制' : '复制命令' }}</v-btn>
           </div>
           <v-alert v-if="installError" type="error" variant="tonal" density="compact" class="mt-3">{{ installError }}</v-alert>
           <div class="text-caption mt-2">在目标机器上以 root 执行该命令；安装完成后节点会自动连到 console，并在列表中出现。</div>
@@ -446,6 +467,9 @@ const newNodeAlias = ref('')
 const addNodeError = ref('')
 const addNodeSaving = ref(false)
 const installOpen = ref(false)
+const deleteOpen = ref(false)
+const deleteTarget = ref(null)
+const deleting = ref(false)
 const installNodeId = ref('')
 const installToken = ref('')
 const installError = ref('')
@@ -569,6 +593,28 @@ async function createNode() {
     addNodeError.value = String(e.message || e)
   } finally {
     addNodeSaving.value = false
+  }
+}
+
+function askDelete(item) {
+  deleteTarget.value = item
+  deleteOpen.value = true
+}
+
+async function confirmDelete() {
+  if (!deleteTarget.value) return
+  deleting.value = true
+  try {
+    const res = await api.deleteNode(deleteTarget.value.node_id)
+    if (!res.ok) throw new Error(res.error || '删除失败')
+    deleteOpen.value = false
+    deleteTarget.value = null
+    await load()
+    finishToast('节点已删除', 'success', 3000)
+  } catch (e) {
+    finishToast(String(e.message || e), 'error', 5000)
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -1121,6 +1167,24 @@ onBeforeUnmount(() => {
 .meter-fill { height: 100%; border-radius: 999px; transition: width .3s ease, background .3s ease; }
 .version-cell { white-space: nowrap; }
 .info-icon { color: rgba(var(--v-theme-on-surface), .45); cursor: help; }
+.install-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+  margin-bottom: 14px;
+}
+.install-grid .span-2 { grid-column: span 2; }
+.install-insecure { align-self: center; }
+.install-command__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(var(--v-theme-on-surface), .65);
+}
 .install-command pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.5; background: rgba(var(--v-theme-on-surface), .05); border: 1px solid rgba(var(--v-theme-on-surface), .12); border-radius: 8px; padding: 10px; margin: 0 0 8px; }
 .ip-v6 { color: var(--dok-subtle); }
 .node-flag { width: 24px; height: 16px; border-radius: 2px; object-fit: cover; flex: 0 0 auto; }

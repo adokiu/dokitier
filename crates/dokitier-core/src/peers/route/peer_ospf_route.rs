@@ -745,14 +745,14 @@ impl OspfRouteTable {
 }
 
 static UPDATE_PEER_INFO_PERIOD: Duration = Duration::from_secs(3600);
-static REMOVE_DEAD_PEER_INFO_AFTER: Duration = Duration::from_secs(3660);
+static REMOVE_DEAD_PEER_INFO_AFTER: Duration = Duration::from_secs(300);
 static FORCE_USE_CONN_LIST: AtomicBool = AtomicBool::new(false);
 
 // if a peer is unreachable for `REMOVE_UNREACHABLE_PEER_INFO_AFTER` time, we can remove it because
 // 1. all the ospf sessions between two zone are already destroy, new created session will resend the peer info.
 // 2. all the dst_saved_peer_info_version in all sessions already remove the peer info, the peer info will be propagated
 //    in another zone when two zone restore the conneciton.
-static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(90);
+static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(10);
 
 fn route_peer_inst_id(info: &RoutePeerInfo) -> Option<uuid::Uuid> {
     info.inst_id.map(Into::into)
@@ -4466,7 +4466,8 @@ impl PeerRoute {
 
     async fn clear_expired_peer(service_impl: Arc<PeerRouteServiceImpl>) {
         loop {
-            crate::foundation::time::sleep(Duration::from_secs(60)).await;
+            // converge fast: check every 5s (was 60s)
+            crate::foundation::time::sleep(Duration::from_secs(5)).await;
             service_impl.clear_expired_peer().await;
             // TODO: use debug log level for this.
             tracing::debug!(?service_impl, "clear_expired_peer");
