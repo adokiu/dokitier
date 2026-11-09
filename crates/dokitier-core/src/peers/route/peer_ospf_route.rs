@@ -3194,16 +3194,11 @@ impl PeerRouteServiceImpl {
         let mut included_peer_ids = HashSet::new();
         let peer_infos = self.synced_route_info.peer_infos.read();
         let mut unreachable_peers_for_peer_info = session.unreachable_peers_for_peer_info.lock();
-        let last_sync_succ_timestamp = session.last_sync_succ_timestamp.load();
-        for (peer_id, peer_info) in peer_infos.iter().rev() {
-            // stop iter if last_update of peer info is older than session.last_sync_succ_timestamp
-            if let Some(last_update) = peer_info.last_update {
-                let last_update = SystemTime::try_from(last_update).unwrap();
-                if last_sync_succ_timestamp.is_some_and(|t| last_update < t) {
-                    break;
-                }
-            }
-
+        for (peer_id, peer_info) in peer_infos.iter() {
+            // Do not prune the rest of the table by origin timestamp: a peer
+            // that missed an entry (relay path came up later, peer restarted,
+            // relay switched) would never receive it again. The authoritative
+            // check is the per-peer acknowledged version below.
             if session.check_saved_peer_info_update_to_date(peer_info.peer_id, peer_info.version) {
                 continue;
             }
@@ -3250,7 +3245,6 @@ impl PeerRouteServiceImpl {
         session: &SyncRouteSession,
         estimated_size: &mut usize,
     ) -> Option<RouteConnPeerList> {
-        let last_sync_succ_timestamp = session.last_sync_succ_timestamp.load();
         let mut peer_conn_infos = Vec::new();
         let mut included_peer_ids = HashSet::new();
         *estimated_size = 0;
@@ -3273,13 +3267,8 @@ impl PeerRouteServiceImpl {
                 + conn_info.connected_peers.len() * std::mem::size_of::<PeerId>();
         };
 
-        for (peer_id, conn_info) in conn_map.iter().rev() {
-            // stop iter if last_update of conn info is older than session.last_sync_succ_timestamp
-            let last_update = TryInto::<SystemTime>::try_into(conn_info.last_update).unwrap();
-            if last_sync_succ_timestamp.is_some_and(|t| last_update < t) {
-                break;
-            }
-
+        for (peer_id, conn_info) in conn_map.iter() {
+            // same as peer infos: never prune the remainder by timestamp
             if session.check_saved_conn_version_update_to_date(*peer_id, conn_info.version.get()) {
                 continue;
             }
