@@ -2,36 +2,26 @@
   <div class="topology-page">
     <div class="d-flex align-center mb-3 flex-wrap topology-head">
       <div class="page-title">{{ t('nav.topology') }}</div>
-      <v-chip
-        v-if="viewMode === 'detail' && drillGroup"
-        size="small"
-        variant="tonal"
-        color="primary"
-        class="ml-3"
-        prepend-icon="mdi-arrow-left"
-        @click="leaveGroupView"
-      >{{ drillGroup }} · 返回分组</v-chip>
       <v-spacer />
-      <template v-if="viewMode === 'detail' && drillGroup">
-        <v-btn
-          size="small"
-          variant="text"
-          :color="routeMode ? 'primary' : undefined"
-          prepend-icon="mdi-map-marker-path"
-          class="mr-2"
-          @click="toggleRoute"
-        >路由</v-btn>
-        <v-select
-          v-model="networkFilter"
-          :items="networkOptions"
-          item-title="title"
-          item-value="value"
-          density="compact"
-          variant="outlined"
-          hide-details
-          class="network-select mr-2"
-        />
-      </template>
+      <v-btn
+        v-if="viewMode === 'detail'"
+        size="small"
+        variant="text"
+        :color="routeMode ? 'primary' : undefined"
+        prepend-icon="mdi-map-marker-path"
+        class="mr-2"
+        @click="toggleRoute"
+      >路由</v-btn>
+      <v-select
+        v-model="networkFilter"
+        :items="networkOptions"
+        item-title="title"
+        item-value="value"
+        density="compact"
+        variant="outlined"
+        hide-details
+        class="network-select mr-2"
+      />
       <v-btn-toggle v-model="viewMode" mandatory density="compact" variant="text" divided class="mode-toggle">
         <v-btn value="detail" size="small">普通拓扑</v-btn>
         <v-btn value="circle" size="small">环形视图</v-btn>
@@ -77,8 +67,8 @@
           </div>
         </div>
       </div>
-      <div v-if="viewMode === 'detail' && drillGroup && marqueeRect" class="marquee-box" :style="marqueeRect"></div>
-      <div v-if="viewMode === 'detail' && drillGroup && isolated.length" class="isolated-panel">
+      <div v-if="viewMode === 'detail' && marqueeRect" class="marquee-box" :style="marqueeRect"></div>
+      <div v-if="viewMode === 'detail' && isolated.length" class="isolated-panel">
         <div class="isolated-title">未连接 ({{ isolated.length }})</div>
         <div class="isolated-body">
           <div v-for="n in isolated" :key="n.key" class="isolated-item">
@@ -87,7 +77,7 @@
           </div>
         </div>
       </div>
-      <div v-if="viewMode === 'detail' && drillGroup && routePath.length" class="route-panel">
+      <div v-if="viewMode === 'detail' && routePath.length" class="route-panel">
         <div class="route-title">
           路由路径 ({{ routePath.length - 1 }} 跳 / {{ routeLatency != null ? routeLatency.toFixed(2) + ' ms' : '-' }})
         </div>
@@ -764,10 +754,7 @@ function refreshIsolated() {
     if (node.status !== 'online') continue
     const insts = (node.snapshot && node.snapshot.instances) || []
     let mine = insts
-    if (drillGroup.value) {
-      // group drill-down: only report nodes of this p2p group
-      mine = mine.filter((i) => (i.p2p_group || '') === drillGroup.value)
-    } else if (networkFilter.value) {
+    if (networkFilter.value) {
       mine = mine.filter((i) => i.network_name === networkFilter.value)
     }
     if (!mine.length) continue
@@ -879,7 +866,14 @@ function computeLayout(force = false) {
   const clusters = [...groupMap.entries()].map(([g, list]) => ({ g, list: list.slice().sort(byName), relay: isRelayGroup(g) }))
   const relays = clusters.filter((c) => c.relay).sort((a, b) => a.g.localeCompare(b.g))
   const others = clusters.filter((c) => !c.relay).sort((a, b) => b.list.length - a.list.length || a.g.localeCompare(b.g))
-  const cols = [others.filter((_, i) => i % 2 === 0), relays, others.filter((_, i) => i % 2 === 1)].filter((c) => c.length)
+  // Preferred flat arrangement: cn on the left, IX groups in the middle
+  // column, overseas on the right (other groups fill the middle).
+  const rank = (g) => (g === 'cn' ? 0 : g === 'overseas' ? 2 : g.startsWith('ix') ? 1 : 1)
+  const cols = relays.length
+    ? [others.filter((_, i) => i % 2 === 0), relays, others.filter((_, i) => i % 2 === 1)].filter((c) => c.length)
+    : [0, 1, 2]
+        .map((k) => others.filter((c) => rank(c.g) === k))
+        .filter((c) => c.length)
   const COL_GAP = Math.round(Math.max(240, Math.min(330, width * 0.13)))
   const ROW_GAP = Math.round(Math.max(130, Math.min(180, height * 0.24)))
   const clusterW = COL_GAP + 170
@@ -2335,9 +2329,12 @@ function buildCircleOption() {
               fill: 'none',
               opacity: d.opacity,
               lineCap: 'round',
-              lineDash: d.active ? [6, 5] : undefined,
-              // reference animation: dashoffset -11px per 0.9s, linear
-              lineDashOffset: d.active ? -(((performance.now() % 900) / 900) * 11) : 0,
+              // thick links need a proportionally larger gap so the round dash
+              // caps never touch each other under heavy traffic
+              lineDash: d.active ? [6 + d.width * 0.9, 5 + d.width * 1.6] : undefined,
+              lineDashOffset: d.active
+                ? -(((performance.now() % 900) / 900) * (11 + d.width * 2.5))
+                : 0,
             },
           }]
           if (d.label) {
@@ -2722,7 +2719,6 @@ function onMatrixCell(cell, ev) {
 function buildOption() {
   if (viewMode.value === 'circle') return buildCircleOption()
   if (viewMode.value === 'traffic' || viewMode.value === 'latency' || viewMode.value === 'loss') return { animation: false, tooltip: { show: false }, series: [] }
-  if (viewMode.value === 'detail' && !drillGroup.value) return buildGroupLevelOption()
   return buildDetailOption()
 }
 
@@ -3185,20 +3181,6 @@ function setupDrag() {
   zr.on('mousedown', (e) => {
     if (viewMode.value !== 'detail') return
     const native = e.event || {}
-    if (!drillGroup.value) {
-      const g = hitGroup(e.offsetX, e.offsetY)
-      if (g != null) {
-        const pos = groupLayout.get(g)
-        const world = toWorld(e.offsetX, e.offsetY)
-        groupBoxDrag = { group: g, dx: world.x - pos.x, dy: world.y - pos.y, moved: false }
-        suppressClick = true
-        zr.setCursorStyle('grabbing')
-        return
-      }
-      pan = { x: e.offsetX, y: e.offsetY, tx: view.tx, ty: view.ty }
-      zr.setCursorStyle('grabbing')
-      return
-    }
     const id = hitNode(e.offsetX, e.offsetY)
     const world = toWorld(e.offsetX, e.offsetY)
     // right button: rubber-band selection of all nodes inside the area
@@ -3246,24 +3228,6 @@ function setupDrag() {
 
   zr.on('mousemove', (e) => {
     if (viewMode.value !== 'detail') return
-    if (groupBoxDrag) {
-      const world = toWorld(e.offsetX, e.offsetY)
-      groupLayout.set(groupBoxDrag.group, { x: world.x - groupBoxDrag.dx, y: world.y - groupBoxDrag.dy })
-      groupBoxDrag.moved = true
-      apply()
-      return
-    }
-    if (!drillGroup.value) {
-      if (pan) {
-        view.tx = pan.tx + (e.offsetX - pan.x)
-        view.ty = pan.ty + (e.offsetY - pan.y)
-        apply()
-        return
-      }
-      groupHoverAt(e.offsetX, e.offsetY)
-      zr.setCursorStyle(hitGroup(e.offsetX, e.offsetY) ? 'pointer' : 'grab')
-      return
-    }
     if (marquee) {
       const world = toWorld(e.offsetX, e.offsetY)
       marquee.x1 = world.x
@@ -3549,7 +3513,7 @@ onMounted(async () => {
       if (viewMode.value === 'circle' && params.seriesId === 'circle-nodes' && params.data) openNode(params.data.node)
       return
     }
-    if (!drillGroup.value) return
+
     const series = seriesOf(params)
     const data = params?.data
     if (!data) return
@@ -3574,10 +3538,6 @@ onMounted(async () => {
     const rect = chartEl.value.getBoundingClientRect()
     const localX = e.clientX - rect.left
     const localY = e.clientY - rect.top
-    if (viewMode.value === 'detail' && !drillGroup.value) {
-      groupHoverAt(localX, localY)
-      return
-    }
     if (viewMode.value === 'circle') circleHoverAt(localX, localY)
     else if (viewMode.value === 'traffic' || viewMode.value === 'latency') matrixHoverAt(localX, localY)
     else if (viewMode.value === 'detail') showHoverAt(localX, localY)
@@ -3612,8 +3572,7 @@ onMounted(async () => {
     animTick += 1
     const moving = tickLayoutAnim()
     if (animTick % 6 === 0) flowOffset = (flowOffset + 1.5) % 14
-    const groupLevel = viewMode.value === 'detail' && !drillGroup.value
-    if ((moving || groupLevel || animTick % 6 === 0) && chart) chart.setOption(buildOption(), true)
+    if ((moving || animTick % 6 === 0) && chart) chart.setOption(buildOption(), true)
   }, 33)
   window.addEventListener('resize', resize)
 })
