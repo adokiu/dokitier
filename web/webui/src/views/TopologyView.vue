@@ -54,7 +54,7 @@
           </div>
           <div class="matrix-gridwrap">
             <div class="matrix-rows" :style="{ width: matrixModel.labelW + 'px' }">
-              <div v-for="r in matrixModel.rows" :key="'rn' + r.i" class="matrix-row" :style="{ height: matrixModel.cell + 'px' }">
+              <div v-for="r in matrixModel.rows" :key="'rn' + r.i" class="matrix-row" :class="{ 'matrix-row--offline': r.offline }" :style="{ height: matrixModel.cell + 'px' }">
                 <span class="matrix-name">{{ r.name }}</span>
                 <span class="matrix-strip" :style="{ background: r.color }"></span>
               </div>
@@ -254,6 +254,8 @@ let flowOffset = 0
 let nodesTimer = null
 let refreshTick = 0
 let lastSampleTs = 0
+// peer_id -> last seen node object; offline nodes keep their matrix/ring slot
+const knownNodes = new Map()
 const prevTraffic = new Map()
 const edgeSamples = {}
 const historyRange = ref('live')
@@ -2157,7 +2159,7 @@ let circleGeom = null
 let matrixGeom = null
 
 function overviewData() {
-  const nodes = allGraph.nodes || []
+  const nodes = [...knownNodes.values()]
   const pairs = (allGraph.edges || []).map((e) => ({
     a: e.a,
     b: e.b,
@@ -2190,19 +2192,19 @@ function shortName(n) {
   return n.alias || n.hostname || String(n.peer_id)
 }
 
+// Ring/matrix order is permanent and data-independent: group order first, then
+// hostname/peer id. It never reshuffles when metrics update and it does not
+// depend on which nodes are online right now.
 function orderedNodes(byGroup, groups) {
   const out = []
-  const pool = allGraph.edges || []
   for (const g of groups) {
     const list = (byGroup.get(g) || []).slice()
-    if (!list.length) continue
-    const byId = new Map(list.map((n) => [n.peer_id, n]))
-    // spectral seriation: similar nodes (low latency) end up next to each other
-    const ids = spectralOrder(list, pool)
-    for (const id of ids) {
-      const node = byId.get(id)
-      if (node) out.push({ node, group: g })
-    }
+    list.sort((a, b) => {
+      const na = a.alias || a.hostname || String(a.peer_id)
+      const nb = b.alias || b.hostname || String(b.peer_id)
+      return na.localeCompare(nb) || a.peer_id - b.peer_id
+    })
+    for (const node of list) out.push({ node, group: g })
   }
   return out
 }
@@ -2292,7 +2294,14 @@ function buildCircleOption() {
     const ly = p.y + s * 13 + (Math.abs(c) <= 0.15 ? (s > 0 ? 8 : -8) : 0)
     const dim = hoverId != null && item.node.peer_id !== hoverId
     circleGeom.hit.push({ id: item.node.peer_id, x: p.x, y: p.y })
-    return { x: p.x, y: p.y, lx, ly, align, label: shortName(item.node), color: groupColor(item.group), dim, node: item.node }
+    return {
+      x: p.x, y: p.y, lx, ly, align,
+      label: shortName(item.node),
+      color: item.node.offline ? 'rgba(127,127,127,0.55)' : groupColor(item.group),
+      dim: dim || !!item.node.offline,
+      offline: !!item.node.offline,
+      node: item.node,
+    }
   })
   // group legend along the bottom (like the reference example)
   const legendGroups = groups.slice(0, 8)
@@ -2360,7 +2369,7 @@ function buildCircleOption() {
           return {
             type: 'group',
             children: [
-              { type: 'circle', shape: { cx: d.x, cy: d.y, r: 6 }, style: { fill: d.color, stroke: 'rgba(255,255,255,0.85)', lineWidth: 1.5, opacity: d.dim ? 0.35 : 1 } },
+              { type: 'circle', shape: { cx: d.x, cy: d.y, r: d.offline ? 5 : 6 }, style: { fill: d.color, stroke: 'rgba(255,255,255,0.85)', lineWidth: 1.5, opacity: d.dim ? 0.35 : 1 } },
               {
                 type: 'text',
                 style: {
@@ -2589,7 +2598,7 @@ function buildMatrixModel() {
     if (i == null || j == null) continue
     pairMap.set(`${Math.min(i, j)}:${Math.max(i, j)}`, pr)
   }
-  const rows = ordered.map((item, i) => ({ i, name: `${i + 1} ${shortName(item.node)}`, color: groupColor(item.group) }))
+  const rows = ordered.map((item, i) => ({ i, name: `${i + 1} ${shortName(item.node)}`, color: groupColor(item.group), offline: !!item.node.offline }))
   let maxTraffic = 0
   for (const pr of pairMap.values()) maxTraffic = Math.max(maxTraffic, pr.traffic || 0)
   if (maxTraffic <= 0) maxTraffic = 1024 * 1024
@@ -3364,11 +3373,20 @@ function computeTunnelBps(key, tunnels, now, dt) {
 }
 
 function ingestBoard(board) {
-  overviewReportId += 1
   const now = Math.floor(Date.now() / 1000)
   const dt = lastSampleTs ? Math.max(0.5, now - lastSampleTs) : 1
   const raw = board.graph || { nodes: [], edges: [] }
   allGraph = raw
+  const present = new Set()
+  for (const n of raw.nodes || []) {
+    present.add(n.peer_id)
+    const prev = knownNodes.get(n.peer_id)
+    knownNodes.set(n.peer_id, { ...n, offline: false })
+    if (prev && prev.group !== undefined) knownNodes.get(n.peer_id).group = prev.group
+  }
+  for (const [pid, rec] of knownNodes) {
+    if (!present.has(pid)) rec.offline = true
+  }
   // latency/loss history is sampled from the raw board data (like the compiled build)
   for (const e of raw.edges || []) {
     const key = keyOf(e.a, e.b)
@@ -3439,7 +3457,9 @@ async function load(silent = false) {
       }
       return
     }
-  } catch {}
+  } catch (e) {
+    console.error('topology load failed', e)
+  }
   if (silent) return
   try {
     const data = await api.topology()
@@ -3687,6 +3707,8 @@ onBeforeUnmount(() => {
   border-radius: 2px;
   flex: 0 0 auto;
 }
+.matrix-row--offline .matrix-name { opacity: 0.45; }
+.matrix-row--offline .matrix-strip { opacity: 0.45; }
 .matrix-name {
   flex: 1 1 auto;
   min-width: 0;

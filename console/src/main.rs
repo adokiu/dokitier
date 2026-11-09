@@ -173,7 +173,36 @@ struct AppState {
     last_traffic: std::sync::Arc<dashmap::DashMap<String, (i64, u64, u64)>>,
     edge_traffic: std::sync::Arc<dashmap::DashMap<String, (i64, u64, u64)>>,
     edge_rates: std::sync::Arc<dashmap::DashMap<String, (f64, f64)>>,
+    node_rt: std::sync::Arc<dashmap::DashMap<String, NodeRt>>,
+    rt_flush: std::sync::Arc<dashmap::DashMap<String, i64>>,
     geo_attempts: std::sync::Arc<dashmap::DashMap<String, i64>>,
+}
+
+/// Live node state, authoritative for every realtime API. Only the periodic
+/// flusher writes this to the database (batch, every 60s per node).
+#[derive(Clone, Default)]
+struct NodeRt {
+    ts: i64,
+    last_seen: i64,
+    online: bool,
+    hostname: String,
+    version: String,
+    networks: Value,
+    snapshot: Value,
+    system: Value,
+    public_ipv4: Option<String>,
+    public_ipv6: Option<String>,
+    country_code: Option<String>,
+    cpu_pct: f32,
+    mem_pct: f32,
+    mem_used: i64,
+    mem_total: i64,
+    rx_bps: f64,
+    tx_bps: f64,
+    traffic: Value,
+    listeners: Vec<String>,
+    prev_bytes: Option<(i64, u64, u64)>,
+    pending_links: Vec<(String, i64, i64, Option<String>, Option<String>, i64, Option<f64>, Option<f64>)>,
 }
 
 static POSTGRES: AtomicBool = AtomicBool::new(false);
@@ -435,6 +464,96 @@ async fn verify_node(db: &AnyPool, node_id: &str, token: &str) -> bool {
     let row: Option<(String,)> = sqlx::query_as(&q("SELECT token_hash FROM nodes WHERE node_id = ?"))
         .bind(node_id).fetch_optional(db).await.ok().flatten();
     row.is_some_and(|(hash,)| hash == hash_token(token))
+}
+
+/// Merge one agent snapshot into the in-memory runtime registry. This is the
+/// only place realtime values are produced; nothing here touches SQL.
+fn apply_snapshot_to_rt(state: &AppState, node_id: &str, data: &Value) {
+    let now_ts = now();
+    let mut rx_total = 0u64;
+    let mut tx_total = 0u64;
+    let mut by_network: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut pending: Vec<(String, i64, i64, Option<String>, Option<String>, i64, Option<f64>, Option<f64>)> = Vec::new();
+    let mut nets: Vec<Value> = Vec::new();
+    if let Some(instances) = data.get("instances").and_then(|v| v.as_array()) {
+        for inst in instances {
+            let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
+            if !network.is_empty() && !nets.iter().any(|v| v.as_str() == Some(network)) {
+                nets.push(json!(network));
+            }
+            let Some(topo) = inst.get("topology") else { continue };
+            let mut peer_uuid: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+            for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
+                let id = n.get("peer_id").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
+                if let Some(uuid) = n.get("instance_id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                    peer_uuid.insert(id, uuid.to_string());
+                }
+            }
+            for edge in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
+                let a = edge.get("a").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
+                let b = edge.get("b").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
+                let tunnels = edge.get("tunnels").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                for tunnel in &tunnels {
+                    let rx = tunnel.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let tx = tunnel.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    rx_total += rx;
+                    tx_total += tx;
+                    if !network.is_empty() {
+                        *by_network.entry(network.to_string()).or_insert(0) += rx + tx;
+                    }
+                }
+                let latency = tunnels.iter().filter_map(|t| t.get("latency_ms").and_then(|v| v.as_f64())).reduce(f64::min);
+                let loss = tunnels.iter().filter_map(|t| t.get("loss_pct").and_then(|v| v.as_f64())).reduce(|x, y| x + y)
+                    .map(|v| v / tunnels.len().max(1) as f64);
+                let (a_uuid, b_uuid) = match (peer_uuid.get(&a), peer_uuid.get(&b)) {
+                    (Some(ua), Some(ub)) if ua <= ub => (Some(ua.clone()), Some(ub.clone())),
+                    (Some(ua), Some(ub)) => (Some(ub.clone()), Some(ua.clone())),
+                    _ => (peer_uuid.get(&a).cloned(), peer_uuid.get(&b).cloned()),
+                };
+                pending.push((network.to_string(), a, b, a_uuid, b_uuid, now_ts, latency, loss));
+            }
+        }
+    }
+    let merged = json!({"ts": now_ts, "instances": data.get("instances").cloned().unwrap_or(json!([]))});
+    let mut rt = state.node_rt.entry(node_id.to_string()).or_default();
+    let (prev_ts, prev_rx, prev_tx) = rt.prev_bytes.unwrap_or((now_ts, 0, 0));
+    let elapsed = (now_ts - prev_ts).max(1) as f64;
+    let mut rx_bps = 0.0;
+    let mut tx_bps = 0.0;
+    if rt.prev_bytes.is_some() {
+        rx_bps = rx_total.saturating_sub(prev_rx) as f64 / elapsed;
+        tx_bps = tx_total.saturating_sub(prev_tx) as f64 / elapsed;
+    }
+    rt.ts = now_ts;
+    rt.last_seen = now_ts;
+    rt.online = true;
+    rt.hostname = data.pointer("/instances/0/hostname").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    rt.version = data.pointer("/instances/0/version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !nets.is_empty() {
+        rt.networks = Value::Array(nets);
+    }
+    rt.snapshot = merged;
+    if let Some(sys) = data.get("system").filter(|v| !v.is_null()) {
+        rt.system = sys.clone();
+        if let Some(listener) = sys.get("shared_listener").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+            rt.listeners = listener.split(',').map(str::trim).filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
+        }
+    }
+    rt.public_ipv4 = data.get("public_ipv4").and_then(|v| v.as_str()).map(|v| v.to_string()).or(rt.public_ipv4.clone());
+    rt.public_ipv6 = data.get("public_ipv6").and_then(|v| v.as_str()).map(|v| v.to_string()).or(rt.public_ipv6.clone());
+    rt.cpu_pct = data.get("cpu_pct").and_then(|v| v.as_f64()).unwrap_or(rt.cpu_pct as f64) as f32;
+    rt.mem_pct = data.get("mem_pct").and_then(|v| v.as_f64()).unwrap_or(rt.mem_pct as f64) as f32;
+    if let Some(v) = data.get("mem_used").and_then(|v| v.as_u64()) { rt.mem_used = v as i64; }
+    if let Some(v) = data.get("mem_total").and_then(|v| v.as_u64()) { rt.mem_total = v as i64; }
+    rt.rx_bps = rx_bps;
+    rt.tx_bps = tx_bps;
+    rt.traffic = json!(by_network);
+    rt.prev_bytes = Some((now_ts, rx_total, tx_total));
+    rt.pending_links.extend(pending);
+    if rt.pending_links.len() > 5000 {
+        let drop = rt.pending_links.len() - 5000;
+        rt.pending_links.drain(0..drop);
+    }
 }
 
 async fn touch_node(db: &AnyPool, node_id: &str, hostname: Option<&str>, version: Option<&str>,
@@ -717,14 +836,14 @@ fn spawn_bandwidth_sampler(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let rows: Vec<(f64, f64)> = sqlx::query_as(
-                "SELECT rx_bps, tx_bps FROM nodes WHERE status = 'online'",
-            )
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-            let rx: f64 = rows.iter().map(|(rx, _)| *rx).sum();
-            let tx: f64 = rows.iter().map(|(_, tx)| *tx).sum();
+            let now_ts = now();
+            let totals: (f64, f64) = state
+                .node_rt
+                .iter()
+                .filter(|e| e.value().online && now_ts - e.value().ts <= 30)
+                .fold((0.0, 0.0), |acc, e| (acc.0 + e.value().rx_bps, acc.1 + e.value().tx_bps));
+            let rx = totals.0;
+            let tx = totals.1;
             {
                 let ts = now();
                 let _ = sqlx::query(&q("INSERT INTO bandwidth_samples (ts, rx_bps, tx_bps) VALUES (?, ?, ?)"))
@@ -2016,68 +2135,32 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
             Ok(())
         }
         AgentFrame::Heartbeat { node_id, .. } => {
-            touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
+            if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+                rt.last_seen = now();
+                rt.online = true;
+            }
+            Ok(())
         }
         AgentFrame::Snapshot { node_id, data } => {
-            let v4 = data.get("public_ipv4").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let v6 = data.get("public_ipv6").and_then(|v| v.as_str()).map(|s| s.to_string());
-            update_public_ip(&state.db, &node_id, v4.as_deref(), v6.as_deref()).await;
-            // resolve geo for nodes that still have no country (throttled per node)
-            if let Some(ip) = v4.clone().or(v6.clone()) {
-                let has_country: Option<(Option<String>,)> = sqlx::query_as(&q("SELECT country_code FROM nodes WHERE node_id = ?"))
-                    .bind(&node_id).fetch_optional(&state.db).await.ok().flatten();
-                let missing = has_country.and_then(|(c,)| c).map(|c| c.is_empty()).unwrap_or(true);
-                let now_ts = now();
-                let due = state.geo_attempts.get(&node_id).map(|v| now_ts - *v > 300).unwrap_or(true);
-                if missing && due {
-                    state.geo_attempts.insert(node_id.clone(), now_ts);
-                    let db = state.db.clone();
-                    let id = node_id.clone();
-                    tokio::spawn(async move { lookup_and_store_country(db, id, ip).await });
-                }
-            }
-            update_traffic(state, &node_id, &data).await;
-            let cpu_pct = data.get("cpu_pct").and_then(|v| v.as_f64()).map(|v| v as f32);
-            let mem_pct = data.get("mem_pct").and_then(|v| v.as_f64()).map(|v| v as f32);
-            let mem_used = data.get("mem_used").and_then(|v| v.as_u64()).map(|v| v as i64);
-            let mem_total = data.get("mem_total").and_then(|v| v.as_u64()).map(|v| v as i64);
-            let _ = sqlx::query(&q("UPDATE nodes SET cpu_pct = COALESCE(?, cpu_pct), mem_pct = COALESCE(?, mem_pct), mem_used = COALESCE(?, mem_used), mem_total = COALESCE(?, mem_total) WHERE node_id = ?"))
-                .bind(cpu_pct).bind(mem_pct).bind(mem_used).bind(mem_total).bind(&node_id)
-                .execute(&state.db).await;
-            let merged = merge_snapshot(state, &node_id, &data).await;
-            if let Some(instances) = data.get("instances").and_then(|v| v.as_array()) {
-                for inst in instances {
-                    let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
-                    let Some(topo) = inst.get("topology") else { continue };
-                    let mut peer_uuid: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-                    for node in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
-                        let id = node.get("peer_id").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
-                        if let Some(uuid) = node.get("instance_id").and_then(|v| v.as_str()) {
-                            if !uuid.is_empty() {
-                                peer_uuid.insert(id, uuid.to_string());
-                            }
-                        }
-                    }
-                    for e in topo.get("edges").and_then(|v| v.as_array()).into_iter().flatten() {
-                        let a = e.get("a").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
-                        let b = e.get("b").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
-                        let tunnels = e.get("tunnels").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                        let latency = tunnels.iter().filter_map(|t| t.get("latency_ms").and_then(|v| v.as_f64())).reduce(f64::min);
-                        let loss = tunnels.iter().filter_map(|t| t.get("loss_pct").and_then(|v| v.as_f64())).reduce(|x, y| x + y).map(|v| v / tunnels.len().max(1) as f64);
-                        let (a_uuid, b_uuid) = match (peer_uuid.get(&a), peer_uuid.get(&b)) {
-                            (Some(ua), Some(ub)) if ua <= ub => (Some(ua.clone()), Some(ub.clone())),
-                            (Some(ua), Some(ub)) => (Some(ub.clone()), Some(ua.clone())),
-                            _ => (peer_uuid.get(&a).cloned(), peer_uuid.get(&b).cloned()),
-                        };
-                        let _ = sqlx::query(&q("INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
-                            .bind(network).bind(a).bind(b).bind(a_uuid).bind(b_uuid).bind(now()).bind(latency).bind(loss)
-                            .execute(&state.db).await;
+            // Memory only: the runtime registry is the authoritative source for
+            // every realtime API; SQL is written by the periodic batch flusher.
+            apply_snapshot_to_rt(state, &node_id, &data);
+            let rt = state
+                .node_rt
+                .get(&node_id)
+                .map(|r| (r.public_ipv4.clone(), r.public_ipv6.clone()));
+            if let Some((v4, v6)) = rt {
+                if let Some(ip) = v4.or(v6) {
+                    let due = state.geo_attempts.get(&node_id).map(|v| now() - *v > 300).unwrap_or(true);
+                    if due {
+                        state.geo_attempts.insert(node_id.clone(), now());
+                        let db = state.db.clone();
+                        let id = node_id.clone();
+                        tokio::spawn(async move { lookup_and_store_country(db, id, ip).await });
                     }
                 }
             }
-            let hostname = data.pointer("/instances/0/hostname").and_then(|v| v.as_str());
-            let version = data.pointer("/instances/0/version").and_then(|v| v.as_str());
-            touch_node(&state.db, &node_id, hostname, version, None, Some(&merged), "online").await; Ok(())
+            Ok(())
         }
         AgentFrame::Result { node_id, .. } => {
             touch_node(&state.db, &node_id, None, None, None, None, "online").await; Ok(())
@@ -2170,7 +2253,10 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
         let prefix = format!("{id}:");
         let keys: Vec<String> = state.agents.iter().filter(|e| e.key().starts_with(&prefix)).map(|e| e.key().clone()).collect();
         for key in keys { state.agents.remove(&key); }
-        touch_node(&state.db, &id, None, None, None, None, "offline").await;
+        if let Some(mut rt) = state.node_rt.get_mut(&id) {
+            rt.online = false;
+            rt.last_seen = now();
+        }
     }
 }
 
@@ -2216,8 +2302,11 @@ struct NodeView {
 }
 
 async fn nodes_payload(state: &AppState) -> Value {
-    let rows = sqlx::query(&q(
-        "SELECT node_id, hostname, version, networks, snapshot, last_seen, status, public_ipv4, public_ipv6, country_code, rx_bps, tx_bps, alias, cpu_pct, mem_pct, mem_used, mem_total, node_uuid, system_info, traffic, bandwidth_mbps, bandwidth_up_mbps, bandwidth_down_mbps, bandwidth_intranet_down_mbps, bandwidth_internet_down_mbps, shared_listeners FROM nodes ORDER BY node_id",
+    // Static inventory (alias, uuid, configured bandwidth, listeners) comes from
+    // SQL; every realtime field comes from the in-memory runtime registry.
+    #[allow(clippy::type_complexity)]
+    let static_rows: Vec<(String, Option<String>, Option<String>, Option<String>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<String>)> = sqlx::query_as(&q(
+        "SELECT node_id, alias, country_code, node_uuid, bandwidth_mbps, bandwidth_up_mbps, bandwidth_down_mbps, bandwidth_intranet_down_mbps, bandwidth_internet_down_mbps, shared_listeners FROM nodes",
     )).fetch_all(&state.db).await.unwrap_or_default();
     let instance_rows = sqlx::query(&q("SELECT node_id, network, instance_id FROM network_instances"))
         .fetch_all(&state.db)
@@ -2230,38 +2319,62 @@ async fn nodes_payload(state: &AppState) -> Value {
         let instance_id: String = row.try_get("instance_id").unwrap_or_default();
         instance_map.entry(node_id).or_default().push(json!({"network": network, "instance_id": instance_id}));
     }
+    struct Static {
+        alias: Option<String>,
+        country: Option<String>,
+        uuid: Option<String>,
+        bw: Option<f32>,
+        bw_up: Option<f32>,
+        bw_down: Option<f32>,
+        bw_intra: Option<f32>,
+        bw_inet: Option<f32>,
+        listeners: Option<String>,
+    }
+    let mut statics: std::collections::BTreeMap<String, Static> = std::collections::BTreeMap::new();
+    for (node_id, alias, country, uuid, bw, bw_up, bw_down, bw_intra, bw_inet, listeners) in static_rows {
+        statics.insert(node_id, Static { alias, country, uuid, bw, bw_up, bw_down, bw_intra, bw_inet, listeners });
+    }
+    let mut ids: std::collections::BTreeSet<String> = statics.keys().cloned().collect();
+    ids.extend(state.node_rt.iter().map(|e| e.key().clone()));
+    let now_ts = now();
     let mut nodes = Vec::new();
-    for row in rows {
-        let networks: String = row.try_get("networks").unwrap_or_default();
-        let snapshot: String = row.try_get("snapshot").unwrap_or_default();
+    for node_id in ids {
+        let meta = statics.get(&node_id);
+        let rt = state.node_rt.get(&node_id).map(|r| r.clone());
+        let live = rt.filter(|r| now_ts - r.ts <= 30);
+        let status = if live.is_some() { "online".to_string() } else { "offline".to_string() };
         nodes.push(NodeView {
-            node_id: row.try_get("node_id").unwrap_or_default(),
-            hostname: row.try_get("hostname").unwrap_or_default(),
-            version: row.try_get("version").unwrap_or_default(),
-            networks: serde_json::from_str(&networks).unwrap_or(Value::Null),
-            snapshot: serde_json::from_str(&snapshot).unwrap_or(Value::Null),
-            last_seen: row.try_get("last_seen").unwrap_or_default(),
-            status: row.try_get("status").unwrap_or_default(),
-            public_ipv4: row.try_get("public_ipv4").ok(),
-            public_ipv6: row.try_get("public_ipv6").ok(),
-            country_code: row.try_get("country_code").ok(),
-            rx_bps: row.try_get("rx_bps").ok(),
-            tx_bps: row.try_get("tx_bps").ok(),
-            alias: row.try_get("alias").ok(),
-            cpu_pct: row.try_get("cpu_pct").ok(),
-            mem_pct: row.try_get("mem_pct").ok(),
-            mem_used: row.try_get("mem_used").ok(),
-            mem_total: row.try_get("mem_total").ok(),
-            node_uuid: row.try_get("node_uuid").ok(),
-            system_info: serde_json::from_str(&row.try_get::<String, _>("system_info").unwrap_or_default()).unwrap_or(Value::Null),
-            traffic: serde_json::from_str(&row.try_get::<String, _>("traffic").unwrap_or_default()).unwrap_or(Value::Null),
-            bandwidth_mbps: row.try_get("bandwidth_mbps").ok(),
-            bandwidth_up_mbps: row.try_get("bandwidth_up_mbps").ok(),
-            bandwidth_down_mbps: row.try_get("bandwidth_down_mbps").ok(),
-            bandwidth_intranet_down_mbps: row.try_get("bandwidth_intranet_down_mbps").ok(),
-            bandwidth_internet_down_mbps: row.try_get("bandwidth_internet_down_mbps").ok(),
-            shared_listeners: row.try_get("shared_listeners").ok(),
-            instance_ids: json!(instance_map.get(&row.try_get::<String, _>("node_id").unwrap_or_default()).cloned().unwrap_or_default()),
+            node_id: node_id.clone(),
+            hostname: live.as_ref().map(|r| r.hostname.clone()).unwrap_or_default(),
+            version: live.as_ref().map(|r| r.version.clone()).unwrap_or_default(),
+            networks: live.as_ref().map(|r| r.networks.clone()).unwrap_or(Value::Null),
+            snapshot: live.as_ref().map(|r| r.snapshot.clone()).unwrap_or(Value::Null),
+            last_seen: live.as_ref().map(|r| r.last_seen).unwrap_or(0),
+            status,
+            public_ipv4: live.as_ref().and_then(|r| r.public_ipv4.clone()),
+            public_ipv6: live.as_ref().and_then(|r| r.public_ipv6.clone()),
+            country_code: meta.and_then(|m| m.country.clone()),
+            rx_bps: live.as_ref().map(|r| r.rx_bps as f32),
+            tx_bps: live.as_ref().map(|r| r.tx_bps as f32),
+            alias: meta.and_then(|m| m.alias.clone()),
+            cpu_pct: live.as_ref().map(|r| r.cpu_pct),
+            mem_pct: live.as_ref().map(|r| r.mem_pct),
+            mem_used: live.as_ref().map(|r| r.mem_used),
+            mem_total: live.as_ref().map(|r| r.mem_total),
+            node_uuid: meta.and_then(|m| m.uuid.clone()),
+            system_info: live.as_ref().map(|r| r.system.clone()).unwrap_or(Value::Null),
+            traffic: live.as_ref().map(|r| r.traffic.clone()).unwrap_or(Value::Null),
+            bandwidth_mbps: meta.and_then(|m| m.bw),
+            bandwidth_up_mbps: meta.and_then(|m| m.bw_up),
+            bandwidth_down_mbps: meta.and_then(|m| m.bw_down),
+            bandwidth_intranet_down_mbps: meta.and_then(|m| m.bw_intra),
+            bandwidth_internet_down_mbps: meta.and_then(|m| m.bw_inet),
+            shared_listeners: live
+                .as_ref()
+                .map(|r| r.listeners.join(","))
+                .filter(|v| !v.is_empty())
+                .or_else(|| meta.and_then(|m| m.listeners.clone())),
+            instance_ids: json!(instance_map.get(&node_id).cloned().unwrap_or_default()),
         });
     }
     json!({"nodes": nodes})
@@ -2740,9 +2853,104 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
             let prefix = format!("{node_id}:");
             let keys: Vec<String> = state.agents.iter().filter(|e| e.key().starts_with(&prefix)).map(|e| e.key().clone()).collect();
             for key in keys { state.agents.remove(&key); }
-            touch_node(&state.db, node_id, None, None, None, None, "offline").await;
+            if let Some(mut rt) = state.node_rt.get_mut(node_id) {
+                rt.online = false;
+                rt.last_seen = now();
+            }
         });
     }
+}
+
+fn spawn_snapshot_flusher(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let now_ts = now();
+            let due: Vec<(String, NodeRt)> = state
+                .node_rt
+                .iter()
+                .filter(|e| now_ts - state.rt_flush.get(e.key()).map(|v| *v).unwrap_or(0) >= 60)
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .collect();
+            if due.is_empty() {
+                continue;
+            }
+            let mut tx = match state.db.begin().await {
+                Ok(tx) => tx,
+                Err(_) => continue,
+            };
+            let mut ok = true;
+            let mut flushed: Vec<(String, i64)> = Vec::new();
+            for (node_id, rt) in due {
+                let st = if rt.online { "online" } else { "offline" };
+                let res = sqlx::query(&q("UPDATE nodes SET last_seen = ?, status = ?, \
+                        hostname = COALESCE(NULLIF(?, ''), hostname), \
+                        version = COALESCE(NULLIF(?, ''), version), \
+                        networks = COALESCE(?, networks), snapshot = ?, \
+                        system_info = COALESCE(?, system_info), \
+                        public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6), \
+                        cpu_pct = ?, mem_pct = ?, mem_used = ?, mem_total = ?, \
+                        rx_bps = ?, tx_bps = ?, traffic = ?, \
+                        shared_listeners = COALESCE(NULLIF(?, ''), shared_listeners) WHERE node_id = ?"))
+                    .bind(rt.last_seen)
+                    .bind(st)
+                    .bind(rt.hostname.clone())
+                    .bind(rt.version.clone())
+                    .bind(if rt.networks.is_null() { None } else { Some(rt.networks.to_string()) })
+                    .bind(rt.snapshot.to_string())
+                    .bind(if rt.system.is_null() { None } else { Some(rt.system.to_string()) })
+                    .bind(rt.public_ipv4.clone())
+                    .bind(rt.public_ipv6.clone())
+                    .bind(rt.cpu_pct)
+                    .bind(rt.mem_pct)
+                    .bind(rt.mem_used)
+                    .bind(rt.mem_total)
+                    .bind(rt.rx_bps)
+                    .bind(rt.tx_bps)
+                    .bind(rt.traffic.to_string())
+                    .bind(rt.listeners.join(","))
+                    .bind(&node_id)
+                    .execute(&mut *tx)
+                    .await;
+                if res.is_err() {
+                    ok = false;
+                    continue;
+                }
+                for (network, a, b, a_uuid, b_uuid, ts, latency, loss) in &rt.pending_links {
+                    let ins = sqlx::query(&q("INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
+                        .bind(network)
+                        .bind(a)
+                        .bind(b)
+                        .bind(a_uuid.clone())
+                        .bind(b_uuid.clone())
+                        .bind(ts)
+                        .bind(latency)
+                        .bind(loss)
+                        .execute(&mut *tx)
+                        .await;
+                    if ins.is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    flushed.push((node_id, rt.ts));
+                }
+            }
+            if ok {
+                if tx.commit().await.is_ok() {
+                    for (node_id, up_to) in flushed {
+                        if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+                            rt.pending_links.retain(|row| row.5 > up_to);
+                        }
+                        state.rt_flush.insert(node_id, now_ts);
+                    }
+                }
+            } else {
+                let _ = tx.rollback().await;
+            }
+        }
+    });
 }
 
 fn spawn_edge_rate_sampler(state: AppState) {
@@ -2753,16 +2961,13 @@ fn spawn_edge_rate_sampler(state: AppState) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let rows = match sqlx::query_as::<_, (String,)>("SELECT snapshot FROM nodes")
-                .fetch_all(&state.db)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!("edge rate sampler db error: {e}");
-                    continue;
-                }
-            };
+            let fresh_before = now() - 30;
+            let rows: Vec<(String,)> = state
+                .node_rt
+                .iter()
+                .filter(|e| e.value().ts >= fresh_before)
+                .map(|e| (e.value().snapshot.to_string(),))
+                .collect();
             let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (snapshot,) in rows {
                 let Ok(value) = serde_json::from_str::<Value>(&snapshot) else { continue };
@@ -2787,14 +2992,29 @@ fn spawn_edge_rate_sampler(state: AppState) {
                             if !seen_keys.insert(key.clone()) {
                                 continue;
                             }
-                            if let Some(prev) = state.edge_traffic.get(&key) {
-                                let (ts, prx, ptx) = *prev;
-                                let elapsed = ((now_ms - ts) as f64 / 1000.0).max(0.2);
-                                let drx = rx.saturating_sub(prx) as f64 / elapsed;
-                                let dtx = tx.saturating_sub(ptx) as f64 / elapsed;
-                                state.edge_rates.insert(key.clone(), (drx, dtx));
+                            // Counters only move when a node reports (every few
+                            // seconds), so a 1s sample would otherwise read 0 in
+                            // between. Keep the last computed rate until the
+                            // counters actually change, and only decay to zero
+                            // after a few seconds without any movement.
+                            let prev = state.edge_traffic.get(&key).map(|v| *v);
+                            match prev {
+                                Some((ts, prx, ptx)) if rx > prx || tx > ptx => {
+                                    let elapsed = ((now_ms - ts) as f64 / 1000.0).max(0.2);
+                                    let drx = rx.saturating_sub(prx) as f64 / elapsed;
+                                    let dtx = tx.saturating_sub(ptx) as f64 / elapsed;
+                                    state.edge_rates.insert(key.clone(), (drx, dtx));
+                                    state.edge_traffic.insert(key.clone(), (now_ms, rx, tx));
+                                }
+                                Some((ts, _prx, _ptx)) => {
+                                    if now_ms - ts > 6000 {
+                                        state.edge_rates.insert(key.clone(), (0.0, 0.0));
+                                    }
+                                }
+                                None => {
+                                    state.edge_traffic.insert(key.clone(), (now_ms, rx, tx));
+                                }
                             }
-                            state.edge_traffic.insert(key, (now_ms, rx, tx));
                         }
                     }
                 }
@@ -2804,10 +3024,14 @@ fn spawn_edge_rate_sampler(state: AppState) {
 }
 
 async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filter: Option<&str>) -> Value {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT node_id, snapshot FROM nodes")
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    // realtime data comes exclusively from the in-memory runtime registry
+    let fresh_before = now() - 30;
+    let rows: Vec<(String, String)> = state
+        .node_rt
+        .iter()
+        .filter(|e| e.value().ts >= fresh_before)
+        .map(|e| (e.key().clone(), e.value().snapshot.to_string()))
+        .collect();
     // nodes are keyed by (network, peer_id): the same peer exists independently
     // in every network instance and must not collapse into one row.
     let mut nodes: std::collections::BTreeMap<(String, u32), Value> = std::collections::BTreeMap::new();
@@ -3320,15 +3544,18 @@ async fn board_links(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn board_overview(State(state): State<AppState>) -> Json<Value> {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT status, snapshot FROM nodes")
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+    let now_ts = now();
+    let mut rows: Vec<(bool, Value)> = Vec::new();
+    for e in state.node_rt.iter() {
+        let rt = e.value();
+        let fresh = now_ts - rt.ts <= 30;
+        rows.push((fresh && rt.online, rt.snapshot.clone()));
+    }
     let total = rows.len();
-    let online = rows.iter().filter(|(status, _)| status == "online").count();
+    let online = rows.iter().filter(|(online, _)| *online).count();
     let mut networks: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-    for (_, snapshot) in &rows {
-        let Ok(value) = serde_json::from_str::<Value>(snapshot) else { continue };
+    for (_, value) in &rows {
+        let value = value.clone();
         for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
             let name = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default();
             if name.is_empty() { continue; }
@@ -3764,9 +3991,12 @@ async fn main() -> anyhow::Result<()> {
         last_traffic: std::sync::Arc::new(dashmap::DashMap::new()),
         edge_traffic: std::sync::Arc::new(dashmap::DashMap::new()),
         edge_rates: std::sync::Arc::new(dashmap::DashMap::new()),
+        node_rt: std::sync::Arc::new(dashmap::DashMap::new()),
+        rt_flush: std::sync::Arc::new(dashmap::DashMap::new()),
         geo_attempts: std::sync::Arc::new(dashmap::DashMap::new()) };
     spawn_bandwidth_sampler(state.clone());
     spawn_edge_rate_sampler(state.clone());
+    spawn_snapshot_flusher(state.clone());
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
