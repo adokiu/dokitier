@@ -15,6 +15,7 @@ INSTALL_DIR="$DEFAULT_INSTALL_DIR"
 SERVICE="$DEFAULT_SERVICE"
 INTERVAL="1"
 INSECURE=0
+NO_SERVICE=0
 
 usage() {
   cat <<'USAGE'
@@ -27,6 +28,7 @@ usage() {
   --service-name <n>   systemd service name (default: dokitier-core)
   -i <seconds>         report interval seconds (default: 1)
   --insecure           skip TLS certificate verification when downloading
+  --no-service         only install the binary and config (no systemd service)
 USAGE
 }
 
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --service-name) SERVICE="$2"; shift 2 ;;
     -i) INTERVAL="$2"; shift 2 ;;
     --insecure) INSECURE=1; shift ;;
+    --no-service) NO_SERVICE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1"; usage; exit 1 ;;
   esac
@@ -101,6 +104,11 @@ interval_secs = ${INTERVAL}
 [flags]
 no_tun = false
 CONF
+
+if [[ "$NO_SERVICE" == "1" ]]; then
+  echo "==> --no-service: binary and config installed in ${INSTALL_DIR}"
+  exit 0
+fi
 
 echo "==> installing systemd service ${SERVICE}"
 cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
