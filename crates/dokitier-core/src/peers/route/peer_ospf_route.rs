@@ -941,9 +941,6 @@ struct SyncedRouteInfo {
     // reachability, but excluded from forwarding until owner election selects them.
     suppressed_non_reusable_credential_peers: DashMap<PeerId, ()>,
 
-    /// stale peer incarnations that must stay evicted even if other peers keep
-    /// re-advertising them (value = (instance id, current incarnation peer id))
-    stale_peer_incarnations: DashMap<PeerId, (uuid::Uuid, PeerId)>,
 
     version: AtomicVersion,
 }
@@ -1404,19 +1401,6 @@ impl SyncedRouteInfo {
         let mut need_inc_version = false;
         for (idx, route_info) in peer_infos.iter().enumerate() {
             let mut route_info = route_info.clone();
-            // a restarted node's previous incarnation stays suppressed: peers
-            // may keep re-advertising it forever, but it must not come back
-            if let Some(entry) = self.stale_peer_incarnations.get(&route_info.peer_id) {
-                let suppressed_inst = entry.value().0;
-                let incoming_inst = route_info
-                    .inst_id
-                    .as_ref()
-                    .map(|id| uuid::Uuid::from(*id))
-                    .unwrap_or(uuid::Uuid::nil());
-                if suppressed_inst == incoming_inst {
-                    continue;
-                }
-            }
             let raw_route_info = &raw_peer_infos[idx];
             self.check_duplicate_peer_id(
                 my_peer_id,
@@ -1434,9 +1418,16 @@ impl SyncedRouteInfo {
             )?;
 
             let mut guard = self.peer_infos.write();
-            // time between peers may not be synchronized, so update last_update to local now.
-            // note only last_update with larger version will be updated to local saved peer info.
-            route_info.last_update = Some(Timestamp::now());
+            // Preserve the origin's last_update instead of stamping "now" on every
+            // flooded copy. Overwriting it made dead incarnations look fresh
+            // forever, so a restarted node's old peer_id never aged out and the
+            // topology kept showing zombie nodes.
+            let incoming_ts = route_info.last_update;
+            let previous_ts = guard.get(&route_info.peer_id).and_then(|old| old.last_update);
+            route_info.last_update = match (incoming_ts, previous_ts) {
+                (Some(a), Some(b)) if b.seconds > a.seconds => Some(b),
+                (a, b) => a.or(b),
+            };
             if guard
                 .get_mut(&route_info.peer_id)
                 .is_none_or(|old| route_info.version > old.version)
@@ -2484,7 +2475,6 @@ impl PeerRouteServiceImpl {
                 suppressed_non_reusable_credential_peers: DashMap::with_shard_amount(
                     small_map_shard_amount(),
                 ),
-                stale_peer_incarnations: DashMap::with_shard_amount(small_map_shard_amount()),
                 version: AtomicVersion::new(),
             },
             public_ipv6_service: std::sync::Mutex::new(Weak::new()),
@@ -3462,91 +3452,6 @@ impl PeerRouteServiceImpl {
 
         self.synced_route_info
             .remove_peers(to_remove.iter().copied());
-
-        // A restarted node comes back with a fresh peer_id but the same instance
-        // id. Its old incarnation stays in the flooded route info set (other
-        // peers keep re-advertising it), so it never ages out and the topology
-        // shows the node twice - with enough churn it never converges at all.
-        // Keep the reachable / newest incarnation of each instance id and evict
-        // + disconnect the stale one so routes converge on their own.
-        let mut incarnations: std::collections::HashMap<uuid::Uuid, Vec<(PeerId, i64, bool)>> =
-            std::collections::HashMap::new();
-        {
-            let peer_infos = self.synced_route_info.peer_infos.read();
-            for (peer_id, info) in peer_infos.iter() {
-                let Some(inst_id) = info.inst_id.as_ref() else { continue };
-                let inst_uuid: uuid::Uuid = (*inst_id).into();
-                if inst_uuid.is_nil() {
-                    continue;
-                }
-                let updated = info.last_update.as_ref().map(|ts| ts.seconds).unwrap_or(0);
-                let reachable = self.route_table.topology_peer_reachable(*peer_id);
-                incarnations
-                    .entry(inst_uuid)
-                    .or_default()
-                    .push((*peer_id, updated, reachable));
-            }
-        }
-        // drop suppression entries whose keeping incarnation already disappeared
-        {
-            let live: std::collections::HashSet<PeerId> =
-                self.synced_route_info.peer_infos.read().keys().copied().collect();
-            self.synced_route_info
-                .stale_peer_incarnations
-                .retain(|_stale, (_inst, keep)| live.contains(keep));
-        }
-        let mut stale = Vec::new();
-        let mut stale_with_inst: Vec<(PeerId, uuid::Uuid, PeerId)> = Vec::new();
-        // Pick the incarnation that is alive right now. A restarted node's old
-        // peer id keeps being flooded with its last-known conn info, so the
-        // freshest conn-map timestamp distinguishes the live incarnation from
-        // the dead one; peer id only breaks exact ties.
-        let conn_stamps: std::collections::HashMap<PeerId, std::time::SystemTime> = {
-            let conn_map = self.synced_route_info.conn_map.read();
-            conn_map
-                .iter()
-                .map(|(peer, info)| (*peer, info.last_update))
-                .collect()
-        };
-        for (inst, peers) in incarnations.iter_mut() {
-            if peers.len() < 2 {
-                continue;
-            }
-            peers.sort_by_key(|(peer, updated, reachable)| {
-                let conn_age = conn_stamps.get(peer).copied();
-                (
-                    std::cmp::Reverse(conn_age),
-                    !*reachable,
-                    std::cmp::Reverse(*updated),
-                    std::cmp::Reverse(*peer),
-                )
-            });
-            let keep = peers[0].0;
-            for (peer, _, _) in peers.iter().skip(1) {
-                if *peer != keep {
-                    stale.push(*peer);
-                    stale_with_inst.push((*peer, *inst, keep));
-                }
-            }
-        }
-        if !stale.is_empty() {
-            tracing::warn!(
-                ?stale,
-                "evicting stale peer incarnations sharing one instance id"
-            );
-            self.synced_route_info.remove_peers(stale.iter().copied());
-            for (peer, inst, keep) in &stale_with_inst {
-                self.synced_route_info
-                    .stale_peer_incarnations
-                    .insert(*peer, (*inst, *keep));
-            }
-            let interface = self.interface.lock().await;
-            if let Some(interface) = interface.as_ref() {
-                for peer_id in &stale {
-                    interface.close_peer(*peer_id).await;
-                }
-            }
-        }
 
         // clear expired foreign network info
         let mut to_remove = Vec::new();
