@@ -3049,7 +3049,8 @@ function apply() {
   // the globe renders itself from geoModel; do not rebuild the empty echarts
   // option on every realtime tick
   if (viewMode.value === 'geo') return
-  if (chart) chart.setOption(buildOption(), true)
+  if (!chart || chart.isDisposed?.()) return
+  chart.setOption(buildOption(), true)
 }
 
 function nodeSize(id) {
@@ -3745,7 +3746,9 @@ function connectBoardEvents() {
 function resize() {
   if (histChart) histChart.resize()
   const box = cardEl.value?.$el || cardEl.value
-  const rect = (box || chartEl.value).getBoundingClientRect()
+  const target = box || chartEl.value
+  if (!target) return
+  const rect = target.getBoundingClientRect()
   width = rect.width
   height = rect.height
   if (viewMode.value === 'traffic' || viewMode.value === 'latency' || viewMode.value === 'loss') {
@@ -3789,7 +3792,9 @@ onMounted(async () => {
   })
 
   chartEl.value.addEventListener('mousemove', (e) => {
-    const rect = chartEl.value.getBoundingClientRect()
+    const el = chartEl.value
+    if (!el) return
+    const rect = el.getBoundingClientRect()
     const localX = e.clientX - rect.left
     const localY = e.clientY - rect.top
     if (viewMode.value === 'circle') circleHoverAt(localX, localY)
@@ -3826,7 +3831,7 @@ onMounted(async () => {
     animTick += 1
     const moving = tickLayoutAnim()
     if (animTick % 6 === 0) flowOffset = (flowOffset + 1.5) % 14
-    if ((moving || animTick % 6 === 0) && chart) chart.setOption(buildOption(), true)
+    if ((moving || animTick % 6 === 0) && chart && !chart.isDisposed?.()) chart.setOption(buildOption(), true)
   }, 33)
   window.addEventListener('resize', resize)
 })

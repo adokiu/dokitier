@@ -190,7 +190,7 @@
               </div>
               <v-text-field v-model.number="nodeInternetCap" type="number" density="compact" variant="outlined" hide-details placeholder="留空使用下行带宽" class="mb-4" />
               <v-alert v-if="nodeSaveError" type="error" variant="tonal" density="compact" class="mb-3">{{ nodeSaveError }}</v-alert>
-              <v-btn color="primary" :loading="savingNodeSettings" @click="saveNodeSettings">保存</v-btn>
+              <v-btn color="primary" :loading="savingNodeSettings" @click="saveNodeSettings">保存并应用</v-btn>
             </div>
           </div>
 
@@ -388,11 +388,18 @@
         </div>
       </v-card>
     </v-dialog>
+
+    <v-snackbar v-model="toast.show" :color="toast.color" :timeout="toast.timeout">
+      <div class="d-flex align-center gap-2">
+        <v-progress-circular v-if="toast.loading" indeterminate size="16" width="2" />
+        <span>{{ toast.text }}</span>
+      </div>
+    </v-snackbar>
   </div>
   </template>
 
 <script setup>
-import { computed, markRaw, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from 'vue'
+import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, triggerRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api } from '@/api'
 import DetailDrawer from '@/components/DetailDrawer.vue'
@@ -470,6 +477,22 @@ const nodeSharedListeners = ref([])
 const sharedProtoOptions = ['tcp', 'udp', 'quic', 'ws', 'wss']
 const savingNodeSettings = ref(false)
 const nodeSaveError = ref('')
+const toast = ref({ show: false, text: '', color: 'success', loading: false, timeout: 3000 })
+
+function showToast(text, color = 'success', { loading = false, timeout = 3000 } = {}) {
+  const next = { show: true, text: String(text ?? ''), color, loading, timeout }
+  if (toast.value.show) {
+    // 强制关闭后重开，确保 timeout/loading 状态对已有 snackbar 也生效
+    toast.value = { ...toast.value, show: false }
+    nextTick(() => { toast.value = next })
+  } else {
+    toast.value = next
+  }
+}
+
+function finishToast(text, color, timeout = 3000) {
+  showToast(text, color, { loading: false, timeout })
+}
 const sysInfo = computed(() => detail.value?.system_info || detail.value?.snapshot?.system || {})
 const sysSnapshot = computed(() => detail.value?.snapshot || {})
 const sysNetwork = computed(() => sysInfo.value?.network || {})
@@ -611,6 +634,9 @@ async function saveAlias() {
     await api.setAlias(aliasTarget.value.node_id, aliasValue.value)
     aliasTarget.value.alias = aliasValue.value
     aliasOpen.value = false
+    finishToast('节点名称已保存', 'success', 3000)
+  } catch (e) {
+    finishToast(String(e.message || e), 'error', 5000)
   } finally {
     savingAlias.value = false
   }
@@ -741,6 +767,7 @@ async function saveNodeSettings() {
     .filter(Boolean)
     .join(',')
   try {
+    showToast('正在保存并下发配置…', 'info', { loading: true, timeout: -1 })
     const res = await api.setNodeSettings(detail.value.node_id, {
       alias: nodeAlias.value,
       country_code: nodeCountry.value,
@@ -769,8 +796,11 @@ async function saveNodeSettings() {
       row.bandwidth_intranet_down_mbps = intranet
       row.bandwidth_internet_down_mbps = internet
     }
+    if (res.warning) finishToast(String(res.warning), 'warning', 5000)
+    else finishToast('已保存，core 已应用配置', 'success', 3000)
   } catch (e) {
     nodeSaveError.value = String(e.message || e)
+    finishToast(String(e.message || e), 'error', 5000)
   } finally {
     savingNodeSettings.value = false
   }
@@ -998,6 +1028,7 @@ async function saveConfig() {
   configError.value = ''
   saved.value = false
   try {
+    showToast('正在下发网络配置…', 'info', { loading: true, timeout: -1 })
     const precheck = await api.precheckConfig(network.value, configText.value)
     if (!precheck.ok) throw new Error((precheck.errors || []).join('; ') || 'precheck failed')
     const res = await api.boardCommand(detail.value.node_id, { kind: 'apply_network', network: network.value, toml: configText.value }, network.value)
@@ -1005,8 +1036,10 @@ async function saveConfig() {
     saved.value = true
     draftNetwork.value = ''
     await load()
+    finishToast('网络配置已下发，core 已应用', 'success', 3000)
   } catch (e) {
     configError.value = String(e.message || e)
+    finishToast(String(e.message || e), 'error', 5000)
   } finally {
     saving.value = false
   }

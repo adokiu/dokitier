@@ -712,6 +712,27 @@ async fn ensure_instance_id(db: &AnyPool, node_id: &str, network: &str) -> Strin
     stored.map(|(v,)| v).unwrap_or(id)
 }
 
+fn inject_instance_name(text: &str, network: &str, node_id: &str) -> String {
+    let Ok(mut value) = toml::from_str::<toml::Value>(text) else {
+        return text.to_string();
+    };
+    let Some(table) = value.as_table_mut() else {
+        return text.to_string();
+    };
+    let missing = table
+        .get("instance_name")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if missing {
+        table.insert(
+            "instance_name".to_string(),
+            toml::Value::String(format!("{network}-{}", node_id.replace(':', "-"))),
+        );
+    }
+    toml::to_string(&value).unwrap_or_else(|_| text.to_string())
+}
+
 fn inject_instance_id(text: &str, instance_id: &str) -> String {
     let Ok(mut value) = toml::from_str::<toml::Value>(text) else {
         return text.to_string();
@@ -1090,9 +1111,6 @@ async fn precheck_config(Json(body): Json<PrecheckBody>) -> Json<Value> {
     }
     match toml::from_str::<toml::Value>(&body.toml) {
         Ok(value) => {
-            if value.get("instance_name").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                errors.push("instance_name is required".to_string());
-            }
             if let Some(listeners) = value.get("listeners").and_then(|v| v.as_array()) {
                 for listener in listeners {
                     let Some(text) = listener.as_str() else {
@@ -1145,6 +1163,7 @@ async fn delete_network_on_node(state: &AppState, node_id: &str, network: &str) 
 async fn apply_new_network(state: &AppState, node_id: &str, network: &str, toml: &str) -> Value {
     let instance_id = ensure_instance_id(&state.db, node_id, network).await;
     let mut toml = inject_instance_id(toml, &instance_id);
+    toml = inject_instance_name(&toml, network, node_id);
     let acl_chains = load_acl_chains(&state.db).await;
     if let Ok(mut value) = toml::from_str::<toml::Value>(&toml) {
         if let Some(table) = value.as_table_mut() {
@@ -2173,16 +2192,16 @@ fn spawn_reconcile_inner(state: AppState, node_id: String, force: bool) {
                     if let Ok(mut value) = toml::from_str::<toml::Value>(&toml) {
                         if let Some(table) = value.as_table_mut() {
                             if let Some(up) = up {
-                                table.entry("node_bandwidth_up_mbps".to_string()).or_insert(toml::Value::Float(f64::from(up)));
+                                table.insert("node_bandwidth_up_mbps".to_string(), toml::Value::Float(f64::from(up)));
                             }
                             if let Some(down) = down {
-                                table.entry("node_bandwidth_down_mbps".to_string()).or_insert(toml::Value::Float(f64::from(down)));
+                                table.insert("node_bandwidth_down_mbps".to_string(), toml::Value::Float(f64::from(down)));
                             }
                             if let Some(cap) = intranet {
-                                table.entry("node_bandwidth_intranet_down_mbps".to_string()).or_insert(toml::Value::Float(f64::from(cap)));
+                                table.insert("node_bandwidth_intranet_down_mbps".to_string(), toml::Value::Float(f64::from(cap)));
                             }
                             if let Some(cap) = internet {
-                                table.entry("node_bandwidth_internet_down_mbps".to_string()).or_insert(toml::Value::Float(f64::from(cap)));
+                                table.insert("node_bandwidth_internet_down_mbps".to_string(), toml::Value::Float(f64::from(cap)));
                             }
                             if let Ok(text) = toml::to_string(&value) {
                                 toml = text;
@@ -2855,9 +2874,14 @@ async fn set_node_settings(
     Path(node_id): Path<String>,
     Json(body): Json<NodeSettingsBody>,
 ) -> Json<Value> {
+    // 1) persist every field first; the core push happens afterwards so the
+    // pushed config always carries the values that were just saved
     if let Some(alias) = body.alias.as_deref() {
         let _ = sqlx::query(&q("UPDATE nodes SET alias = ? WHERE node_id = ?"))
-            .bind(alias.trim()).bind(&node_id).execute(&state.db).await;
+            .bind(alias.trim())
+            .bind(&node_id)
+            .execute(&state.db)
+            .await;
     }
     if let Some(country) = body.country_code.as_ref() {
         let code = country.as_text().trim().to_lowercase();
@@ -2865,7 +2889,10 @@ async fn set_node_settings(
             spawn_node_geo_refresh(state.clone(), node_id.clone());
         } else if code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic()) {
             let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
-                .bind(&code).bind(&node_id).execute(&state.db).await;
+                .bind(&code)
+                .bind(&node_id)
+                .execute(&state.db)
+                .await;
             if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
                 rt.country_code = Some(code);
             }
@@ -2889,7 +2916,11 @@ async fn set_node_settings(
             spawn_node_geo_refresh(state.clone(), node_id.clone());
         } else {
             let _ = sqlx::query(&q("UPDATE nodes SET latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude) WHERE node_id = ?"))
-                .bind(lat).bind(lon).bind(&node_id).execute(&state.db).await;
+                .bind(lat)
+                .bind(lon)
+                .bind(&node_id)
+                .execute(&state.db)
+                .await;
             if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
                 if lat.is_some() {
                     rt.lat = lat;
@@ -2900,37 +2931,118 @@ async fn set_node_settings(
             }
         }
     }
+    let previous_caps: Option<(Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = sqlx::query_as(
+        &q("SELECT bandwidth_mbps, bandwidth_up_mbps, bandwidth_down_mbps, bandwidth_intranet_down_mbps, bandwidth_internet_down_mbps FROM nodes WHERE node_id = ?"),
+    )
+    .bind(&node_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
     if let Some(bw) = body.bandwidth_mbps {
         let _ = sqlx::query(&q("UPDATE nodes SET bandwidth_mbps = ?, bandwidth_up_mbps = ?, bandwidth_down_mbps = ? WHERE node_id = ?"))
-            .bind(bw.max(0.0) as f32).bind(bw.max(0.0) as f32).bind(bw.max(0.0) as f32).bind(&node_id).execute(&state.db).await;
-        spawn_reconcile_inner(state.clone(), node_id.clone(), true);
-    }
-    if let Some(shared) = body.shared_listeners.as_deref() {
-        let _ = sqlx::query(&q("UPDATE nodes SET shared_listeners = ? WHERE node_id = ?"))
-            .bind(shared)
-            .bind(&node_id).execute(&state.db).await;
-        let listeners: Vec<String> = shared.split(',').map(str::trim).filter(|v| !v.is_empty()).map(|v| v.to_string()).collect();
-        let result = send_shared_listeners(&state, &node_id, listeners).await;
-        if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Json(result);
-        }
-        spawn_reconcile_inner(state.clone(), node_id.clone(), true);
-    }
-    if body.bandwidth_intranet_down_mbps.is_some() || body.bandwidth_internet_down_mbps.is_some() {
-        let _ = sqlx::query(&q("UPDATE nodes SET bandwidth_intranet_down_mbps = COALESCE(?, bandwidth_intranet_down_mbps), bandwidth_internet_down_mbps = COALESCE(?, bandwidth_internet_down_mbps) WHERE node_id = ?"))
-            .bind(body.bandwidth_intranet_down_mbps.map(|v| v.max(0.0) as f32))
-            .bind(body.bandwidth_internet_down_mbps.map(|v| v.max(0.0) as f32))
-            .bind(&node_id).execute(&state.db).await;
-        spawn_reconcile_inner(state.clone(), node_id.clone(), true);
+            .bind(bw.max(0.0) as f32)
+            .bind(bw.max(0.0) as f32)
+            .bind(bw.max(0.0) as f32)
+            .bind(&node_id)
+            .execute(&state.db)
+            .await;
     }
     if body.bandwidth_up_mbps.is_some() || body.bandwidth_down_mbps.is_some() {
         let _ = sqlx::query(&q("UPDATE nodes SET bandwidth_up_mbps = COALESCE(?, bandwidth_up_mbps), bandwidth_down_mbps = COALESCE(?, bandwidth_down_mbps) WHERE node_id = ?"))
             .bind(body.bandwidth_up_mbps.map(|v| v.max(0.0) as f32))
             .bind(body.bandwidth_down_mbps.map(|v| v.max(0.0) as f32))
-            .bind(&node_id).execute(&state.db).await;
-        spawn_reconcile_inner(state.clone(), node_id.clone(), true);
+            .bind(&node_id)
+            .execute(&state.db)
+            .await;
     }
-    Json(json!({"ok": true}))
+    if body.bandwidth_intranet_down_mbps.is_some() || body.bandwidth_internet_down_mbps.is_some() {
+        let _ = sqlx::query(&q("UPDATE nodes SET bandwidth_intranet_down_mbps = COALESCE(?, bandwidth_intranet_down_mbps), bandwidth_internet_down_mbps = COALESCE(?, bandwidth_internet_down_mbps) WHERE node_id = ?"))
+            .bind(body.bandwidth_intranet_down_mbps.map(|v| v.max(0.0) as f32))
+            .bind(body.bandwidth_internet_down_mbps.map(|v| v.max(0.0) as f32))
+            .bind(&node_id)
+            .execute(&state.db)
+            .await;
+    }
+
+    // 2) core-level shared listeners: wait for the core callback
+    let mut warning: Option<String> = None;
+    if let Some(shared) = body.shared_listeners.as_deref() {
+        let listeners: Vec<String> = shared
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .collect();
+        let normalized = listeners.join(",");
+        let previous: Option<String> = sqlx::query_scalar(&q(
+            "SELECT shared_listeners FROM nodes WHERE node_id = ?",
+        ))
+        .bind(&node_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        let _ = sqlx::query(&q("UPDATE nodes SET shared_listeners = ? WHERE node_id = ?"))
+            .bind(&normalized)
+            .bind(&node_id)
+            .execute(&state.db)
+            .await;
+        if previous.as_deref().unwrap_or("") != normalized {
+            let result = send_shared_listeners(&state, &node_id, listeners).await;
+            if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                let reason = result
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("节点未确认");
+                warning = Some(format!("共享监听已保存，但{reason}，节点上线后自动生效"));
+            }
+        }
+    }
+
+    // 3) network config (bandwidth caps are injected into it): wait for the
+    // core callback; a rejected config is a real error, offline/timeout is a
+    // warning because the values are already persisted
+    // only re-apply the network configs when a cap really changed: the UI sends
+    // the whole form on every save, and an alias/geo-only save must not restart
+    // every network instance on the node
+    let (prev_bw, prev_up, prev_down, prev_intra, prev_inet) =
+        previous_caps.unwrap_or((None, None, None, None, None));
+    let changed = |new: Option<f32>, old: Option<f32>| match new {
+        None => false,
+        Some(v) => Some(v.max(0.0)) != old.map(|o| o.max(0.0)),
+    };
+    let needs_push = changed(body.bandwidth_mbps, prev_bw)
+        || changed(body.bandwidth_up_mbps, prev_up)
+        || changed(body.bandwidth_down_mbps, prev_down)
+        || changed(body.bandwidth_intranet_down_mbps, prev_intra)
+        || changed(body.bandwidth_internet_down_mbps, prev_inet);
+    if needs_push {
+        let result = push_node_configs_wait(&state, &node_id).await;
+        if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let reason = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("core 未应用配置")
+                .to_string();
+            let transient = reason.contains("offline")
+                || reason.contains("离线")
+                || reason.contains("超时")
+                || reason.contains("timeout")
+                || reason.contains("closed")
+                || reason.contains("断开");
+            if transient {
+                warning = Some(format!("配置已保存；{reason}，节点恢复后自动生效"));
+            } else {
+                return Json(json!({"ok": false, "error": format!("core 拒绝配置：{reason}")}));
+            }
+        }
+    }
+
+    match warning {
+        Some(warning) => Json(json!({"ok": true, "warning": warning})),
+        None => Json(json!({"ok": true})),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -3109,6 +3221,7 @@ fn validate_network_toml(network: &str, toml_text: &str) -> Result<(), String> {
 async fn prepare_node_network_toml(state: &AppState, node_id: &str, network: &str, toml: &str) -> String {
     let instance_id = ensure_instance_id(&state.db, node_id, network).await;
     let mut toml = inject_instance_id(toml, &instance_id);
+    toml = inject_instance_name(&toml, network, node_id);
     let bandwidth: Option<(Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = sqlx::query_as(
         &q("SELECT bandwidth_up_mbps, bandwidth_down_mbps, bandwidth_intranet_down_mbps, bandwidth_internet_down_mbps FROM nodes WHERE node_id = ?"),
     )
@@ -3121,16 +3234,123 @@ async fn prepare_node_network_toml(state: &AppState, node_id: &str, network: &st
     if let Ok(mut value) = toml::from_str::<toml::Value>(&toml) {
         if let Some(table) = value.as_table_mut() {
             if let Some((up, down, intranet, internet)) = bandwidth {
-                if let Some(up) = up { table.entry("node_bandwidth_up_mbps".to_string()).or_insert(toml::Value::Float(f64::from(up))); }
-                if let Some(down) = down { table.entry("node_bandwidth_down_mbps".to_string()).or_insert(toml::Value::Float(f64::from(down))); }
-                if let Some(cap) = intranet { table.entry("node_bandwidth_intranet_down_mbps".to_string()).or_insert(toml::Value::Float(f64::from(cap))); }
-                if let Some(cap) = internet { table.entry("node_bandwidth_internet_down_mbps".to_string()).or_insert(toml::Value::Float(f64::from(cap))); }
+                if let Some(up) = up { table.insert("node_bandwidth_up_mbps".to_string(), toml::Value::Float(f64::from(up))); }
+                if let Some(down) = down { table.insert("node_bandwidth_down_mbps".to_string(), toml::Value::Float(f64::from(down))); }
+                if let Some(cap) = intranet { table.insert("node_bandwidth_intranet_down_mbps".to_string(), toml::Value::Float(f64::from(cap))); }
+                if let Some(cap) = internet { table.insert("node_bandwidth_internet_down_mbps".to_string(), toml::Value::Float(f64::from(cap))); }
             }
             inject_acl(table, &acl_chains);
             if let Ok(text) = toml::to_string(&value) { toml = text; }
         }
     }
     toml
+}
+
+/// Send one console command to a node and wait for the core's callback.
+/// Returns the core's result value ({"ok":true,...} / {"ok":false,"error":...}).
+async fn send_command_wait(
+    state: &AppState,
+    node_id: &str,
+    network: Option<&str>,
+    command: dokitier_controller::ConsoleCommand,
+) -> Value {
+    let prefix = format!("{node_id}:");
+    let key = match network {
+        Some(network) => {
+            let exact = format!("{node_id}:{network}");
+            if state.agents.contains_key(&exact) {
+                exact
+            } else {
+                state
+                    .agents
+                    .iter()
+                    .find(|entry| entry.key().starts_with(&prefix))
+                    .map(|entry| entry.key().clone())
+                    .unwrap_or_default()
+            }
+        }
+        None => state
+            .agents
+            .iter()
+            .find(|entry| entry.key().starts_with(&prefix))
+            .map(|entry| entry.key().clone())
+            .unwrap_or_default(),
+    };
+    if key.is_empty() {
+        return json!({"ok": false, "error": "node is offline"});
+    }
+    let Some(tx) = state.agents.get(&key).map(|v| v.clone()) else {
+        return json!({"ok": false, "error": "node is offline"});
+    };
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    state.pending.insert(request_id.clone(), result_tx);
+    let frame = json!({
+        "type": "command",
+        "request_id": request_id,
+        "command": serde_json::to_value(&command).unwrap_or(Value::Null),
+    });
+    if tx.send(frame).await.is_err() {
+        state.pending.remove(&request_id);
+        return json!({"ok": false, "error": "agent channel closed"});
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(20), result_rx).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => json!({"ok": false, "error": "agent result channel closed"}),
+        Err(_) => {
+            state.pending.remove(&request_id);
+            json!({"ok": false, "error": "core 响应超时"})
+        }
+    }
+}
+
+/// Push every config of this node to its core and wait for the callbacks.
+/// Used by settings saves so the UI can report the real apply result.
+async fn push_node_configs_wait(state: &AppState, node_id: &str) -> Value {
+    let rows = sqlx::query(&q(
+        "SELECT network, toml FROM config_versions WHERE node_id = ? ORDER BY created DESC",
+    ))
+    .bind(node_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for row in rows {
+        let network: String = row.try_get("network").unwrap_or_default();
+        let toml: String = row.try_get("toml").unwrap_or_default();
+        if !network.is_empty() {
+            latest.entry(network).or_insert(toml);
+        }
+    }
+    if latest.is_empty() {
+        return json!({"ok": true, "applied": true});
+    }
+    let mut errors: Vec<String> = Vec::new();
+    for (network, toml) in latest {
+        let prepared = prepare_node_network_toml(state, node_id, &network, &toml).await;
+        let result = send_command_wait(
+            state,
+            node_id,
+            Some(&network),
+            dokitier_controller::ConsoleCommand::ApplyNetwork {
+                network: network.clone(),
+                toml: prepared,
+            },
+        )
+        .await;
+        if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            let reason = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("core 未确认");
+            errors.push(format!("{network}: {reason}"));
+        }
+    }
+    if errors.is_empty() {
+        json!({"ok": true, "applied": true})
+    } else {
+        json!({"ok": false, "error": errors.join("; ")})
+    }
 }
 
 async fn post_command(
@@ -3180,6 +3400,7 @@ async fn post_command(
     if let dokitier_controller::ConsoleCommand::ApplyNetwork { network, toml } = &mut command {
         let instance_id = ensure_instance_id(&state.db, &node_id, network).await;
         *toml = inject_instance_id(toml, &instance_id);
+        *toml = inject_instance_name(toml, network, &node_id);
         let bandwidth: Option<(Option<f32>, Option<f32>, Option<f32>, Option<f32>)> = sqlx::query_as(
             &q("SELECT bandwidth_up_mbps, bandwidth_down_mbps, bandwidth_intranet_down_mbps, bandwidth_internet_down_mbps FROM nodes WHERE node_id = ?"),
         )
@@ -5171,5 +5392,82 @@ mod runtime_tests {
         let new_token = rotated.0["token"].as_str().unwrap().to_string();
         assert_ne!(new_token, token);
         assert_eq!(new_token.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn frontend_settings_payload_deserializes_and_saves() {
+        let state = test_state().await;
+        // exactly the body the web UI sends (strings for geo, numbers for caps)
+        let raw = json!({
+            "alias": "nms-renamed",
+            "country_code": "cn",
+            "latitude": "30.5",
+            "longitude": "104.25",
+            "bandwidth_up_mbps": 500,
+            "bandwidth_down_mbps": 100,
+            "bandwidth_intranet_down_mbps": null,
+            "bandwidth_internet_down_mbps": null,
+            "shared_listeners": "tcp://0.0.0.0:12401"
+        });
+        let body: NodeSettingsBody = serde_json::from_value(raw).expect("frontend payload must deserialize");
+        let res = set_node_settings(State(state.clone()), Path("n1".to_string()), Json(body)).await;
+        assert!(res.0.get("error").is_none(), "save failed: {}", res.0);
+        let (alias, lat, listeners): (Option<String>, Option<f64>, Option<String>) =
+            sqlx::query_as("SELECT alias, latitude, shared_listeners FROM nodes WHERE node_id = 'n1'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(alias.as_deref(), Some("nms-renamed"));
+        assert_eq!(lat, Some(30.5));
+        assert_eq!(listeners.as_deref(), Some("tcp://0.0.0.0:12401"));
+    }
+
+    #[tokio::test]
+    async fn settings_push_waits_for_core_ack_and_reports_result() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO config_versions (node_id, network, hash, toml, created) VALUES ('n1', 'netA', 'h1', 'instance_name = \"netA-n1\"', 0)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(4);
+        state.agents.insert("n1:netA".into(), tx);
+
+        let state_for_task = state.clone();
+        let handle = tokio::spawn(async move {
+            let body = NodeSettingsBody {
+                alias: None,
+                country_code: None,
+                latitude: None,
+                longitude: None,
+                bandwidth_mbps: None,
+                bandwidth_up_mbps: Some(500.0),
+                bandwidth_down_mbps: None,
+                bandwidth_intranet_down_mbps: None,
+                bandwidth_internet_down_mbps: None,
+                shared_listeners: None,
+            };
+            set_node_settings(State(state_for_task), Path("n1".to_string()), Json(body)).await
+        });
+
+        // the console must be waiting for the core callback, not returning yet
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("console did not push the config")
+            .expect("agent channel closed");
+        let request_id = frame["request_id"].as_str().unwrap().to_string();
+        assert_eq!(frame["command"]["kind"].as_str(), Some("apply_network"));
+        let (_, result_tx) = state.pending.remove(&request_id).expect("pending request");
+        let _ = result_tx.send(json!({"ok": true}));
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("save did not finish after the core ack")
+            .unwrap();
+        assert_eq!(res.0["ok"].as_bool(), Some(true), "{:?}", res.0);
+        let up: Option<f64> = sqlx::query_scalar("SELECT bandwidth_up_mbps FROM nodes WHERE node_id = 'n1'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(up, Some(500.0));
     }
 }
