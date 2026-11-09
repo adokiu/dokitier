@@ -182,6 +182,7 @@ impl From<RoutePeerInfo> for crate::core_peer::peer::Route {
             ipv6_addr: val.ipv6_addr,
             public_ipv6_addr: val.ipv6_public_addr_lease,
             ipv6_public_addr_prefix: val.ipv6_public_addr_prefix,
+            p2p_group: val.p2p_group.clone(),
         }
     }
 }

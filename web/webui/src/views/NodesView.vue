@@ -930,7 +930,8 @@ function shortIp(ip) {
 }
 
 function ipInfo(item, kind) {
-  const inst = networksOf(item)[0]
+  const insts = networksOf(item)
+  const inst = insts.find((i) => i.ipv4 || i.ipv6) || insts[0]
   const v4 = kind === 'vpn' ? inst?.ipv4 : item.public_ipv4
   const v6 = kind === 'vpn' ? inst?.ipv6 : item.public_ipv6
   return { v4: v4 || '', v6: shortIp(v6), v6full: v6 || '' }
@@ -960,7 +961,10 @@ async function refreshItem(item) {
 }
 
 async function open(item) {
-  detail.value = item
+  // clone so the drawer's computed values (system info, snapshot based tunnel
+  // table) are reactive: the list rows themselves are plain objects inside a
+  // shallowRef, so mutating them in place never re-evaluates those computed.
+  detail.value = { ...item }
   // the realtime list omits snapshot/system_info; load the full record here
   void (async () => {
     try {
@@ -969,6 +973,11 @@ async function open(item) {
         Object.assign(item, fresh)
         item.snapshot = fresh.snapshot == null ? fresh.snapshot : markRaw(fresh.snapshot)
         item.system_info = fresh.system_info == null ? fresh.system_info : markRaw(fresh.system_info)
+        Object.assign(detail.value, {
+          ...fresh,
+          snapshot: item.snapshot,
+          system_info: item.system_info,
+        })
         triggerRef(nodes)
       }
     } catch {}

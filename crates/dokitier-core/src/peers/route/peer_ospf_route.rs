@@ -795,6 +795,7 @@ fn new_route_peer_info_with_version(easytier_version: String) -> RoutePeerInfo {
         trusted_credential_pubkeys: Vec::new(),
         ipv6_public_addr_prefix: None,
         ipv6_public_addr_lease: None,
+        p2p_group: String::new(),
     }
 }
 
@@ -1418,6 +1419,38 @@ impl SyncedRouteInfo {
             )?;
 
             let mut guard = self.peer_infos.write();
+            // A restarted node keeps its instance id but gets a new peer_id /
+            // peer_route_id. Evict the previous incarnation of the same instance
+            // immediately, so a zombie entry is never produced in the first place
+            // instead of waiting for the dead-peer GC timeout.
+            if let Some(inst) = route_peer_inst_id(&route_info) {
+                let stale: Vec<PeerId> = guard
+                    .iter()
+                    .filter(|(pid, old)| {
+                        **pid != route_info.peer_id
+                            && route_peer_inst_id(old) == Some(inst)
+                            && old.peer_route_id != route_info.peer_route_id
+                    })
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                for pid in stale {
+                    let is_stale = guard.get(&pid).is_some_and(|old| {
+                        route_peer_inst_id(old) == Some(inst)
+                            && old.peer_route_id != route_info.peer_route_id
+                    });
+                    if is_stale {
+                        guard.remove(&pid);
+                        self.raw_peer_infos.remove(&pid);
+                        self.conn_map.write().remove(&pid);
+                        need_inc_version = true;
+                        tracing::info!(
+                            stale_peer_id = pid,
+                            new_peer_id = route_info.peer_id,
+                            "evicted stale peer incarnation for same instance"
+                        );
+                    }
+                }
+            }
             // Preserve the origin's last_update instead of stamping "now" on every
             // flooded copy. Overwriting it made dead incarnations look fresh
             // forever, so a restarted node's old peer_id never aged out and the

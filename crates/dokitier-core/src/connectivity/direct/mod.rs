@@ -344,7 +344,11 @@ where
                     policy.disable_p2p,
                     policy.need_p2p,
                 ) && data.peer_manager.has_recent_traffic(route.peer_id, now);
-                route.peer_id != my_peer_id
+                !crate::peers::p2p_group::is_cross_group_for(
+                    data.peer_manager.network_identity().p2p_group.as_deref(),
+                    route.p2p_group.as_str(),
+                )
+                    && route.peer_id != my_peer_id
                     && (static_allowed || dynamic_allowed)
                     && !data.peer_manager.has_directly_connected_conn(route.peer_id)
                     && !data.peer_blacklist.contains(&route.peer_id)

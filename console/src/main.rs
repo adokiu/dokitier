@@ -2654,23 +2654,70 @@ async fn nodes_payload(state: &AppState) -> Value {
 /// demand by the detail endpoint. Keeps the list page smooth without slowing
 /// the refresh cadence.
 async fn nodes_payload_lite(state: &AppState) -> Value {
+    // configured VPN address per (node, network): the list must show the address
+    // the console pushed even when a snapshot does not carry it yet
+    let version_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT node_id, network, toml FROM config_versions ORDER BY id DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let mut configured_ip: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for (node_id, network, toml) in version_rows {
+        let key = (node_id, network);
+        if configured_ip.contains_key(&key) {
+            continue;
+        }
+        if let Ok(value) = toml::from_str::<toml::Value>(&toml) {
+            if let Some(ipv4) = value.get("ipv4").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                configured_ip.insert(key, ipv4.to_string());
+            }
+        }
+    }
     let mut full = nodes_payload(state).await;
     let Some(nodes) = full.get_mut("nodes").and_then(|v| v.as_array_mut()) else { return full };
     for node in nodes.iter_mut() {
+        let node_id = node.get("node_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let snapshot = node.get("snapshot").cloned().unwrap_or(Value::Null);
         node.as_object_mut().map(|obj| obj.remove("snapshot"));
         node.as_object_mut().map(|obj| obj.remove("system_info"));
-        let mut instances = Vec::new();
+        let mut instances: Vec<Value> = Vec::new();
         for inst in snapshot.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            let network = inst.get("network_name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             let topo = inst.get("topology");
+            let ipv4 = inst
+                .get("ipv4")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+                .or_else(|| configured_ip.get(&(node_id.clone(), network.clone())).cloned());
             instances.push(json!({
-                "network_name": inst.get("network_name"),
+                "network_name": network,
                 "instance_id": inst.get("instance_id"),
-                "ipv4": inst.get("ipv4"),
+                "ipv4": ipv4,
                 "ipv6": inst.get("ipv6"),
                 "p2p_group": inst.get("p2p_group"),
                 "peer_count": topo.and_then(|t| t.get("nodes")).and_then(|v| v.as_array()).map(|v| v.len()).unwrap_or(0),
                 "edge_count": topo.and_then(|t| t.get("edges")).and_then(|v| v.as_array()).map(|v| v.len()).unwrap_or(0),
+            }));
+        }
+        // networks that are configured but not reported yet still get an entry so
+        // the list can show the assigned VPN IP
+        for ((cfg_node, network), ipv4) in configured_ip.iter() {
+            if cfg_node != &node_id {
+                continue;
+            }
+            if instances.iter().any(|i| i.get("network_name").and_then(|v| v.as_str()) == Some(network.as_str())) {
+                continue;
+            }
+            instances.push(json!({
+                "network_name": network,
+                "instance_id": Value::Null,
+                "ipv4": ipv4,
+                "ipv6": Value::Null,
+                "p2p_group": Value::Null,
+                "peer_count": 0,
+                "edge_count": 0,
             }));
         }
         node["instances"] = json!(instances);
@@ -3579,6 +3626,9 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
                 rt.online = true;
                 rt.last_seen = now();
             }
+            // run the same hello bookkeeping as the websocket path so quic agents
+            // also get their system info / hostname / instance id persisted
+            let _ = handle_agent_frame(&state, frame.clone()).await;
             let writer_cipher = SessionCipher::new(&token, &nonce, ts);
             let writer = tokio::spawn(async move {
                 while let Some(value) = rx.recv().await {

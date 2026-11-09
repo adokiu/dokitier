@@ -475,9 +475,9 @@ function str(v) {
 
 function buildToml(f) {
   const lines = []
-  if (f.hostname) lines.push(`hostname = ${str(f.hostname)}`)
-  if (f.ipv4) lines.push(`ipv4 = ${str(f.ipv4)}`)
-  if (f.p2p_group) lines.push(`p2p_group = ${str(f.p2p_group)}`)
+  if (f.hostname.trim()) lines.push(`hostname = ${str(f.hostname.trim())}`)
+  if (f.ipv4.trim()) lines.push(`ipv4 = ${str(f.ipv4.trim())}`)
+  if (f.p2p_group.trim()) lines.push(`p2p_group = ${str(f.p2p_group.trim())}`)
   if (f.dhcp_mode === 'on') lines.push('dhcp = true')
   else if (f.dhcp_mode === 'cidr' && f.dhcp_cidr.trim()) lines.push(`dhcp = ${str(f.dhcp_cidr.trim())}`)
   if (f.ipv6.trim()) lines.push(`ipv6 = ${str(f.ipv6.trim())}`)

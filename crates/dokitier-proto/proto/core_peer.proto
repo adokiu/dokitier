@@ -61,6 +61,10 @@ message Route {
   common.Ipv6Inet ipv6_addr = 15;
   common.Ipv6Inet public_ipv6_addr = 16;
   common.Ipv6Inet ipv6_public_addr_prefix = 17;
+
+  // p2p group advertised by this peer; automatic direct / hole-punch
+  // connections are only allowed inside the same non-empty group.
+  string p2p_group = 18;
 }
 
 message PublicIpv6LeaseInfo {

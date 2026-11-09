@@ -47,6 +47,12 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
         self.list_route_snapshots()
             .await
             .into_iter()
+            .filter(|route| {
+                !crate::peers::p2p_group::is_cross_group_for(
+                    self.network_identity().p2p_group.as_deref(),
+                    route.p2p_group.as_str(),
+                )
+            })
             .filter_map(|route| {
                 let udp_nat_type = route
                     .stun_info
