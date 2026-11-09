@@ -199,6 +199,17 @@ fn random_peer_id() -> PeerId {
     }
 }
 
+/// Deterministic, process-independent peer id for an instance uuid.
+fn peer_id_from_instance_id(instance_id: uuid::Uuid) -> PeerId {
+    let mut value: u32 = 0x9e37_79b9;
+    for chunk in instance_id.as_bytes().chunks(4) {
+        let mut bytes = [0u8; 4];
+        bytes[..chunk.len()].copy_from_slice(chunk);
+        value = value.rotate_left(5) ^ u32::from_le_bytes(bytes);
+    }
+    if value <= 1 { value + 2 } else { value }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteAlgoType {
     Ospf,
@@ -886,16 +897,19 @@ impl PeerManagerCore {
             anyhow::bail!("portable peer manager construction requires an entered Tokio runtime");
         }
 
-        // Peer IDs identify one live process incarnation. They are never
-        // configuration: every new PeerManager gets a fresh runtime identity.
-        let my_peer_id = random_peer_id();
-        runtime.core.node.peer_id = Some(my_peer_id);
         let instance_id = runtime
             .core
             .node
             .instance_id
             .map(uuid::Uuid::from_bytes)
             .unwrap_or_else(uuid::Uuid::new_v4);
+        // Peer id is derived from the stable instance uuid instead of a fresh
+        // random value: a restarted agent keeps its network identity, so OSPF
+        // never sees a second incarnation of the same node (which used to leave
+        // a zombie entry behind in parts of the network that never received the
+        // replacement route).
+        let my_peer_id = peer_id_from_instance_id(instance_id);
+        runtime.core.node.peer_id = Some(my_peer_id);
         runtime.core.node.instance_id = Some(*instance_id.as_bytes());
 
         let secret = runtime

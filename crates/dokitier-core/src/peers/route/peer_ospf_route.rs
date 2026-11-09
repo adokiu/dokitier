@@ -754,6 +754,15 @@ static FORCE_USE_CONN_LIST: AtomicBool = AtomicBool::new(false);
 //    in another zone when two zone restore the conneciton.
 static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(10);
 
+fn route_id_from_instance_id(instance_id: uuid::Uuid) -> u64 {
+    let mut value: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in instance_id.as_bytes() {
+        value ^= *byte as u64;
+        value = value.wrapping_mul(0x100_0000_01b3);
+    }
+    value
+}
+
 fn route_peer_inst_id(info: &RoutePeerInfo) -> Option<uuid::Uuid> {
     info.inst_id.map(Into::into)
 }
@@ -1461,6 +1470,15 @@ impl SyncedRouteInfo {
                 (Some(a), Some(b)) if b.seconds > a.seconds => Some(b),
                 (a, b) => a.or(b),
             };
+            if let Some(old) = guard.get(&route_info.peer_id) {
+                // Same peer id, different route id => the instance restarted.
+                // Adopt the new incarnation and keep the stored version
+                // monotonic so route sync does not reject it.
+                if old.peer_route_id != route_info.peer_route_id {
+                    route_info.version = route_info.version.max(old.version.saturating_add(1));
+                    route_info.last_update = Some(Timestamp::now());
+                }
+            }
             if guard
                 .get_mut(&route_info.peer_id)
                 .is_none_or(|old| route_info.version > old.version)
@@ -1588,7 +1606,14 @@ impl SyncedRouteInfo {
         );
         let mut guard = self.peer_infos.upgradable_read();
         let old = guard.get(&my_peer_id);
-        let new_version = old.map(|x| x.version).unwrap_or(0) + 1;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let new_version = old
+            .map(|x| x.version + 1)
+            .unwrap_or(0)
+            .max(now_secs);
         let need_insert_new = if let Some(old) = old {
             try_update_new_peer_info(old, &mut new)
         } else {
@@ -1625,7 +1650,14 @@ impl SyncedRouteInfo {
 
         let guard = self.conn_map.upgradable_read();
         let my_conn_info = guard.get(&my_peer_id);
-        let new_version = my_conn_info.map(|x| x.version.get()).unwrap_or(0) + 1;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        let new_version = my_conn_info
+            .map(|x| x.version.get() + 1)
+            .unwrap_or(0)
+            .max(now_secs);
 
         if my_conn_info.is_none_or(|old| old.connected_peers != connected_peers) {
             let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
@@ -2477,9 +2509,13 @@ impl Debug for PeerRouteServiceImpl {
 #[allow(dead_code)]
 impl PeerRouteServiceImpl {
     fn new(my_peer_id: PeerId, context: ArcPeerContext) -> Self {
+        // Route id identifies the instance, not the process incarnation: it is
+        // derived from the stable instance uuid so a restarted agent does not
+        // look like a duplicate peer id to its neighbours.
+        let my_peer_route_id = route_id_from_instance_id(context.instance_id());
         PeerRouteServiceImpl {
             my_peer_id,
-            my_peer_route_id: rand::random(),
+            my_peer_route_id,
             context: context.clone(),
             sessions: DashMap::with_shard_amount(small_map_shard_amount()),
             stopped: AtomicBool::new(false),
