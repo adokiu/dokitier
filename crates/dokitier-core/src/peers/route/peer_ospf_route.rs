@@ -363,7 +363,7 @@ impl OspfRouteTable {
                 // half-dead / one-way tunnel) must not put the edge into the
                 // graph — traffic forwarded into such an edge blackholes.
                 let bidirectional = lookup
-                    .connected_peers(*dst_peer_id)
+                    .connected_peers::<std::collections::BTreeSet<PeerId>>(*dst_peer_id)
                     .is_some_and(|peers| peers.contains(&src_peer_id));
                 if !bidirectional {
                     continue;
