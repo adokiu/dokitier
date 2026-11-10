@@ -75,7 +75,8 @@ use crate::{
 use super::{
     DefaultRouteCostCalculator, ForeignNetworkRouteInfoMap, NextHopPolicy, Route,
     RouteCostCalculator, RouteCostCalculatorInterface, RouteInterfaceBox,
-    graph_algo::dijkstra_with_first_hop,
+    RouteCostMode,
+    graph_algo::{dijkstra_peer_edges, dijkstra_with_first_hop},
     route_peer_wire::{
         self, RawRoutePeerInfo, extract_route_peer_infos, patch_credential_route_peer_info,
         raw_credential_bytes, raw_route_peer_info,
@@ -215,6 +216,22 @@ pub struct OspfNextHopInfo {
 
 type NextHopMap = DashMap<PeerId, OspfNextHopInfo>;
 
+/// One direct link in the mode-specific edge list (peer-id keyed).
+#[derive(Debug, Clone)]
+struct SmartEdge {
+    from: PeerId,
+    to: PeerId,
+    latency_ms: i32,
+    loss_pct: f32,
+    avoid_relay: bool,
+    /// Mbps the `from` peer reports forwarding out of this link (all
+    /// destinations) — propagated via peer center for remote links.
+    forward_total_mbps: f64,
+    /// Per-final-destination forwarded rates on this link, reported by the
+    /// `from` peer.
+    dst_rates_mbps: std::collections::BTreeMap<PeerId, f64>,
+}
+
 // computed with SyncedRouteInfo snapshot. used to get next hop.
 #[derive(Debug)]
 pub struct OspfRouteTable {
@@ -300,6 +317,7 @@ impl OspfRouteTable {
         snapshot: &OspfRouteSnapshot,
         lookup: &OspfRouteSnapshotLookup<'_>,
         cost_calc: &T,
+        smart_edges: &mut Vec<SmartEdge>,
     ) -> (PeerGraph, NodeIndex) {
         let mut graph: PeerGraph = PeerGraph::new();
 
@@ -345,6 +363,18 @@ impl OspfRouteTable {
                 }
 
                 graph.add_edge(*src_node_idx, *dst_node_idx, cost);
+
+                smart_edges.push(SmartEdge {
+                    from: src_peer_id,
+                    to: *dst_peer_id,
+                    latency_ms: cost_calc.link_latency_ms(src_peer_id, *dst_peer_id),
+                    loss_pct: cost_calc.link_loss_pct(src_peer_id, *dst_peer_id),
+                    avoid_relay: peer_avoid_relay_data,
+                    forward_total_mbps: cost_calc
+                        .link_forward_total_mbps(src_peer_id, *dst_peer_id),
+                    dst_rates_mbps: cost_calc
+                        .link_dst_rates_map(src_peer_id, *dst_peer_id),
+                });
             }
         }
 
@@ -377,6 +407,278 @@ impl OspfRouteTable {
         shrink_dashmap(&self.ipv6_peer_id_map, None);
     }
 
+    /// MinLatency mode: pure per-link latency sum, plain Dijkstra.
+    fn gen_next_hop_map_min_latency(
+        &self,
+        my_peer_id: PeerId,
+        edges: &[SmartEdge],
+        version: Version,
+    ) {
+        // All links pass the capacity filter; the base cost is the latency and
+        // there is no bottleneck penalty. Stickiness applies with the latency
+        // model so jittering RTTs cannot flip equal-ish paths.
+        let caps = [f64::INFINITY];
+        let base_of = |e: &SmartEdge, _util: Option<f64>| -> i64 {
+            if e.avoid_relay {
+                AVOID_RELAY_COST as i64
+            } else {
+                e.latency_ms.max(1) as i64
+            }
+        };
+        let cap_of = |_e: &SmartEdge, _dst: PeerId| -> f64 { f64::INFINITY };
+        let penalty_of = |_level: f64| -> i64 { 0 };
+        let mut dsts: Vec<PeerId> = edges
+            .iter()
+            .flat_map(|e| [e.from, e.to])
+            .chain(std::iter::once(my_peer_id))
+            .collect();
+        dsts.sort_unstable();
+        dsts.dedup();
+        let weighted: Vec<(PeerId, PeerId, i64)> =
+            edges.iter().map(|e| (e.from, e.to, base_of(e, None))).collect();
+        let reached = dijkstra_peer_edges(&weighted, my_peer_id);
+        for dst in dsts {
+            let Some(&(total, first, hops)) = reached.get(&dst) else {
+                continue;
+            };
+            self.install_mode_candidate(
+                my_peer_id,
+                dst,
+                (total, first.unwrap_or(my_peer_id), hops),
+                edges,
+                &caps,
+                &base_of,
+                &cap_of,
+                &penalty_of,
+                &|_e: &SmartEdge, _dst: PeerId| -> Option<f64> { None },
+                version,
+            );
+        }
+    }
+
+    /// Smart mode: per-hop base cost (latency + loss + hop) summed along the
+    /// path, plus the bottleneck-bandwidth penalty counted ONCE per path. A
+    /// path's available bandwidth is the minimum of its links' AVAILABLE
+    /// capacity: capacity minus the traffic of every OTHER destination — the
+    /// destination being routed never counts against itself (anti-oscillation),
+    /// and user-configured node bandwidth overrides auto measurements.
+    /// Implemented as a level-restricted Dijkstra per destination: for each
+    /// distinct available-capacity level, run base-cost Dijkstra over links
+    /// with available capacity >= level and add that level's bottleneck
+    /// penalty once; the minimum over levels is the exact optimum of
+    /// `sum(base) + ref_bw/bottleneck * w_bw`.
+    fn gen_next_hop_map_smart(&self, my_peer_id: PeerId, edges: &[SmartEdge], version: Version) {
+        // Fresh per-(link, dst) rates for this rebuild: sampling here (control
+        // plane, once per rebuild) keeps the accounting deterministic and
+        // avoids any background task touching the data-plane counters.
+        crate::peers::link_policy::sample_link_dst_rates();
+        let global = crate::peers::link_policy::routing_weights();
+        let min_bw = global.min_bandwidth_mbps;
+        let base_of = |e: &SmartEdge, util: Option<f64>| -> i64 {
+            let mut base = crate::peers::link_policy::link_base_cost(
+                e.from,
+                e.to,
+                e.latency_ms,
+                e.loss_pct,
+                util,
+            ) as i64;
+            if e.avoid_relay {
+                base += AVOID_RELAY_COST as i64;
+            }
+            base
+        };
+        // Raw link capacity (manual node bandwidth > per-link > auto probe).
+        let raw_cap_of = |e: &SmartEdge| -> f64 {
+            crate::peers::link_policy::link_capacity_mbps(e.from, e.to)
+        };
+        // Traffic on this link that belongs to destinations OTHER than `dst`:
+        // our own per-destination counters for links leaving this node, the
+        // link owner's peer-center report for remote links. No measurement =>
+        // no penalty (anti-oscillation: a flow never counts against itself).
+        let other_traffic_mbps = |e: &SmartEdge, dst: PeerId| -> f64 {
+            if e.from == my_peer_id {
+                (crate::peers::link_policy::link_total_rate(e.to)
+                    - crate::peers::link_policy::link_dst_rate(e.to, dst))
+                .max(0.0)
+            } else if e.forward_total_mbps > 0.0 {
+                (e.forward_total_mbps
+                    - e.dst_rates_mbps.get(&dst).copied().unwrap_or(0.0))
+                .max(0.0)
+            } else {
+                0.0
+            }
+        };
+        // Available capacity for a route towards `dst`: raw capacity minus the
+        // traffic of every OTHER destination on this link. Links leaving this
+        // node use our own per-destination counters; remote links use the
+        // rates their owner reports via peer center.
+        let cap_of = |e: &SmartEdge, dst: PeerId| -> f64 {
+            let raw = raw_cap_of(e);
+            let other = other_traffic_mbps(e, dst);
+            (raw - other).max(0.1)
+        };
+        // Utilization fraction of the link consumed by other destinations.
+        let util_of = |e: &SmartEdge, dst: PeerId| -> Option<f64> {
+            let raw = raw_cap_of(e);
+            if raw <= 0.1 {
+                return None;
+            }
+            let other = other_traffic_mbps(e, dst);
+            Some((other / raw).clamp(0.0, 1.0))
+        };
+        let mut dsts: Vec<PeerId> = edges
+            .iter()
+            .flat_map(|e| [e.from, e.to])
+            .collect();
+        dsts.sort_unstable();
+        dsts.dedup();
+
+        for dst in dsts {
+            // NOTE: the self entry (dst == me) is installed like any other:
+            // topology_peer_reachable(self) must stay true, otherwise this
+            // node would stop announcing its own route info network-wide.
+            // Available capacities at this destination define the levels.
+            let mut caps: Vec<f64> = edges
+                .iter()
+                .map(|e| cap_of(e, dst))
+                .filter(|cap| min_bw <= 0.0 || *cap >= min_bw)
+                .collect();
+            caps.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            caps.dedup();
+            if caps.is_empty() {
+                continue;
+            }
+            let penalty_of = |level: f64| -> i64 {
+                ((global.reference_bandwidth_mbps.max(0.1) / level.max(0.1))
+                    * global.bandwidth_weight) as i64
+            };
+            let mut best: Option<(i64, PeerId, usize)> = None;
+            for &level in &caps {
+                let weighted: Vec<(PeerId, PeerId, i64)> = edges
+                    .iter()
+                    .filter(|e| cap_of(e, dst) >= level)
+                    .map(|e| (e.from, e.to, base_of(e, util_of(e, dst))))
+                    .collect();
+                let reached = dijkstra_peer_edges(&weighted, my_peer_id);
+                if let Some(&(dist, Some(first), hops)) = reached.get(&dst) {
+                    let total = dist.saturating_add(penalty_of(level));
+                    if best.map_or(true, |(b, _, _)| total < b) {
+                        best = Some((total, first, hops));
+                    }
+                }
+            }
+            let Some(candidate) = best else { continue };
+            self.install_mode_candidate(
+                my_peer_id,
+                dst,
+                candidate,
+                edges,
+                &caps,
+                &base_of,
+                &cap_of,
+                &penalty_of,
+                &util_of,
+                version,
+            );
+        }
+    }
+
+    /// Install one mode-computed candidate with path stickiness: when the best
+    /// first hop changed, the previous one is kept only if it still reaches
+    /// the destination under the same model (validated over the current edge
+    /// list) within a 20% cost margin. Dead paths never stick; metric jitter
+    /// cannot flip traffic between paths.
+    #[allow(clippy::too_many_arguments)]
+    fn install_mode_candidate(
+        &self,
+        my_peer_id: PeerId,
+        dst: PeerId,
+        candidate: (i64, PeerId, usize),
+        edges: &[SmartEdge],
+        caps: &[f64],
+        base_of: &dyn Fn(&SmartEdge, Option<f64>) -> i64,
+        cap_of: &dyn Fn(&SmartEdge, PeerId) -> f64,
+        penalty_of: &dyn Fn(f64) -> i64,
+        util_of: &dyn Fn(&SmartEdge, PeerId) -> Option<f64>,
+        version: Version,
+    ) {
+        let info = OspfNextHopInfo {
+            next_hop_peer_id: candidate.1,
+            path_latency: candidate.0.clamp(1, i32::MAX as i64) as i32,
+            path_len: candidate.2 + 1,
+            version,
+        };
+        let old = self.next_hop_map.get(&dst).map(|x| *x);
+        let changed = old.as_ref().is_some_and(|old| {
+            old.version < version
+                && old.next_hop_peer_id != info.next_hop_peer_id
+                && old.path_latency > 0
+                && old.next_hop_peer_id != my_peer_id
+        });
+        let info = if changed {
+            let old = old.unwrap();
+            let old_total = Self::path_total_under_model(
+                old.next_hop_peer_id,
+                dst,
+                edges,
+                caps,
+                base_of,
+                cap_of,
+                penalty_of,
+                util_of,
+            );
+            match old_total {
+                Some(old_total) if old_total * 100 <= info.path_latency as i64 * 120 => {
+                    OspfNextHopInfo {
+                        next_hop_peer_id: old.next_hop_peer_id,
+                        path_latency: old_total.clamp(1, i32::MAX as i64) as i32,
+                        path_len: old.path_len,
+                        version,
+                    }
+                }
+                _ => info,
+            }
+        } else {
+            info
+        };
+        self.next_hop_map
+            .entry(dst)
+            .and_modify(|x| {
+                if x.version < version {
+                    *x = info;
+                }
+            })
+            .or_insert(info);
+    }
+
+    /// Best total cost from `from_hop` to `dst` under the same model, or None
+    /// when the old hop can no longer reach the destination.
+    #[allow(clippy::too_many_arguments)]
+    fn path_total_under_model(
+        from_hop: PeerId,
+        dst: PeerId,
+        edges: &[SmartEdge],
+        caps: &[f64],
+        base_of: &dyn Fn(&SmartEdge, Option<f64>) -> i64,
+        cap_of: &dyn Fn(&SmartEdge, PeerId) -> f64,
+        penalty_of: &dyn Fn(f64) -> i64,
+        util_of: &dyn Fn(&SmartEdge, PeerId) -> Option<f64>,
+    ) -> Option<i64> {
+        let mut min_total: Option<i64> = None;
+        for &level in caps {
+            let weighted: Vec<(PeerId, PeerId, i64)> = edges
+                .iter()
+                .filter(|e| cap_of(e, dst) >= level)
+                .map(|e| (e.from, e.to, base_of(e, util_of(e, dst))))
+                .collect();
+            let reached = dijkstra_peer_edges(&weighted, from_hop);
+            if let Some(&(dist, _, _)) = reached.get(&dst) {
+                let total = dist.saturating_add(penalty_of(level));
+                min_total = Some(min_total.map_or(total, |m| m.min(total)));
+            }
+        }
+        min_total
+    }
     fn gen_next_hop_map_with_least_hop(
         &self,
         graph: &PeerGraph,
@@ -445,13 +747,14 @@ impl OspfRouteTable {
         let (costs, next_hops) = dijkstra_with_first_hop(graph, *start_node, |e| *e.weight());
 
         for (dst, (next_hop, path_len)) in next_hops.iter() {
-            let info = OspfNextHopInfo {
+            let dst_peer_id = *graph.node_weight(*dst).unwrap();
+            let candidate = OspfNextHopInfo {
                 next_hop_peer_id: *graph.node_weight(*next_hop).unwrap(),
                 path_latency: (*costs.get(dst).unwrap() % AVOID_RELAY_COST) as i32,
                 path_len: *path_len,
                 version,
             };
-            let dst_peer_id = *graph.node_weight(*dst).unwrap();
+            let info = self.stabilize_next_hop_choice(graph, *start_node, *dst, dst_peer_id, candidate);
             self.next_hop_map
                 .entry(dst_peer_id)
                 .and_modify(|x| {
@@ -463,6 +766,63 @@ impl OspfRouteTable {
         }
 
         self.next_hop_map_version.set_if_larger(version);
+    }
+
+    /// Keep the previous first hop for a destination while it still routes to
+    /// the destination in the CURRENT graph within a margin of the newly
+    /// computed best path. Link cost metrics jitter by a few units every
+    /// measurement round; without this margin the chosen first hop flips back
+    /// and forth between equal-ish paths, so traffic simultaneously traverses
+    /// multiple links (latency/bandwidth jitter, packet reordering). The old
+    /// path is fully re-validated in the current graph: the previous first hop
+    /// must still be a direct neighbour AND still have a route to the
+    /// destination — a dead path never sticks.
+    fn stabilize_next_hop_choice(
+        &self,
+        graph: &PeerGraph,
+        start_node: NodeIndex,
+        dst: NodeIndex,
+        dst_peer_id: PeerId,
+        candidate: OspfNextHopInfo,
+    ) -> OspfNextHopInfo {
+        const SWITCH_MARGIN_PCT: i64 = 20; // candidate must be >=20% better to take over
+        let old = match self.next_hop_map.get(&dst_peer_id) {
+            Some(x) if x.version < candidate.version => *x,
+            _ => return candidate,
+        };
+        if old.next_hop_peer_id == candidate.next_hop_peer_id || old.path_latency <= 0 {
+            return candidate;
+        }
+        let Some(old_idx) = graph
+            .node_references()
+            .find(|(idx, w)| **w == old.next_hop_peer_id && *idx != start_node)
+            .map(|(idx, _)| idx)
+        else {
+            return candidate;
+        };
+        if graph.find_edge(start_node, old_idx).is_none() {
+            return candidate;
+        }
+        // Re-validate the old path end to end in the current graph.
+        let (_costs, hops) = dijkstra_with_first_hop(graph, old_idx, |e| *e.weight());
+        let Some(&(_, old_hops)) = hops.get(&dst) else {
+            return candidate;
+        };
+        let Some(&old_cost) = _costs.get(&dst) else {
+            return candidate;
+        };
+        let total = (old_cost % AVOID_RELAY_COST) as i64;
+        let candidate_cost = candidate.path_latency.max(1) as i64;
+        if total * 100 > candidate_cost * (100 + SWITCH_MARGIN_PCT) {
+            // New best path is more than SWITCH_MARGIN_PCT better: switch.
+            return candidate;
+        }
+        OspfNextHopInfo {
+            next_hop_peer_id: old.next_hop_peer_id,
+            path_latency: (old_cost % AVOID_RELAY_COST) as i32,
+            path_len: old_hops + 1, // +1 for the me -> first hop edge
+            version: candidate.version,
+        }
     }
 
     pub fn build_from_snapshot<T: RouteCostCalculatorInterface>(
@@ -484,8 +844,9 @@ impl OspfRouteTable {
             .collect::<Vec<_>>();
 
         // build next hop map
+        let mut smart_edges: Vec<SmartEdge> = Vec::new();
         let (graph, start_node) =
-            Self::build_peer_graph_from_snapshot(my_peer_id, snapshot, &lookup, cost_calc);
+            Self::build_peer_graph_from_snapshot(my_peer_id, snapshot, &lookup, cost_calc, &mut smart_edges);
 
         if graph.node_count() == 0 {
             tracing::warn!("no peer in graph, cannot build next hop map");
@@ -507,7 +868,20 @@ impl OspfRouteTable {
         if matches!(policy, NextHopPolicy::LeastHop) {
             self.gen_next_hop_map_with_least_hop(&graph, &start_node, version);
         } else {
-            self.gen_next_hop_map_with_least_cost(&graph, &start_node, version);
+            // Mode selection (console-selectable, hot-reloadable with the
+            // routing weights). LeastHop mode keeps the legacy least-cost
+            // builder; Smart and MinLatency use their dedicated builders.
+            match crate::peers::link_policy::routing_weights().cost_mode {
+                RouteCostMode::Smart => {
+                    self.gen_next_hop_map_smart(my_peer_id, &smart_edges, version)
+                }
+                RouteCostMode::MinLatency => {
+                    self.gen_next_hop_map_min_latency(my_peer_id, &smart_edges, version)
+                }
+                RouteCostMode::LeastHop => {
+                    self.gen_next_hop_map_with_least_cost(&graph, &start_node, version)
+                }
+            }
         };
 
         let mut new_cidr_prefix_trie = PrefixMap::new();
@@ -855,6 +1229,10 @@ pub fn new_updated_self_route_peer_info(
 
         groups: context.peer_groups(my_peer_id),
 
+        // Advertise the p2p group so cross-group auto-p2p candidates can be
+        // filtered. Never leave it empty when a group is configured.
+        p2p_group: network_identity.p2p_group.clone().unwrap_or_default(),
+
         noise_static_pubkey,
 
         // Only admin nodes (holding network_secret) publish trusted credential pubkeys
@@ -875,6 +1253,21 @@ type RouteConnPeerList = crate::proto::peer_rpc::RouteConnPeerList;
 type PeerConnInfo = crate::proto::peer_rpc::route_conn_peer_list::PeerConnInfo;
 
 /// Attempts to update the `new` RoutePeerInfo based on the `old` RoutePeerInfo.
+/// Unix-seconds floor for self-announced route info versions. Own peer_info /
+/// conn_info versions are per-process counters, so they reset to 1 on every
+/// restart; other nodes reject versions not strictly greater than their
+/// stored value. Anchoring the counter at unix seconds makes the first
+/// post-restart version larger than anything announced before it, keeping
+/// route info monotonic across restarts (same guarantee the foreign-network
+/// path already applies). Resolution is seconds: within one second the local
+/// counter keeps incrementing past the floor.
+fn self_version_floor() -> Version {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as Version)
+        .unwrap_or(0)
+}
+
 fn try_update_new_peer_info(old: &RoutePeerInfo, new: &mut RoutePeerInfo) -> bool {
     let need_update_periodically = if let Ok(Ok(d)) =
         SystemTime::try_from(old.last_update.unwrap_or_default()).map(|x| x.elapsed())
@@ -1551,8 +1944,17 @@ impl SyncedRouteInfo {
     ) -> Result<(), Error> {
         // 1. check if we are duplicated.
         if info.peer_id == my_peer_id {
+            // With a persistent peer id (stable across restarts) our own
+            // pre-restart rows (different peer_route_id, version anchored to
+            // the unix-seconds floor of the previous run) legitimately come
+            // back through relay before our first route tick stores anything.
+            // Those rows can never outlive our own next announcement, which is
+            // also floored at the current unix seconds, so they are not a
+            // duplicate. A genuine duplicate runs its own clock and keeps
+            // announcing versions above this floor, so it is still detected.
             if info.peer_route_id != my_peer_route_id
                 && info.version > self.get_peer_info_version_with_default(info.peer_id)
+                && info.version > self_version_floor()
             {
                 // if dst peer send to us with higher version info of my peer, our peer id is duplicated
                 // TODO: handle this better. restart peer manager?
@@ -1758,7 +2160,13 @@ impl SyncedRouteInfo {
         );
         let mut guard = self.peer_infos.upgradable_read();
         let old = guard.get(&my_peer_id);
-        let new_version = old.map(|x| x.version).unwrap_or(0) + 1;
+        // Floor at unix seconds: the local counter resets on every process
+        // restart, and other nodes reject versions <= their stored value.
+        // With the persistent peer id (stable across restarts) the first
+        // post-restart announcement must therefore already exceed everything
+        // that was stored before the restart, or the node would be stuck
+        // with stale route info network-wide.
+        let new_version = (old.map(|x| x.version).unwrap_or(0) + 1).max(self_version_floor());
         let need_insert_new = if let Some(old) = old {
             try_update_new_peer_info(old, &mut new)
         } else {
@@ -1795,7 +2203,11 @@ impl SyncedRouteInfo {
 
         let guard = self.conn_map.upgradable_read();
         let my_conn_info = guard.get(&my_peer_id);
-        let new_version = my_conn_info.map(|x| x.version.get()).unwrap_or(0) + 1;
+        // Same unix-seconds floor as update_my_peer_info: keep conn-info
+        // versions monotonic across process restarts under a persistent
+        // peer id, or peers would drop our connection-list announcements.
+        let new_version = (my_conn_info.map(|x| x.version.get()).unwrap_or(0) + 1)
+            .max(self_version_floor());
 
         if my_conn_info.is_none_or(|old| old.connected_peers != connected_peers) {
             let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
@@ -5732,7 +6144,11 @@ mod tests {
         let self_row = service_impl.synced_route_info.conn_map.read();
         let self_row = self_row.get(&1).unwrap();
         assert_eq!(self_row.connected_peers, snapshot.peers);
-        assert_eq!(self_row.version.get(), first_version + 1);
+        // Version is the local counter floored at unix seconds; the floor can
+        // tick between the capture above and this reconcile, so assert both
+        // bounds instead of an exact value.
+        assert!(self_row.version.get() >= first_version + 1);
+        assert!(self_row.version.get() >= self_version_floor());
     }
 
     #[test]

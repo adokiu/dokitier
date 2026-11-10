@@ -364,6 +364,10 @@ pub struct RoutingWeights {
     /// When false, the classic least-hop table is used unless the packet asks
     /// for latency-first routing.
     pub weighted: bool,
+    /// Route cost mode: Smart (latency+loss+bottleneck bandwidth), MinLatency,
+    /// LeastHop. Console-selectable, hot-reloadable with the weights.
+    #[serde(default)]
+    pub cost_mode: crate::peers::RouteCostMode,
 }
 
 impl Default for RoutingWeights {
@@ -383,6 +387,7 @@ impl Default for RoutingWeights {
             wg_loss_weight: 1.0,
             min_bandwidth_mbps: 0.0,
             weighted: true,
+            cost_mode: crate::peers::RouteCostMode::Smart,
         }
     }
 }

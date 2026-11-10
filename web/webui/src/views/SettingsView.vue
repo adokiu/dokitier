@@ -40,8 +40,10 @@
                 </div>
               </div>
               <div class="config-row">
-                <div class="property-info"><div class="property-name">启用加权选路</div><div class="property-hint">关闭后按最少跳数</div></div>
-                <div class="config-input config-input--switch"><v-switch v-model="routing.weighted" color="primary" density="compact" hide-details /></div>
+                <div class="property-info"><div class="property-name">路由模式</div><div class="property-hint">智能=延迟+丢包+瓶颈带宽综合（路径带宽取链路容量最小值，手动带宽优先于自动测量）；最低延迟=纯延迟；最少跳数=按跳数</div></div>
+                <div class="config-input">
+                  <v-select v-model="routing.cost_mode" :items="costModes" item-title="title" item-value="value" density="compact" variant="outlined" hide-details />
+                </div>
               </div>
             </div>
           </div>
@@ -226,17 +228,6 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '@/api'
 import ConfigField from '@/components/ConfigField.vue'
 
-const form = ref({
-  latency_weight: 1,
-  loss_weight: 20,
-  bandwidth_weight: 0.5,
-  reference_bandwidth_mbps: 100,
-  mode: 'weighted',
-})
-const modes = [
-  { title: '加权成本（延迟/丢包/带宽）', value: 'weighted' },
-  { title: '最少跳数（权重只做平局比较）', value: 'least_hop' },
-]
 const saving = ref(false)
 const snack = ref(false)
 const snackText = ref('')
@@ -280,10 +271,16 @@ const routing = ref({
   utilization_weight: 10, hop_weight: 0.05, loss_gain: 1,
   tcp_loss_weight: 1, udp_loss_weight: 1, kcp_loss_weight: 1, quic_loss_weight: 1, 
   min_bandwidth_mbps: 0, weighted: true,
+  cost_mode: 'smart',
   probe_enabled: true, probe_interval_secs: 3600, probe_payload_bytes: 524288,
   probe_repeats: 2, probe_max_concurrent: 2, probe_idle_utilization_pct: 20,
   probe_timeout_ms: 5000, probe_max_range_mbps: 5000,
 })
+const costModes = [
+  { title: '智能模式（延迟+丢包+瓶颈带宽）', value: 'smart' },
+  { title: '最低延迟', value: 'min_latency' },
+  { title: '最少跳数', value: 'least_hop' },
+]
 const probeFields = [
   { key: 'probe_interval_secs', label: '测量间隔（秒）', hint: '同一链路两次探测的最小间隔，默认 3600' },
   { key: 'probe_payload_bytes', label: '单次 payload（字节）', hint: '一次 burst 的响应大小，默认 65536' },
@@ -505,6 +502,8 @@ function humanDuration(seconds) {
 async function saveRouting() {
   savingRouting.value = true
   try {
+    // keep the legacy weighted flag consistent with the selected mode
+    routing.value.weighted = routing.value.cost_mode !== 'least_hop'
     const res = await api.setBoardRouting(routing.value)
     if (!res.ok) throw new Error(res.error || 'save failed')
     snackText.value = '路由参数已下发'
@@ -534,22 +533,6 @@ async function saveGeo() {
   } finally {
     savingGeo.value = false
   }
-}
-
-async function save() {
-  saving.value = true
-  try {
-    const payload = {}
-    for (const [k, v] of Object.entries(form.value)) payload[`routing.${k}`] = String(v)
-    await api.saveSettings(payload)
-    snackText.value = '已保存并同步'
-    snackColor.value = 'success'
-    snack.value = true
-  } catch (e) {
-    snackText.value = String(e.message || e)
-    snackColor.value = 'error'
-    snack.value = true
-  } finally { saving.value = false }
 }
 </script>
 <style scoped>

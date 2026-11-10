@@ -96,6 +96,8 @@ pub struct RoutingParams {
     pub wg_loss_weight: f64,
     pub min_bandwidth_mbps: f64,
     pub weighted: bool,
+    #[serde(default = "default_cost_mode")]
+    pub cost_mode: String,
     #[serde(default = "default_probe_enabled")]
     pub probe_enabled: bool,
     #[serde(default = "default_probe_interval")]
@@ -115,6 +117,7 @@ pub struct RoutingParams {
 }
 
 fn default_probe_enabled() -> bool { true }
+fn default_cost_mode() -> String { "smart".to_string() }
 fn default_probe_interval() -> u64 { 3600 }
 fn default_probe_payload() -> u32 { 256 * 1024 }
 fn default_probe_repeats() -> u32 { 2 }

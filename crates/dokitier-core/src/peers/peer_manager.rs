@@ -199,6 +199,45 @@ fn random_peer_id() -> PeerId {
     }
 }
 
+/// Peer id must stay stable for the lifetime of the process for a given
+/// instance: console config patches rebuild the peer manager, and re-rolling
+/// the id on every rebuild leaves the previous incarnation's route rows alive
+/// in the network (same-instance zombie pairs observed in production with two
+/// peer_ids sharing one instance_id). The id is additionally DERIVED from the
+/// persisted instance id, so console-driven service restarts also keep the
+/// node identity (router-id semantics): the previous incarnation's rows in
+/// every peer's route table are refreshed by the same identity instead of
+/// lingering as a zombie until the withdraw/TTL machinery reaps them. Only a
+/// genuinely new config (new instance_id) or an explicit configured peer_id
+/// produces a different identity.
+fn stable_process_peer_id(instance_id: uuid::Uuid, configured: Option<PeerId>) -> PeerId {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, PeerId>>,
+    > = std::sync::OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    });
+    let mut map = registry.lock().unwrap();
+    *map.entry(instance_id).or_insert_with(|| {
+        configured
+            .filter(|id| *id != 0)
+            .unwrap_or_else(|| derive_persistent_peer_id(instance_id))
+    })
+}
+
+/// Deterministic peer id derived from the persisted instance id (FNV-1a 32
+/// bit over the UUID bytes). Stable across process restarts so a restarted
+/// node keeps its route identity instead of leaving its previous incarnation
+/// behind as a zombie in every peer's route table.
+fn derive_persistent_peer_id(instance_id: uuid::Uuid) -> PeerId {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in instance_id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteAlgoType {
     Ospf,
@@ -210,6 +249,9 @@ pub struct PortablePeerManagerConfig {
     pub snapshot: PeerRuntimeSnapshot,
     pub route_algo: RouteAlgoType,
     pub exit_nodes: Vec<IpAddr>,
+    /// Egress interface pin for core-originated outbound connections
+    /// (SO_BINDTODEVICE). See crate::socket::set_outbound_interface.
+    pub outbound_interface: Option<String>,
     /// Defaults inherited by peer contexts created for foreign networks.
     ///
     /// This is explicit because those contexts participate in the same
@@ -241,6 +283,7 @@ impl PortablePeerManagerConfig {
             snapshot: PeerRuntimeSnapshot::new(runtime, flags),
             route_algo: RouteAlgoType::Ospf,
             exit_nodes: Vec::new(),
+            outbound_interface: None,
             foreign_context_default_flags,
         }
     }
@@ -826,6 +869,11 @@ impl PeerManagerCore {
         foreign_rpc_registrar: Arc<dyn ForeignNetworkRpcRegistrar>,
     ) -> anyhow::Result<Self> {
         let initial_acl = runtime_config.snapshot().services.acl.build()?;
+        // Hot-reloadable egress pin: applied by the host socket factory to every
+        // auto-initiated outbound connection from here on. Set on every manager
+        // construction (initial + config-patch rebuilds) so console updates
+        // take effect without a process restart.
+        crate::socket::set_outbound_interface(config.outbound_interface.clone());
         let runtime = &mut config.snapshot.runtime;
         let flags = &config.snapshot.flags;
         let network_name = runtime.network_identity.network_name.clone();
@@ -892,12 +940,13 @@ impl PeerManagerCore {
             .instance_id
             .map(uuid::Uuid::from_bytes)
             .unwrap_or_else(uuid::Uuid::new_v4);
-        // Peer id is a fresh random value per process, matching upstream EasyTier:
-        // a restart is a brand-new identity, so no stale incarnation of the same
-        // peer id can conflict with a new one. The old identity is reaped by the
-        // withdrawal/tombstone mechanism in the OSPF route layer. instance_id stays
-        // stable for console mapping and diagnostics only.
-        let my_peer_id = random_peer_id();
+        // Peer id is stable within the process for a given instance (see
+        // stable_process_peer_id): config-patch rebuilds keep the identity so
+        // no zombie incarnation is produced, while a process restart gets a
+        // fresh random identity, matching upstream. The old identity is reaped
+        // by the withdrawal/tombstone mechanism in the OSPF route layer.
+        // instance_id stays stable for console mapping and diagnostics only.
+        let my_peer_id = stable_process_peer_id(instance_id, runtime.core.node.peer_id);
         runtime.core.node.peer_id = Some(my_peer_id);
         runtime.core.node.instance_id = Some(*instance_id.as_bytes());
 
@@ -3551,6 +3600,12 @@ pub(crate) async fn send_msg_internal(
     {
         relay_peer_map.send_msg(msg, dst_peer_id, policy).await
     } else if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
+        // Direct p2p link: the link peer IS the destination.
+        crate::peers::link_policy::add_link_dst_bytes(
+            dst_peer_id,
+            dst_peer_id,
+            msg_len,
+        );
         peer.send_msg(msg).await
     } else if peers.is_self(dst_peer_id) {
         peers.send_msg_directly(msg, dst_peer_id).await

@@ -99,6 +99,14 @@ impl RelayRouteTransport for PeerMapRelayRouteTransport {
                 "next hop not found in route for peer {dst_peer_id:?}"
             ))));
         };
+        // Per-(link, destination) traffic accounting for Smart-mode routing.
+        // One sharded-map atomic add per relayed packet — no locks shared with
+        // the forwarding path, no added latency beyond a few nanoseconds.
+        crate::peers::link_policy::add_link_dst_bytes(
+            next_hop,
+            dst_peer_id,
+            msg.buf_len() as u64,
+        );
         if self.peer_map.has_peer(next_hop) {
             self.peer_map.send_msg_directly(msg, next_hop).await
         } else if let Some(foreign_network_client) = &self.foreign_network_client {

@@ -130,6 +130,7 @@ impl From<Vec<crate::api::instance::PeerInfo>> for PeerInfoForGlobalMap {
             let dp_info = DirectConnectedPeerInfo {
                 latency_ms: std::cmp::max(1, (min_lat as u32 / 1000) as i32),
                 loss_rate,
+                dst_rates_mbps: Default::default(),
             };
 
             peer_map.insert(peer.peer_id, dp_info);

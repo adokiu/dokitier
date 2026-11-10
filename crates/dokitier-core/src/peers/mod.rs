@@ -16,6 +16,7 @@ pub mod bandwidth_probe;
 pub mod link_policy;
 pub mod transport_metrics;
 pub(crate) mod route;
+pub use route::RouteCostMode;
 pub(crate) mod traffic_metrics;
 mod util;
 pub(crate) mod whitelist;

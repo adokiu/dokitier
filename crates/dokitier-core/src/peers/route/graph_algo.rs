@@ -60,6 +60,84 @@ impl<K: PartialOrd, T> Ord for MinScored<K, T> {
 
 pub type DijkstraResult<K, NodeId> = (HashMap<NodeId, K>, HashMap<NodeId, (NodeId, usize)>);
 
+/// Dijkstra over a static directed edge list keyed by arbitrary node ids
+/// (peer ids). Returns per-node (distance, first hop, hop count); unreachable
+/// nodes are absent from the maps. Deterministic: ties pop by node id, and the
+/// per-mode path stickiness on top absorbs metric jitter.
+pub fn dijkstra_peer_edges<P: Copy + Eq + std::hash::Hash + Ord>(
+    edges: &[(P, P, i64)],
+    src: P,
+) -> std::collections::HashMap<P, (i64, Option<P>, usize)> {
+    dijkstra_peer_edges_with_paths(edges, src)
+        .into_iter()
+        .map(|(peer, (d, f, h, _))| (peer, (d, f, h)))
+        .collect()
+}
+
+/// Same as [`dijkstra_peer_edges`], additionally returning the full path
+/// (inclusive of both endpoints) per node. The path is required by the
+/// symmetric path selection: two ends of a flow compare candidate paths by a
+/// reversal-invariant canonical rank, which needs the intermediate nodes.
+pub fn dijkstra_peer_edges_with_paths<P: Copy + Eq + std::hash::Hash + Ord>(
+    edges: &[(P, P, i64)],
+    src: P,
+) -> std::collections::HashMap<P, (i64, Option<P>, usize, Vec<P>)> {
+    use std::collections::{BinaryHeap, HashMap};
+    use std::cmp::Reverse;
+
+    const INF: i64 = i64::MAX / 4;
+    let mut adj: HashMap<P, Vec<(P, i64)>> = HashMap::new();
+    for &(from, to, weight) in edges {
+        adj.entry(from).or_default().push((to, weight));
+    }
+    let mut dist: HashMap<P, i64> = HashMap::new();
+    let mut first: HashMap<P, Option<P>> = HashMap::new();
+    let mut hops: HashMap<P, usize> = HashMap::new();
+    let mut parent: HashMap<P, P> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    dist.insert(src, 0);
+    first.insert(src, Some(src));
+    hops.insert(src, 0);
+    heap.push((Reverse(0i64), src));
+    while let Some((Reverse(d), node)) = heap.pop() {
+        if dist.get(&node).copied().unwrap_or(INF) < d {
+            continue;
+        }
+        for &(next, weight) in adj.get(&node).into_iter().flatten() {
+            let nd = d + weight;
+            if nd < *dist.get(&next).unwrap_or(&INF) {
+                dist.insert(next, nd);
+                let inherited = if node == src { Some(next) } else { first[&node] };
+                first.insert(next, inherited);
+                hops.insert(next, hops[&node] + 1);
+                parent.insert(next, node);
+                heap.push((Reverse(nd), next));
+            }
+        }
+    }
+    dist
+        .into_iter()
+        .map(|(peer, d)| {
+            let f = first.get(&peer).copied().flatten();
+            let h = hops.get(&peer).copied().unwrap_or(0);
+            // Reconstruct the path by walking parents back to the source.
+            let mut path = vec![peer];
+            let mut cur = peer;
+            while cur != src {
+                match parent.get(&cur) {
+                    Some(&p) => {
+                        path.push(p);
+                        cur = p;
+                    }
+                    None => break,
+                }
+            }
+            path.reverse();
+            (peer, (d, f, h, path))
+        })
+        .collect()
+}
+
 pub fn dijkstra_with_first_hop<G, F, K>(
     graph: G,
     start: G::NodeId,
@@ -172,5 +250,39 @@ mod tests {
         assert_eq!(first_hop[&c], (c, 1));
         assert_eq!(first_hop[&d], (b, 2)); // d is reached via b
         assert_eq!(first_hop[&e], (b, 3)); // e is reached via d
+    }
+
+    #[test]
+    fn dijkstra_peer_edges_tracks_distance_first_hop_and_hops() {
+        // a -> b(1), a -> c(2), b -> d(10), c -> d(2): best path to d is a-c-d.
+        let edges = [
+            (1u32, 2u32, 1i64),
+            (1, 3, 2),
+            (2, 4, 10),
+            (3, 4, 2),
+        ];
+        let result = dijkstra_peer_edges(&edges, 1u32);
+
+        let (dist_a, first_a, hops_a) = result[&1];
+        assert_eq!((dist_a, first_a, hops_a), (0, Some(1), 0));
+        let (dist_b, first_b, hops_b) = result[&2];
+        assert_eq!((dist_b, first_b, hops_b), (1, Some(2), 1));
+        let (dist_d, first_d, hops_d) = result[&4];
+        assert_eq!((dist_d, first_d, hops_d), (4, Some(3), 2));
+        // Unreachable node is absent.
+        assert!(!result.contains_key(&99));
+    }
+
+    #[test]
+    fn dijkstra_peer_edges_prefers_lower_total_cost() {
+        // Two paths a -> d: direct expensive (100) vs relayed cheap (2 + 3).
+        let edges = [
+            (1u32, 2u32, 100i64),
+            (1, 3, 2),
+            (3, 2, 3),
+        ];
+        let result = dijkstra_peer_edges(&edges, 1u32);
+        let (dist, first, hops) = result[&2];
+        assert_eq!((dist, first, hops), (5, Some(3), 2));
     }
 }

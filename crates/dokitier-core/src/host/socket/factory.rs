@@ -1,8 +1,8 @@
 use std::{io, net::SocketAddr, sync::Arc, task::Poll};
 
 use crate::socket::{
-    tcp::{TcpConnectOptions, VirtualTcpSocketFactory},
-    udp::{UdpBindOptions, VirtualUdpSocketFactory},
+    tcp::{TcpConnectOptions, TcpSocketPurpose, VirtualTcpSocketFactory},
+    udp::{UdpBindOptions, UdpSocketPurpose, VirtualUdpSocketFactory},
 };
 use async_trait::async_trait;
 
@@ -79,6 +79,34 @@ where
     }
 }
 
+/// Pin core-originated outbound sockets to the configured egress interface
+/// (console-managed, hot-reloadable). Only auto-initiated traffic is pinned:
+/// hole-punch sockets carry explicit local addresses and manual peers are
+/// user-configured, so both are left untouched.
+fn apply_outbound_bind_tcp(mut options: TcpConnectOptions) -> TcpConnectOptions {
+    if options.purpose == TcpSocketPurpose::DirectConnect
+        && options.bind.bind_device.is_none()
+        && let Some(iface) = crate::socket::outbound_interface()
+    {
+        options.bind.bind_device = Some(iface);
+    }
+    options
+}
+
+fn apply_outbound_bind_udp(mut options: UdpBindOptions) -> UdpBindOptions {
+    let auto_initiated = matches!(
+        options.purpose,
+        UdpSocketPurpose::DirectConnect | UdpSocketPurpose::StunProbe
+    );
+    if auto_initiated
+        && options.bind_device.is_none()
+        && let Some(iface) = crate::socket::outbound_interface()
+    {
+        options.bind_device = Some(iface);
+    }
+    options
+}
+
 impl<B> HostSocketFactory<B>
 where
     B: HostSocketBackend,
@@ -88,6 +116,7 @@ where
     }
 
     async fn connect_tcp(&self, options: TcpConnectOptions) -> io::Result<HostTcpStream> {
+        let options = apply_outbound_bind_tcp(options);
         let result = self
             .runtime
             .run_operation(
@@ -107,6 +136,7 @@ where
     }
 
     async fn bind_udp(&self, options: UdpBindOptions) -> io::Result<Arc<HostUdpSocket>> {
+        let options = apply_outbound_bind_udp(options);
         let context = options.context.clone();
         let result = self
             .runtime

@@ -750,6 +750,29 @@ function computeRoute() {
   const from = routeStart.value
   const to = routeEnd.value
   if (from == null || to == null) return
+  // 真实转发路径：按各节点实际 OSPF 路由表逐跳查 next_hop，与数据面转发一致。
+  // 后端不可用或无快照时退回图上 BFS 估算。
+  fetch(`/api/board/route-path?from=${from}&to=${to}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data) => {
+      if (data && data.ok && Array.isArray(data.path) && data.path.length) {
+        routePath.value = data.path
+        let total = 0
+        let count = 0
+        for (let i = 1; i < data.path.length; i++) {
+          const m = metrics[keyOf(data.path[i - 1], data.path[i])]
+          if (m && m.latency_ms != null) { total += Number(m.latency_ms); count++ }
+        }
+        routeLatency.value = count ? total : null
+        return
+      }
+      computeRouteBfs(from, to)
+    })
+    .catch(() => computeRouteBfs(from, to))
+}
+
+function computeRouteBfs(from, to) {
+  if (from == null || to == null) return
   const adj = new Map()
   for (const e of graph.edges || []) {
     if (!adj.has(e.a)) adj.set(e.a, [])

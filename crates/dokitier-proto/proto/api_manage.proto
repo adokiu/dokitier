@@ -65,6 +65,7 @@ message NetworkConfig {
   optional bool enable_manual_routes = 32;
   repeated string routes = 33;
   repeated string exit_nodes = 34;
+  optional string outbound_interface = 77;
   optional bool proxy_forward_by_system = 35;
   optional bool disable_encryption = 36;
   optional bool enable_socks5 = 37;

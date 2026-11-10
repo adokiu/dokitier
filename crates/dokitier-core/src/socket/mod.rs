@@ -17,7 +17,7 @@ pub(crate) const fn default_need_protect() -> bool {
     true
 }
 
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, sync::RwLock};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -108,4 +108,19 @@ impl Default for SocketContext {
             netns: None,
         }
     }
+}
+
+/// Node-level egress binding: when set, core-originated outbound connections
+/// (tunnel direct-connects, stun probes) are pinned to this network interface
+/// via SO_BINDTODEVICE, so host-level default-route changes (exit nodes,
+/// VPN rules) can never capture tunnel traffic. Configured per node and
+/// hot-reloadable from the console.
+static OUTBOUND_BIND_INTERFACE: RwLock<Option<String>> = RwLock::new(None);
+
+pub fn set_outbound_interface(iface: Option<String>) {
+    *OUTBOUND_BIND_INTERFACE.write().unwrap() = iface.filter(|s| !s.is_empty());
+}
+
+pub fn outbound_interface() -> Option<String> {
+    OUTBOUND_BIND_INTERFACE.read().unwrap().clone()
 }

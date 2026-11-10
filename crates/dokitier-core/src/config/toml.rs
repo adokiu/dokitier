@@ -110,6 +110,10 @@ pub trait ConfigLoader: Send + Sync {
     fn patch_flags(&self, flags: FlagsPatch);
 
     fn get_exit_nodes(&self) -> Vec<IpAddr>;
+    /// Network interface (or bind IP as "iface/ip") all core-originated
+    /// outbound connections must use. Empty/None = system default routing.
+    fn get_outbound_interface(&self) -> Option<String>;
+    fn set_outbound_interface(&self, iface: Option<String>);
     fn get_node_bandwidth_mbps(&self) -> Option<f64>;
     fn get_node_bandwidth_up_mbps(&self) -> Option<f64>;
     fn get_node_bandwidth_down_mbps(&self) -> Option<f64>;
@@ -483,6 +487,7 @@ struct Config {
     #[serde(skip)]
     mapped_listeners: Option<Vec<url::Url>>,
     exit_nodes: Option<Vec<IpAddr>>,
+    outbound_interface: Option<String>,
     node_bandwidth_mbps: Option<f64>,
     node_bandwidth_up_mbps: Option<f64>,
     node_bandwidth_down_mbps: Option<f64>,
@@ -663,6 +668,11 @@ impl TomlConfig {
                 .as_deref()
                 .map(|mode| mode != "least_hop")
                 .unwrap_or(defaults.weighted),
+            cost_mode: routing
+                .mode
+                .as_deref()
+                .map(crate::peers::RouteCostMode::parse)
+                .unwrap_or(defaults.cost_mode),
         }
     }
 
@@ -1167,6 +1177,14 @@ impl ConfigLoader for TomlConfig {
 
     fn get_p2p_group(&self) -> Option<String> {
         self.config.lock().unwrap().p2p_group.clone()
+    }
+
+    fn get_outbound_interface(&self) -> Option<String> {
+        self.config.lock().unwrap().outbound_interface.clone()
+    }
+
+    fn set_outbound_interface(&self, iface: Option<String>) {
+        self.config.lock().unwrap().outbound_interface = iface.filter(|s| !s.is_empty());
     }
 
     fn set_p2p_group(&self, group: Option<String>) {

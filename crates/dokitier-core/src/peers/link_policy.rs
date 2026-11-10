@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use cidr::IpCidr;
+use dashmap::DashMap;
 
 use crate::config::RoutingWeights;
 use crate::config::PeerId;
@@ -272,7 +273,7 @@ pub fn calculate_cost_ext(
     });
     let global = routing_weights();
     let weight = protocol_loss_weight(&global, proto);
-    cost_with(&global, link.as_ref(), node_bw, weight, utilization, latency_ms, effective_loss)
+    cost_with(&global, link.as_ref(), node_bw, weight, utilization, latency_ms, effective_loss, true)
 }
 
 fn cost_with(
@@ -283,6 +284,7 @@ fn cost_with(
     utilization: Option<f64>,
     latency_ms: i32,
     loss_pct: f32,
+    include_bandwidth: bool,
 ) -> i32 {
     let w_lat = link
         .and_then(|l| l.latency_weight)
@@ -315,12 +317,191 @@ fn cost_with(
     let utilization_term = global.utilization_weight.max(0.0)
         * utilization.unwrap_or(0.0).clamp(0.0, 1.0).powi(2);
 
-    let cost = latency_ms as f64 * w_lat
+    let mut cost = latency_ms as f64 * w_lat
         + loss_term * w_loss
-        + (ref_bw / bandwidth) * w_bw
         + utilization_term
         + global.hop_weight.max(0.0);
+    if include_bandwidth {
+        cost += (ref_bw / bandwidth) * w_bw;
+    }
     (cost.clamp(1.0, (i32::MAX - 4) as f64)) as i32
+}
+
+/// Effective capacity of the link src->dst in Mbps. Precedence: per-link
+/// override > user-configured node bandwidth (min of up/down across the two
+/// ends) > auto-measured capacity. Never below 0.1 to keep divisions sane.
+pub fn link_capacity_mbps(src: PeerId, dst: PeerId) -> f64 {
+    let src_bw = node_bandwidth(src);
+    let dst_bw = node_bandwidth(dst);
+    let node_bw = match (src_bw, dst_bw) {
+        (Some(a), Some(b)) => Some(a.up_mbps.min(b.down_mbps)),
+        (Some(a), None) => Some(a.up_mbps),
+        (None, Some(b)) => Some(b.down_mbps),
+        (None, None) => None,
+    };
+    let link = link_for(src, dst);
+    let metrics = peer_metrics(dst).or_else(|| peer_metrics(src));
+    link.and_then(|l| l.bandwidth_mbps)
+        .or(node_bw)
+        .or_else(|| metrics.as_ref().map(|m| m.capacity_mbps).filter(|v| *v > 0.0))
+        .unwrap_or_else(|| routing_weights().reference_bandwidth_mbps)
+        .max(0.1)
+}
+
+/// Additive (latency/loss/utilization/hop) component of the link cost with the
+/// bandwidth term REMOVED. Used by the bottleneck-aware path selection, which
+/// adds the bandwidth penalty once per path based on the bottleneck capacity.
+/// `utilization` is the fraction of the link capacity consumed by OTHER
+/// traffic (never the flow being routed — that would oscillate).
+pub fn link_base_cost(
+    src: PeerId,
+    dst: PeerId,
+    latency_ms: i32,
+    loss_pct: f32,
+    utilization: Option<f64>,
+) -> i32 {
+    let link = link_for(src, dst);
+    if link.as_ref().is_some_and(|link| link.disabled) {
+        return i32::MAX;
+    }
+    let metrics = peer_metrics(dst).or_else(|| peer_metrics(src));
+    let proto = metrics.as_ref().map(|m| m.proto.as_str());
+    let effective_loss = metrics
+        .as_ref()
+        .map(|m| loss_pct.max(m.transport_loss_pct))
+        .unwrap_or(loss_pct);
+    let global = routing_weights();
+    let weight = protocol_loss_weight(&global, proto);
+    cost_with(
+        &global,
+        link.as_ref(),
+        None,
+        weight,
+        utilization,
+        latency_ms,
+        effective_loss,
+        false,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-(link, destination) traffic accounting
+//
+// The relay data path counts every forwarded byte per (next-hop link, final
+// destination). A periodic sampler turns the byte counters into Mbps rates.
+// Smart-mode routing uses these to attribute link usage to the flow that owns
+// it: when computing the route FOR destination D, a link's available capacity
+// is capacity minus the usage of every OTHER destination — the flow's own
+// usage on its own path is excluded, which prevents the classic
+// route-oscillation loop (a-b-c <-> a-d-c flip-flopping as each path fills
+// up and frees the other).
+//
+// Hot-path guarantee: the counter is a sharded DashMap of atomics — the data
+// plane takes a per-shard brief lock plus one atomic add per forwarded
+// packet and NEVER contends with the sampler or the route builder, which
+// read the same map afterwards without holding any lock across iteration.
+// ---------------------------------------------------------------------------
+
+static LINK_DST_BYTES: OnceLock<DashMap<(PeerId, PeerId), AtomicU64>> = OnceLock::new();
+static LINK_LAST_SAMPLE: OnceLock<RwLock<HashMap<(PeerId, PeerId), (u64, i64)>>> = OnceLock::new();
+static LINK_DST_RATES: OnceLock<RwLock<HashMap<(PeerId, PeerId), f64>>> = OnceLock::new();
+static LINK_TOTAL_RATES: OnceLock<RwLock<HashMap<PeerId, f64>>> = OnceLock::new();
+
+fn link_dst_bytes() -> &'static DashMap<(PeerId, PeerId), AtomicU64> {
+    LINK_DST_BYTES.get_or_init(DashMap::new)
+}
+
+fn link_last_sample() -> &'static RwLock<HashMap<(PeerId, PeerId), (u64, i64)>> {
+    LINK_LAST_SAMPLE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Data path: count forwarded bytes on the link towards `link_peer` that are
+/// addressed to `dst_peer`. Cheap: one sharded-map entry plus one atomic add.
+pub fn add_link_dst_bytes(link_peer: PeerId, dst_peer: PeerId, bytes: u64) {
+    link_dst_bytes()
+        .entry((link_peer, dst_peer))
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Sampler: convert byte counters into Mbps rates since the previous call.
+/// Call this periodically (1s) so rates never average over long idle windows.
+pub fn sample_link_dst_rates() {
+    let now_ts = now_millis();
+    // Snapshot the atomics first (brief per-shard reads), do the math without
+    // touching the data-plane map again.
+    let current: Vec<((PeerId, PeerId), u64)> = link_dst_bytes()
+        .iter()
+        .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
+        .collect();
+    let mut last = link_last_sample().write().unwrap();
+    let mut rates: HashMap<(PeerId, PeerId), f64> = HashMap::new();
+    let mut totals: HashMap<PeerId, f64> = HashMap::new();
+    for (key, total) in current {
+        let rate_mbps = match last.get(&key).copied() {
+            Some((prev_total, prev_ts))
+                if prev_total <= total && prev_ts < now_ts && now_ts > prev_ts =>
+            {
+                let elapsed_secs = (now_ts - prev_ts) as f64 / 1000.0;
+                if elapsed_secs > 0.0 {
+                    Some(((total - prev_total) * 8) as f64 / elapsed_secs / 1_000_000.0)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        last.insert(key, (total, now_ts));
+        if let Some(rate_mbps) = rate_mbps.filter(|rate| *rate > 0.0) {
+            rates.insert(key, rate_mbps);
+            *totals.entry(key.0).or_insert(0.0) += rate_mbps;
+        }
+    }
+    *LINK_DST_RATES.get_or_init(|| RwLock::new(HashMap::new())).write().unwrap() = rates;
+    *LINK_TOTAL_RATES.get_or_init(|| RwLock::new(HashMap::new())).write().unwrap() = totals;
+}
+
+/// Mbps currently forwarded over the link towards `link_peer` for the given
+/// destination (0 when unmeasured).
+pub fn link_dst_rate(link_peer: PeerId, dst_peer: PeerId) -> f64 {
+    LINK_DST_RATES
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .read()
+        .unwrap()
+        .get(&(link_peer, dst_peer))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+/// Total Mbps currently forwarded over the link towards `link_peer`.
+pub fn link_total_rate(link_peer: PeerId) -> f64 {
+    LINK_TOTAL_RATES
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .read()
+        .unwrap()
+        .get(&link_peer)
+        .copied()
+        .unwrap_or(0.0)
+}
+
+/// Per-destination rates leaving this node through the link towards
+/// `link_peer` (for the peer-center report).
+pub fn link_dst_rates_for(link_peer: PeerId) -> HashMap<PeerId, f64> {
+    LINK_DST_RATES
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| key.0 == link_peer)
+        .map(|(key, rate)| (key.1, *rate))
+        .collect()
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -375,5 +556,30 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1, 42);
         set_static_routes(Vec::new());
+    }
+
+    #[test]
+    fn link_dst_rates_track_forwarded_bytes() {
+        // Retry loop: unit tests elsewhere may rebuild routes concurrently and
+        // consume this test's rate window; each attempt re-primes and retries.
+        for _ in 0..4 {
+            add_link_dst_bytes(10, 100, 1_000_000);
+            sample_link_dst_rates(); // prime the window
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            add_link_dst_bytes(10, 100, 2_000_000); // +1 MB in the window
+            add_link_dst_bytes(10, 200, 250_000); // new key: primed only
+            sample_link_dst_rates();
+
+            let rate_d100 = link_dst_rate(10, 100);
+            // 1 MB * 8 over ~1.1s ≈ 7.3 Mbps (loose bounds for CI jitter).
+            if rate_d100 > 4.0 && rate_d100 < 12.0 {
+                assert_eq!(link_dst_rate(10, 200), 0.0);
+                let for_link = link_dst_rates_for(10);
+                assert_eq!(for_link[&100], rate_d100);
+                assert!(link_dst_rates_for(99).is_empty());
+                return;
+            }
+        }
+        panic!("link dst rates never converged to the expected window");
     }
 }

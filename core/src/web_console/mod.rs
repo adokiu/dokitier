@@ -547,6 +547,10 @@ pub async fn reload_routing_policy(store: &dokitier_web::Store) {
         .get("routing.mode")
         .map(|mode| mode != "least_hop")
         .unwrap_or(true);
+    weights.cost_mode = settings
+        .get("routing.cost_mode")
+        .map(|mode| dokitier_core::peers::RouteCostMode::parse(mode))
+        .unwrap_or(defaults.cost_mode);
     dokitier_core::peers::link_policy::set_routing_weights(weights);
 
     let static_routes = store.list_static_routes().await.unwrap_or_default();

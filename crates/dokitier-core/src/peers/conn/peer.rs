@@ -36,7 +36,7 @@ use tokio_util::task::AbortOnDropHandle;
 type ArcPeerConn = Arc<PeerConn>;
 type ConnMap = Arc<DashMap<PeerConnId, ArcPeerConn>>;
 
-fn conn_selection_key(conn: &PeerConn) -> (u8, u64) {
+fn conn_selection_key(conn: &PeerConn) -> (u8, u64, PeerConnId) {
     let latency = conn.get_stats().latency_us;
     (
         if latency > 0 {
@@ -48,6 +48,10 @@ fn conn_selection_key(conn: &PeerConn) -> (u8, u64) {
             1
         },
         latency,
+        // Deterministic tie-break: DashMap iteration order is not stable, so
+        // equal-cost parallel conns must not race on which one wins a
+        // (re-)selection — that would scatter flows across paths.
+        conn.get_conn_id(),
     )
 }
 
@@ -154,14 +158,18 @@ impl Peer {
         ));
 
         let conns_copy = conns.clone();
-        let default_conn_copy = default_conn.clone();
         let data_active_copy = data_active.clone();
         let default_conn_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 crate::foundation::time::sleep(Duration::from_secs(5)).await;
-                if conns_copy.len() > 1 {
-                    default_conn_copy.store(None);
-                }
+                // NOTE: the default conn is deliberately NOT re-selected while
+                // it is alive, even when the peer has multiple parallel
+                // connections. Re-selecting (previously: clearing the default
+                // every 5s) made every newly created flow re-run conn
+                // selection and land on a different parallel link, splitting
+                // one peer-to-peer traffic stream across several paths. The
+                // pinned conn is only replaced when it dies (close listener
+                // clears the default, next send re-selects).
                 let active = data_active_copy.swap(false, Ordering::Relaxed);
                 let fast_ping = conns_copy.len() > 1 && active;
                 for conn in conns_copy.iter() {

@@ -105,6 +105,9 @@
         <ConfigField label="出口节点列表" hint="转发所有流量的出口节点，虚拟 IPv4 地址，优先级由列表顺序决定。">
           <v-textarea v-model="form.exit_nodes" rows="2" density="compact" variant="outlined" hide-details placeholder="10.88.0.2" />
         </ConfigField>
+        <ConfigField label="出站绑定网卡" hint="core 自身出站连接（隧道、探测）强制从该网卡走，避免被出口节点默认路由吸入隧道。留空走系统默认路由。">
+          <v-text-field v-model="form.outbound_interface" density="compact" variant="outlined" hide-details placeholder="eth1" />
+        </ConfigField>
       </div>
 
       <div class="section-title section-sep">端口转发</div>
@@ -331,6 +334,7 @@ const emptyForm = () => ({
   proxy_network: [],
   routes: '',
   exit_nodes: '',
+  outbound_interface: '',
   tcp_whitelist: '',
   udp_whitelist: '',
   socks5_proxy: '',
@@ -403,6 +407,7 @@ function parseToml(text) {
   f.proxy_network = [...text.matchAll(/\[\[proxy_network\]\][\s\S]*?cidr\s*=\s*"([^"]+)"/g)].map((m) => m[1])
   f.routes = arrayOf(text, 'routes').join('\n')
   f.exit_nodes = arrayOf(text, 'exit_nodes').join('\n')
+  f.outbound_interface = pick(/^\s*outbound_interface\s*=\s*"([^"]*)"/m)
   f.tcp_whitelist = arrayOf(text, 'tcp_whitelist').join(', ')
   f.udp_whitelist = arrayOf(text, 'udp_whitelist').join(', ')
   f.socks5_proxy = pick(/^\s*socks5_proxy\s*=\s*"([^"]*)"/m)
@@ -494,6 +499,7 @@ function buildToml(f) {
   if (routes.length) lines.push(`routes = [${routes.map(str).join(', ')}]`)
   const exits = f.exit_nodes.split('\n').map((s) => s.trim()).filter(Boolean)
   if (exits.length) lines.push(`exit_nodes = [${exits.map(str).join(', ')}]`)
+  if (f.outbound_interface) lines.push(`outbound_interface = ${str(f.outbound_interface)}`)
   if (f.socks5_proxy) lines.push(`socks5_proxy = ${str(f.socks5_proxy)}`)
   const tcpw = f.tcp_whitelist.split(',').map((s) => s.trim()).filter(Boolean)
   if (tcpw.length) lines.push(`tcp_whitelist = [${tcpw.map(str).join(', ')}]`)

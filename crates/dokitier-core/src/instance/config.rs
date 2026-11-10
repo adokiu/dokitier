@@ -275,6 +275,7 @@ impl CoreInstanceConfig {
             } else {
                 config.get_exit_nodes()
             },
+            outbound_interface: config.get_outbound_interface(),
             foreign_context_default_flags: host.runtime_flags(TomlConfig::default().get_flags()),
         };
 

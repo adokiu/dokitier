@@ -576,6 +576,12 @@ pub(crate) async fn direct_peer_info(peer_maps: &[Arc<PeerMap>]) -> PeerInfoForG
             DirectConnectedPeerInfo {
                 latency_ms: std::cmp::max(1, (min_lat as u32 / 1000) as i32),
                 loss_rate,
+                // Rates are rounded to 1 Mbps so the peer-center digest stays
+                // stable under sub-Mbps jitter (fewer global-map refetches).
+                dst_rates_mbps: crate::peers::link_policy::link_dst_rates_for(peer)
+                    .into_iter()
+                    .map(|(dst, rate)| (dst, rate.round().max(0.0)))
+                    .collect(),
             },
         );
     }

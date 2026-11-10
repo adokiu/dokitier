@@ -326,6 +326,10 @@ service TcpHolePunchRpc {
 message DirectConnectedPeerInfo {
   int32 latency_ms = 1;
   float loss_rate = 2;
+  // Per-final-destination forwarded rates (Mbps) leaving the reporting node
+  // through the link to the peer. Smart-mode bottleneck accounting uses these
+  // so a route for destination D excludes D's own traffic on every link.
+  map<uint32, double> dst_rates_mbps = 3;
 }
 
 message PeerInfoForGlobalMap {

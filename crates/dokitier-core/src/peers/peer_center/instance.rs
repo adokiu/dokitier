@@ -422,6 +422,42 @@ impl PeerCenterInstance {
                 crate::peers::link_policy::calculate_cost(src, dst, latency, loss)
             }
 
+            fn link_latency_ms(&self, src: PeerId, dst: PeerId) -> i32 {
+                self.directed_info(src, dst)
+                    .or_else(|| self.directed_info(dst, src))
+                    .map(|(latency, _)| latency)
+                    .unwrap_or(500)
+            }
+
+            fn link_loss_pct(&self, src: PeerId, dst: PeerId) -> f32 {
+                self.directed_info(src, dst)
+                    .or_else(|| self.directed_info(dst, src))
+                    .map(|(_, loss)| loss)
+                    .unwrap_or(0.0)
+            }
+
+            fn link_forward_total_mbps(&self, src: PeerId, dst: PeerId) -> f64 {
+                self.global_peer_map_clone
+                    .map
+                    .get(&src)
+                    .and_then(|info| info.direct_peers.get(&dst))
+                    .map(|info| info.dst_rates_mbps.values().sum())
+                    .unwrap_or(0.0)
+            }
+
+            fn link_dst_rates_map(
+                &self,
+                src: PeerId,
+                dst: PeerId,
+            ) -> std::collections::BTreeMap<PeerId, f64> {
+                self.global_peer_map_clone
+                    .map
+                    .get(&src)
+                    .and_then(|info| info.direct_peers.get(&dst))
+                    .map(|info| info.dst_rates_mbps.clone())
+                    .unwrap_or_default()
+            }
+
             fn begin_update(&mut self) {
                 let global_peer_map = self.global_peer_map.read().unwrap();
                 for (peer_id, info) in &global_peer_map.map {

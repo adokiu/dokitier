@@ -35,12 +35,12 @@ clap = "4.6.7"
 crossbeam = "0.8.5"
 crossbeam-utils = "0.8.23"
 dashmap = "6.2.1"
-dokitier = { version = "2.7.9", path = "core", default-features = false }
-dokitier-core = { version = "2.7.9", path = "crates/dokitier-core", default-features = false }
+dokitier = { version = "2.7.10", path = "core", default-features = false }
+dokitier-core = { version = "2.7.10", path = "crates/dokitier-core", default-features = false }
 dokitier-ffi = { version = "0.1.0", path = "dokitier-contrib/dokitier-ffi", default-features = false }
 dokitier-ohos-core = { version = "0.1.0", path = "dokitier-contrib/dokitier-ohrs/crates/dokitier-ohos-core", default-features = false }
 dokitier-ohos-features = { version = "0.1.0", path = "dokitier-contrib/dokitier-ohrs/crates/dokitier-ohos-features", default-features = false }
-dokitier-proto = { version = "2.7.9", path = "crates/dokitier-proto", default-features = false }
+dokitier-proto = { version = "2.7.10", path = "crates/dokitier-proto", default-features = false }
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1"
 guarden = "0.3"

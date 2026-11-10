@@ -127,6 +127,7 @@ const FORM_MANAGED_TOML_FIELDS: &[&str] = &[
     "listeners",
     "mapped_listeners",
     "exit_nodes",
+    "outbound_interface",
     "peer",
     "proxy_network",
     "vpn_portal_config",
@@ -432,6 +433,14 @@ impl NetworkConfigExt for NetworkConfig {
             cfg.set_exit_nodes(exit_nodes);
         }
 
+        if let Some(iface) = self
+            .outbound_interface
+            .as_deref()
+            .filter(|iface| !iface.is_empty())
+        {
+            cfg.set_outbound_interface(Some(iface.to_owned()));
+        }
+
         if self.enable_socks5.unwrap_or_default()
             && let Some(socks5_port) = self.socks5_port
         {
@@ -664,6 +673,8 @@ impl NetworkConfigExt for NetworkConfig {
         if !exit_nodes.is_empty() {
             result.exit_nodes = exit_nodes.iter().map(|n| n.to_string()).collect();
         }
+
+        result.outbound_interface = config.get_outbound_interface();
 
         if let Some(socks5_portal) = config.get_socks5_portal() {
             result.enable_socks5 = Some(true);

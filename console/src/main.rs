@@ -6,6 +6,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use std::collections::HashMap;
+
 use axum::{
     extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
     http::{header, HeaderValue, StatusCode, Uri},
@@ -267,10 +269,11 @@ fn rt_nodes_status_snapshot(state: &AppState) -> Vec<(String, String, String)> {
         .iter()
         .map(|e| {
             let rt = e.value();
-            let status = if now_ts - rt.ts <= RT_FRESH_SECS
-                && rt.online
-                && agent_channel_present(state, e.key())
-            {
+            // Metrics freshness alone decides the status: a snapshot every
+            // second refreshes rt.ts, so fresh metrics prove the agent is
+            // alive. A briefly missing command channel must not flip the node
+            // to offline; a dead node stops snapshotting and goes stale here.
+            let status = if now_ts - rt.ts <= RT_FRESH_SECS {
                 "online"
             } else {
                 "offline"
@@ -288,10 +291,9 @@ fn rt_nodes_full(state: &AppState) -> Vec<(String, String, String, String)> {
         .iter()
         .map(|e| {
             let rt = e.value();
-            let status = if now_ts - rt.ts <= RT_FRESH_SECS
-                && rt.online
-                && agent_channel_present(state, e.key())
-            {
+            // Same rule as rt_nodes_status_snapshot: fresh metrics win; a
+            // missing command channel must not override them.
+            let status = if now_ts - rt.ts <= RT_FRESH_SECS {
                 "online"
             } else {
                 "offline"
@@ -306,14 +308,6 @@ fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
 /// Agents send a snapshot every second; a node counts as live only while its
 /// latest snapshot is at most this old.
 const RT_FRESH_SECS: i64 = 5;
-
-/// The control plane can only push commands while the agent session is
-/// registered. Online state and command availability must agree, so online
-/// requires both a fresh snapshot and a registered channel.
-fn agent_channel_present(state: &AppState, node_id: &str) -> bool {
-    let prefix = format!("{node_id}:");
-    state.agents.iter().any(|entry| entry.key().starts_with(&prefix))
-}
 
 async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
     let nodes_ddl = if is_mysql() {
@@ -918,6 +912,7 @@ fn default_routing_params() -> Value {
         "wg_loss_weight": 1.0,
         "min_bandwidth_mbps": 0.0,
         "weighted": true,
+        "cost_mode": "smart",
         "probe_enabled": true,
         "probe_interval_secs": 3600,
         "probe_payload_bytes": 262144,
@@ -1305,7 +1300,9 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
     for (node_id,) in &node_ids {
         let (status, snapshot, system_info) = match state.node_rt.get(node_id) {
             Some(rt) => (
-                if now_ts - rt.ts <= RT_FRESH_SECS && rt.online && agent_channel_present(&state, node_id) {
+                // Metrics freshness alone decides the status (snapshot every 1s
+                // refreshes rt.ts); the command channel is not required here.
+                if now_ts - rt.ts <= RT_FRESH_SECS {
                     "online".to_string()
                 } else {
                     "offline".to_string()
@@ -2504,9 +2501,15 @@ async fn ws_session(state: AppState, mut socket: WebSocket) {
         }
     }
     if let Some(id) = node_id {
+        // Remove only THIS session's channel. A reconnecting agent may have
+        // already registered a fresh session under the same key: wiping every
+        // `{id}:*` entry here would delete the new session's channel and break
+        // command dispatch until it reconnects again. Sender identity
+        // (same_channel) pins the removal to the closing session.
         let prefix = format!("{id}:");
-        let keys: Vec<String> = state.agents.iter().filter(|e| e.key().starts_with(&prefix)).map(|e| e.key().clone()).collect();
-        for key in keys { state.agents.remove(&key); }
+        state
+            .agents
+            .retain(|key, channel| !(key.starts_with(&prefix) && channel.same_channel(&tx)));
         if let Some(mut rt) = state.node_rt.get_mut(&id) {
             rt.online = false;
             rt.last_seen = now();
@@ -2637,9 +2640,14 @@ async fn nodes_payload(state: &AppState) -> Value {
     for node_id in ids {
         let meta = statics.get(&node_id);
         let rt = state.node_rt.get(&node_id).map(|r| r.clone());
+        // Metrics freshness alone decides the status: the agent snapshots every
+        // second and each snapshot refreshes rt.ts, so fresh metrics prove the
+        // agent is alive. The command channel is an extra capability only —
+        // during a reconnect it can be briefly absent and must not flip a
+        // metrics-live node to offline; a dead node stops snapshotting, rt.ts
+        // goes stale and it still shows offline.
         let live = rt.filter(|r| now_ts - r.ts <= RT_FRESH_SECS);
-        let channel_online = agent_channel_present(state, &node_id);
-        let status = if live.is_some() && channel_online {
+        let status = if live.is_some() {
             "online".to_string()
         } else {
             "offline".to_string()
@@ -3663,7 +3671,9 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
             let cipher = SessionCipher::new(&token, &nonce, ts);
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(32);
             let network = networks.first().and_then(|n| n.get("name")).and_then(|v| v.as_str()).unwrap_or("default");
-            state.agents.insert(format!("{node_id}:{network}"), tx);
+            // Keep the session-side sender: the cleanup below matches channel
+            // identity so only this session's entry is ever removed.
+            state.agents.insert(format!("{node_id}:{network}"), tx.clone());
             {
                 let mut rt = state.node_rt.entry(node_id.clone()).or_default();
                 if !hostname.is_empty() { rt.hostname = hostname.clone(); }
@@ -3691,9 +3701,12 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
                 }
             }
             writer.abort();
+            // Same as the websocket cleanup: only drop the channel owned by
+            // this closing session; a newer session's registration must stay.
             let prefix = format!("{node_id}:");
-            let keys: Vec<String> = state.agents.iter().filter(|e| e.key().starts_with(&prefix)).map(|e| e.key().clone()).collect();
-            for key in keys { state.agents.remove(&key); }
+            state
+                .agents
+                .retain(|key, channel| !(key.starts_with(&prefix) && channel.same_channel(&tx)));
             if let Some(mut rt) = state.node_rt.get_mut(node_id) {
                 rt.online = false;
                 rt.last_seen = now();
@@ -3957,14 +3970,13 @@ fn sample_edge_rates_once(state: &AppState) {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let fresh_before = now() - 30;
-        let rows: Vec<(String,)> = state
+        let rows: Vec<(String, String)> = state
             .node_rt
             .iter()
             .filter(|e| e.value().ts >= fresh_before)
-            .map(|e| (e.value().snapshot.to_string(),))
+            .map(|e| (e.key().clone(), e.value().snapshot.to_string()))
             .collect();
-        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (snapshot,) in rows {
+        for (node_id, snapshot) in rows {
             let Ok(value) = serde_json::from_str::<Value>(&snapshot) else { continue };
             let Some(instances) = value.get("instances").and_then(|v| v.as_array()) else { continue };
             for inst in instances {
@@ -3983,10 +3995,15 @@ fn sample_edge_rates_once(state: &AppState) {
                             .unwrap_or_else(|| format!("t{}", idx));
                         let rx = tunnel.get("rx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                         let tx = tunnel.get("tx_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let key = format!("{}|{}|{}|{}", network, pair.0, pair.1, ident);
-                        if !seen_keys.insert(key.clone()) {
-                            continue;
-                        }
+                        // The key MUST include the reporting node: both ends
+                        // of a link report the same edge, and for p2p tunnels
+                        // both ends observe the SAME remote_addr (public
+                        // mapped endpoint). Without the reporter in the key
+                        // the two counter series collided under one entry —
+                        // one end's counters always failed the `rx > prx`
+                        // check against the other's, and the rate decayed to
+                        // 0 B/s on links that were actively carrying traffic.
+                        let key = format!("{}|{}|{}|{}|{}", network, pair.0, pair.1, node_id, ident);
                         // Counters only move when a node reports (every few
                         // seconds), so a 1s sample would otherwise read 0 in
                         // between. Keep the last computed rate until the
@@ -4223,6 +4240,10 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
                     if new_probe && !existing_probe {
                         let mut replacement = e.clone();
                         replacement["network_name"] = json!(network);
+                        // Rate keys are reporter-scoped (both ends report the
+                        // same edge); the displayed tunnels must look their
+                        // rates up under the reporter that produced them.
+                        replacement["reporter"] = json!(node_id);
                         let tunnel_types: Vec<Value> = replacement
                             .get("tunnels")
                             .and_then(|v| v.as_array())
@@ -4237,6 +4258,7 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
                 }
                 let mut edge = e.clone();
                 edge["network_name"] = json!(network);
+                edge["reporter"] = json!(node_id);
                 let tunnel_types: Vec<Value> = e.get("tunnels").and_then(|v| v.as_array()).into_iter().flatten()
                     .filter_map(|t| t.get("type").cloned()).collect();
                 edge["tunnel_types"] = json!(tunnel_types);
@@ -4273,6 +4295,13 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
     for ((a, b, network), edge) in edges.iter_mut() {
         let mut edge_rx = 0.0f64;
         let mut edge_tx = 0.0f64;
+        // Rates are reporter-scoped; look them up under the node whose tunnel
+        // report won this edge (see sample_edge_rates_once).
+        let reporter = edge
+            .get("reporter")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         if let Some(tunnels) = edge.get_mut("tunnels").and_then(|v| v.as_array_mut()) {
             for (idx, tunnel) in tunnels.iter_mut().enumerate() {
                 let ident = tunnel
@@ -4280,7 +4309,7 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("t{}", idx));
-                let key = format!("{}|{}|{}|{}", network, a, b, ident);
+                let key = format!("{}|{}|{}|{}|{}", network, a, b, reporter, ident);
                 let (rx_bps, tx_bps) = state.edge_rates.get(&key).map(|v| *v).unwrap_or((0.0, 0.0));
                 edge_rx += rx_bps;
                 edge_tx += tx_bps;
@@ -4610,6 +4639,76 @@ async fn board_routes(State(state): State<AppState>) -> Json<Value> {
         }
     }
     Json(json!({"routes": routes}))
+}
+
+#[derive(Deserialize)]
+struct RoutePathQuery {
+    /// Source node virtual peer id (frontend selects nodes by peer_id).
+    from: u32,
+    /// Destination peer id.
+    to: u32,
+}
+
+/// Real forwarding path between two peers, walked hop by hop through each
+/// node's ACTUAL OSPF route table from its latest snapshot. Forwarding is a
+/// per-node next-hop lookup, so following next_hop_peer_id reproduces exactly
+/// what data traffic does — unlike a frontend BFS over the metrics graph.
+async fn board_route_path(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<RoutePathQuery>,
+) -> Json<Value> {
+    let now_ts = now();
+    let mut own_peer: HashMap<String, u32> = HashMap::new();
+    let mut routes: HashMap<String, HashMap<u32, u32>> = HashMap::new();
+    for entry in state.node_rt.iter() {
+        if now_ts - entry.value().ts > RT_FRESH_SECS {
+            continue;
+        }
+        let value = entry.value().snapshot.clone();
+        for inst in value.get("instances").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(topo) = inst.get("topology") else { continue };
+            let mut table: HashMap<u32, u32> = HashMap::new();
+            for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
+                let Some(peer_id) = n.get("peer_id").and_then(|v| v.as_u64()).map(|v| v as u32)
+                else {
+                    continue;
+                };
+                if n.get("local").and_then(|v| v.as_bool()) == Some(true) {
+                    own_peer.insert(entry.key().clone(), peer_id);
+                }
+                if let Some(nh) = n.get("next_hop_peer_id").and_then(|v| v.as_u64()) {
+                    table.insert(peer_id, nh as u32);
+                }
+            }
+            routes.insert(entry.key().clone(), table);
+        }
+    }
+    let Some(from_node) = own_peer.iter().find(|(_, p)| **p == q.from).map(|(n, _)| n.clone()) else {
+        return Json(json!({ "ok": false, "error": "source node has no fresh snapshot" }));
+    };
+    let mut path = vec![q.from];
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(q.from);
+    let mut current_node = from_node;
+    let mut ok = false;
+    for _ in 0..16 {
+        let Some(table) = routes.get(&current_node) else { break };
+        let Some(next) = table.get(&q.to).copied() else { break };
+        if visited.contains(&next) {
+            break;
+        }
+        path.push(next);
+        visited.insert(next);
+        if next == q.to {
+            ok = true;
+            break;
+        }
+        let Some(node) = own_peer.iter().find(|(_, p)| **p == next).map(|(n, _)| n.clone()) else {
+            break;
+        };
+        current_node = node;
+    }
+    Json(json!({ "ok": ok, "path": path }))
 }
 
 async fn board_links(State(state): State<AppState>) -> Json<Value> {
@@ -5140,6 +5239,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/board/events", get(board_events))
         .route("/api/board/links", get(board_links))
         .route("/api/board/routes", get(board_routes))
+        .route("/api/board/route-path", get(board_route_path))
         .route("/api/board/history", get(board_history))
         .route("/api/board/audit", get(list_audit))
         .route("/api/board/nodes", get(list_nodes).post(add_node))

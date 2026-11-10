@@ -1,9 +1,12 @@
 //! Route trait surface shared by the peer domain, plus the OSPF route
 //! implementation and the graph algorithms backing it.
 
+pub(crate) mod cost_mode;
 pub(crate) mod graph_algo;
 pub(crate) mod peer_ospf_route;
 mod route_peer_wire;
+
+pub use cost_mode::RouteCostMode;
 
 use cidr::Ipv6Inet;
 use cidr::{Ipv4Cidr, Ipv6Cidr};
@@ -65,6 +68,34 @@ pub trait RouteCostCalculatorInterface: Send + Sync {
 
     fn calculate_cost(&self, _src: PeerId, _dst: PeerId) -> i32 {
         1
+    }
+
+    /// Measured latency of the direct link src->dst (ms). Mode input for
+    /// MinLatency and the Smart base cost.
+    fn link_latency_ms(&self, _src: PeerId, _dst: PeerId) -> i32 {
+        500
+    }
+
+    /// Measured loss rate of the direct link src->dst (percent). Mode input
+    /// for the Smart base cost.
+    fn link_loss_pct(&self, _src: PeerId, _dst: PeerId) -> f32 {
+        0.0
+    }
+
+    /// Total Mbps the peer `src` reports forwarding out of its link to `dst`
+    /// (all destinations). Smart-mode remote-link capacity accounting.
+    fn link_forward_total_mbps(&self, _src: PeerId, _dst: PeerId) -> f64 {
+        0.0
+    }
+
+    /// Per-destination forwarded rates `src` reports on its link to `dst`.
+    /// Smart-mode remote-link per-destination attribution.
+    fn link_dst_rates_map(
+        &self,
+        _src: PeerId,
+        _dst: PeerId,
+    ) -> std::collections::BTreeMap<PeerId, f64> {
+        std::collections::BTreeMap::new()
     }
 
     fn need_update(&self) -> bool {

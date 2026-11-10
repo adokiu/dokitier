@@ -827,6 +827,7 @@ async fn handle_command(
                 wg_loss_weight: params.wg_loss_weight,
                 min_bandwidth_mbps: params.min_bandwidth_mbps,
                 weighted: params.weighted,
+                cost_mode: dokitier_core::peers::RouteCostMode::parse(&params.cost_mode),
             });
             (true, None, None)
         }

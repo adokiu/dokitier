@@ -128,6 +128,14 @@ where
             candidate.set_ipv6_public_addr_prefix(prefix);
             provider_config_changed = true;
         }
+        // Hot-reloadable egress pin: empty string clears the binding.
+        if let Some(iface) = patch.outbound_interface {
+            let desired = if iface.is_empty() { None } else { Some(iface) };
+            candidate.set_outbound_interface(desired.clone());
+            validate_persist_and_commit_candidate(instance, &config, &candidate, persistence)
+                .await?;
+            crate::socket::set_outbound_interface(desired);
+        }
         let mut managed_credentials_changed = false;
 
         // Runs last so client validation sees the fully patched candidate,
