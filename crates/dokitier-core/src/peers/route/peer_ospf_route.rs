@@ -59,9 +59,10 @@ use crate::{
             OspfRouteRpcClientFactory, OspfRouteRpcServer, PeerGroupInfo, PeerIdVersion,
             BandwidthProbeRpcServer, PeerIdentityType, PublicIpv6AddrRpcServer,
             RouteForeignNetworkInfos,
-            RouteForeignNetworkSummary, RoutePeerInfo, RoutePeerInfos, SyncRouteInfoError,
+            RouteForeignNetworkSummary, RoutePeerInfo, RoutePeerInfos, RouteInfoSummaryEntry,
+            SyncRouteInfoError,
             SyncRouteInfoRequest, SyncRouteInfoResponse, TrustedCredentialPubkey,
-            TrustedCredentialPubkeyProof, route_foreign_network_infos,
+            TrustedCredentialPubkeyProof, WithdrawnPeerInfo, route_foreign_network_infos,
             route_foreign_network_summary, sync_route_info_request::ConnInfo,
         },
         rpc_types::{
@@ -745,14 +746,18 @@ impl OspfRouteTable {
 }
 
 static UPDATE_PEER_INFO_PERIOD: Duration = Duration::from_secs(3600);
-static REMOVE_DEAD_PEER_INFO_AFTER: Duration = Duration::from_secs(300);
+static REMOVE_DEAD_PEER_INFO_AFTER: Duration = Duration::from_secs(3660);
 static FORCE_USE_CONN_LIST: AtomicBool = AtomicBool::new(false);
 
 // if a peer is unreachable for `REMOVE_UNREACHABLE_PEER_INFO_AFTER` time, we can remove it because
 // 1. all the ospf sessions between two zone are already destroy, new created session will resend the peer info.
 // 2. all the dst_saved_peer_info_version in all sessions already remove the peer info, the peer info will be propagated
 //    in another zone when two zone restore the conneciton.
-static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(10);
+// Upstream uses 90s. We tombstone GC removals (see clear_expired_peer), which
+// kills the mesh resurrection loop that made short windows unsafe upstream, so
+// a tighter window is possible: a crashed peer's entry is reaped 15-20s after
+// its last edge disappears instead of after 90-150s.
+static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(15);
 
 fn route_peer_inst_id(info: &RoutePeerInfo) -> Option<uuid::Uuid> {
     info.inst_id.map(Into::into)
@@ -918,6 +923,28 @@ struct InterfacePeerSnapshot {
     public_keys: BTreeMap<PeerId, Option<Vec<u8>>>,
 }
 
+/// Tombstone state for a withdrawn peer. Version floors are inclusive: any
+/// stored peer/conn info of the peer with `version <= floor` must be dropped
+/// and must not be re-accepted from flooded copies (this is what stops the
+/// mesh-wide resurrection ping-pong of dead entries).
+#[derive(Debug, Clone, Copy)]
+struct WithdrawnPeerInfoState {
+    peer_info_version: Version,
+    conn_info_version: Version,
+    expires_at: SystemTime,
+    /// The withdrawal was declared by the peer itself (possibly relayed).
+    by_origin: bool,
+}
+
+// Tombstones declared by the origin itself (graceful leave) are authoritative:
+// peer ids are random per process, so this peer id can never legitimately come
+// back. Keep them as long as a dead RoutePeerInfo could otherwise linger.
+const WITHDRAWN_PEER_INFO_ORIGIN_TTL: Duration = Duration::from_secs(3660);
+// Tombstones declared by neighbours (unreachable GC) may be produced by a mere
+// link flap, so they get a short TTL and are cleared early by self-claim (the
+// peer re-appearing on a live session).
+const WITHDRAWN_PEER_INFO_NEIGHBOUR_TTL: Duration = Duration::from_secs(120);
+
 // constructed with all infos synced from all peers.
 struct SyncedRouteInfo {
     default_easytier_version: String,
@@ -925,6 +952,8 @@ struct SyncedRouteInfo {
     // Keep the original protobuf bytes so unknown fields survive multi-hop propagation.
     raw_peer_infos: DashMap<PeerId, RawRoutePeerInfo>,
     conn_map: RwLock<OrderedHashMap<PeerId, RouteConnInfo>>,
+    // Tombstones for withdrawn peers, see WithdrawnPeerInfoState.
+    withdrawn_peer_infos: RwLock<OrderedHashMap<PeerId, WithdrawnPeerInfoState>>,
     foreign_network: DashMap<ForeignNetworkRouteInfoKey, ForeignNetworkRouteInfoEntry>,
     group_trust_map: DashMap<PeerId, HashMap<String, Vec<u8>>>,
     group_trust_map_cache: DashMap<PeerId, Arc<Vec<String>>>, // cache for group trust map, should sync with group_trust_map
@@ -952,6 +981,10 @@ impl Debug for SyncedRouteInfo {
             .field("default_easytier_version", &self.default_easytier_version)
             .field("peer_infos", &self.peer_infos)
             .field("conn_map", &self.conn_map)
+            .field(
+                "withdrawn_peer_infos",
+                &self.withdrawn_peer_infos.read().len(),
+            )
             .field("foreign_network", &self.foreign_network)
             .field("group_trust_map", &self.group_trust_map)
             .field("version", &self.version.get())
@@ -1310,9 +1343,160 @@ impl SyncedRouteInfo {
         self.version.inc();
     }
 
+    /// Record tombstones for the given withdrawals and delete any stored
+    /// entries of those peers. Returns true when this changed the synced state
+    /// (i.e. the change must be re-flooded and the route table rebuilt).
+    /// Withdrawals for `my_peer_id` are ignored: a relayed stale tombstone
+    /// must never make us delete our own route/conn rows.
+    fn withdraw_peer_infos(&self, my_peer_id: PeerId, withdrawn: &[WithdrawnPeerInfo]) -> bool {
+        let mut changed = false;
+        for item in withdrawn {
+            if item.peer_id == my_peer_id {
+                continue;
+            }
+            let ttl = if item.by_origin {
+                WITHDRAWN_PEER_INFO_ORIGIN_TTL
+            } else {
+                WITHDRAWN_PEER_INFO_NEIGHBOUR_TTL
+            };
+            {
+                let mut tombstones = self.withdrawn_peer_infos.write();
+                let state = tombstones
+                    .entry(item.peer_id)
+                    .or_insert(WithdrawnPeerInfoState {
+                        peer_info_version: 0,
+                        conn_info_version: 0,
+                        expires_at: SystemTime::now() + ttl,
+                        by_origin: false,
+                    });
+                state.peer_info_version = state.peer_info_version.max(item.peer_info_version);
+                state.conn_info_version = state.conn_info_version.max(item.conn_info_version);
+                // TTL is anchored at first sighting (and upgraded only when the
+                // declaration gains origin authority). Relayed copies arriving
+                // every sync round must NOT extend it, otherwise tombstones
+                // become immortal and fence peers forever.
+                if item.by_origin && !state.by_origin {
+                    state.by_origin = true;
+                    state.expires_at = SystemTime::now() + WITHDRAWN_PEER_INFO_ORIGIN_TTL;
+                }
+            }
+
+            // Drop stored entries of the withdrawn peer, but only those the
+            // tombstone actually covers: a neighbour-declared tombstone must
+            // never delete a strictly newer incarnation of the peer. Tombstone
+            // floors (not the deletion) are what keep flooded copies from
+            // resurrecting older entries afterwards.
+            let deleted = {
+                let mut peer_infos = self.peer_infos.write();
+                let mut conn_map = self.conn_map.write();
+                let info_v = peer_infos.get(&item.peer_id).map(|x| x.version);
+                let conn_v = conn_map.get(&item.peer_id).map(|x| x.version.get());
+                let keep_info = !item.by_origin && info_v.is_some_and(|v| v > item.peer_info_version);
+                let keep_conn = !item.by_origin && conn_v.is_some_and(|v| v > item.conn_info_version);
+                (
+                    if keep_info { None } else { peer_infos.remove(&item.peer_id) },
+                    if keep_conn { None } else { conn_map.remove(&item.peer_id) },
+                )
+            };
+            if deleted.0.is_some() || deleted.1.is_some() {
+                self.raw_peer_infos.remove(&item.peer_id);
+                changed = true;
+            }
+        }
+        if changed {
+            self.version.inc();
+        }
+        changed
+    }
+
+    /// Snapshot of all live tombstones, to be carried in every sync round.
+    fn list_withdrawn_peer_infos(&self) -> Vec<WithdrawnPeerInfo> {
+        let now = SystemTime::now();
+        self.withdrawn_peer_infos
+            .read()
+            .iter()
+            .filter(|(_, state)| state.expires_at > now)
+            .map(
+                |(peer_id, state)| WithdrawnPeerInfo {
+                    peer_id: *peer_id,
+                    peer_info_version: state.peer_info_version,
+                    conn_info_version: state.conn_info_version,
+                    by_origin: state.by_origin,
+                },
+            )
+            .collect()
+    }
+
+    fn prune_expired_withdrawn_peer_infos(&self) {
+        let now = SystemTime::now();
+        let mut tombstones = self.withdrawn_peer_infos.write();
+        let expired: Vec<PeerId> = tombstones
+            .iter()
+            .filter(|(_, state)| state.expires_at <= now)
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+        for peer_id in expired {
+            tombstones.remove(&peer_id);
+        }
+    }
+
+    /// Some(peer_info_version floor) when a RoutePeerInfo of this peer with the
+    /// given version must be dropped.
+    fn blocked_peer_info_floor(&self, peer_id: PeerId, version: Version) -> Option<Version> {
+        self.withdrawn_peer_infos
+            .read()
+            .get(&peer_id)
+            .filter(|state| state.expires_at > SystemTime::now() && state.peer_info_version >= version)
+            .map(|state| state.peer_info_version)
+    }
+
+    /// True when a RouteConnInfo of this peer with the given version must be
+    /// dropped.
+    fn conn_info_blocked(&self, peer_id: PeerId, version: Version) -> bool {
+        self.withdrawn_peer_infos
+            .read()
+            .get(&peer_id)
+            .is_some_and(|state| {
+                state.expires_at > SystemTime::now() && state.conn_info_version >= version
+            })
+    }
+
+    /// LSDB header summary (OSPF DBD analog): one entry per known peer with
+    /// the currently stored peer-info and conn-info versions. ~12 bytes per
+    /// peer; receivers diff it against their own database to trigger refills.
+    fn build_route_info_summary(&self) -> Vec<RouteInfoSummaryEntry> {
+        let peer_infos = self.peer_infos.read();
+        let conn_map = self.conn_map.read();
+        let mut out = Vec::with_capacity(peer_infos.len() + conn_map.len());
+        for (peer_id, info) in peer_infos.iter() {
+            out.push(RouteInfoSummaryEntry {
+                peer_id: *peer_id,
+                peer_info_version: info.version,
+                conn_info_version: conn_map
+                    .get(peer_id)
+                    .map(|c| c.version.get())
+                    .unwrap_or(0),
+            });
+        }
+        for (peer_id, conn) in conn_map.iter() {
+            if peer_infos.get(peer_id).is_none() {
+                out.push(RouteInfoSummaryEntry {
+                    peer_id: *peer_id,
+                    peer_info_version: 0,
+                    conn_info_version: conn.version.get(),
+                });
+            }
+        }
+        out
+    }
+
     fn fill_empty_peer_info(&self, peer_ids: &BTreeSet<PeerId>) {
         let mut need_inc_version = false;
         for peer_id in peer_ids {
+            // Do not synthesize placeholder rows for withdrawn peers.
+            if self.blocked_peer_info_floor(*peer_id, 0).is_some() {
+                continue;
+            }
             let guard = self.peer_infos.upgradable_read();
             if !guard.contains_key(peer_id) {
                 let mut peer_info =
@@ -1418,76 +1602,30 @@ impl SyncedRouteInfo {
                 &route_info,
             )?;
 
-            let mut guard = self.peer_infos.write();
-            // A restarted node keeps its instance id but gets a new peer_id /
-            // peer_route_id. Evict the previous incarnation of the same instance
-            // immediately, so a zombie entry is never produced in the first place
-            // instead of waiting for the dead-peer GC timeout.
-            if let Some(inst) = route_peer_inst_id(&route_info) {
-                // A restarted instance has a second peer id with the same
-                // instance id. Only the *newer* incarnation may survive: an
-                // older flooded copy must neither resurrect the dead entry nor
-                // evict the fresh one (that symmetry was flipping the graph
-                // back and forth).
-                let mut evict: Vec<PeerId> = Vec::new();
-                let mut drop_incoming = false;
-                for (pid, old) in guard.iter() {
-                    if *pid == route_info.peer_id
-                        || route_peer_inst_id(old) != Some(inst)
-                        || old.peer_route_id == route_info.peer_route_id
-                    {
-                        continue;
-                    }
-                    let incoming_newer = match (route_info.last_update, old.last_update) {
-                        (Some(a), Some(b)) => {
-                            (a.seconds, a.nanos) > (b.seconds, b.nanos)
-                                || ((a.seconds, a.nanos) == (b.seconds, b.nanos)
-                                    && route_info.version >= old.version)
-                        }
-                        (Some(_), None) => true,
-                        (None, Some(_)) => false,
-                        (None, None) => route_info.version >= old.version,
-                    };
-                    if incoming_newer {
-                        evict.push(*pid);
-                    } else {
-                        drop_incoming = true;
-                    }
-                }
-                if drop_incoming {
+            // Tombstone guard: a withdrawn peer's entries (and every older
+            // flooded copy of them) must not be resurrected. If the peer itself
+            // claims its info over a live session it is clearly alive again:
+            // clear the tombstone and adopt the claim with a version that
+            // outruns every other holder's floor so it can propagate through.
+            if let Some(floor) =
+                self.blocked_peer_info_floor(route_info.peer_id, route_info.version)
+            {
+                if route_info.peer_id == dst_peer_id {
+                    route_info.version = floor.saturating_add(1);
+                    self.withdrawn_peer_infos.write().remove(&route_info.peer_id);
+                    tracing::info!(
+                        peer_id = route_info.peer_id,
+                        "withdrawn peer re-claimed its route info on a live session"
+                    );
+                } else {
                     continue;
                 }
-                for pid in evict {
-                    guard.remove(&pid);
-                    self.raw_peer_infos.remove(&pid);
-                    self.conn_map.write().remove(&pid);
-                    need_inc_version = true;
-                    tracing::info!(
-                        stale_peer_id = pid,
-                        new_peer_id = route_info.peer_id,
-                        "evicted stale peer incarnation for same instance"
-                    );
-                }
             }
-            // Preserve the origin's last_update instead of stamping "now" on every
-            // flooded copy. Overwriting it made dead incarnations look fresh
-            // forever, so a restarted node's old peer_id never aged out and the
-            // topology kept showing zombie nodes.
-            let incoming_ts = route_info.last_update;
-            let previous_ts = guard.get(&route_info.peer_id).and_then(|old| old.last_update);
-            route_info.last_update = match (incoming_ts, previous_ts) {
-                (Some(a), Some(b)) if b.seconds > a.seconds => Some(b),
-                (a, b) => a.or(b),
-            };
-            if let Some(old) = guard.get(&route_info.peer_id) {
-                // Same peer id, different route id => the instance restarted.
-                // Adopt the new incarnation and keep the stored version
-                // monotonic so route sync does not reject it.
-                if old.peer_route_id != route_info.peer_route_id {
-                    route_info.version = route_info.version.max(old.version.saturating_add(1));
-                    route_info.last_update = Some(Timestamp::now());
-                }
-            }
+
+            let mut guard = self.peer_infos.write();
+            // time between peers may not be synchronized, so update last_update to local now.
+            // note only last_update with larger version will be updated to local saved peer info.
+            route_info.last_update = Some(Timestamp::now());
             if guard
                 .get_mut(&route_info.peer_id)
                 .is_none_or(|old| route_info.version > old.version)
@@ -1509,6 +1647,11 @@ impl SyncedRouteInfo {
         peer_id_version: &PeerIdVersion,
         connected_peers: BTreeSet<PeerId>,
     ) -> bool {
+        // Tombstone guard: conn rows of a withdrawn peer stay dropped; the edge
+        // is restored through the other endpoint's conn row once it reconnects.
+        if self.conn_info_blocked(peer_id_version.peer_id, peer_id_version.version) {
+            return false;
+        }
         let mut guard = self.conn_map.write();
         if guard
             .get_mut(&peer_id_version.peer_id)
@@ -1615,14 +1758,7 @@ impl SyncedRouteInfo {
         );
         let mut guard = self.peer_infos.upgradable_read();
         let old = guard.get(&my_peer_id);
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
-        let new_version = old
-            .map(|x| x.version + 1)
-            .unwrap_or(0)
-            .max(now_secs);
+        let new_version = old.map(|x| x.version).unwrap_or(0) + 1;
         let need_insert_new = if let Some(old) = old {
             try_update_new_peer_info(old, &mut new)
         } else {
@@ -1659,14 +1795,7 @@ impl SyncedRouteInfo {
 
         let guard = self.conn_map.upgradable_read();
         let my_conn_info = guard.get(&my_peer_id);
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
-        let new_version = my_conn_info
-            .map(|x| x.version.get() + 1)
-            .unwrap_or(0)
-            .max(now_secs);
+        let new_version = my_conn_info.map(|x| x.version.get()).unwrap_or(0) + 1;
 
         if my_conn_info.is_none_or(|old| old.connected_peers != connected_peers) {
             let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
@@ -2518,16 +2647,9 @@ impl Debug for PeerRouteServiceImpl {
 #[allow(dead_code)]
 impl PeerRouteServiceImpl {
     fn new(my_peer_id: PeerId, context: ArcPeerContext) -> Self {
-        // Route id is the *process incarnation* id: it must change on restart so
-        // neighbours can tell that the same peer id has a new incarnation and
-        // adopt its info even though the version counter restarted.
-        let mut my_peer_route_id: u64 = rand::random();
-        if my_peer_route_id == 0 {
-            my_peer_route_id = 1;
-        }
         PeerRouteServiceImpl {
             my_peer_id,
-            my_peer_route_id,
+            my_peer_route_id: rand::random(),
             context: context.clone(),
             sessions: DashMap::with_shard_amount(small_map_shard_amount()),
             stopped: AtomicBool::new(false),
@@ -2547,6 +2669,7 @@ impl PeerRouteServiceImpl {
                 peer_infos: RwLock::new(OrderedHashMap::new()),
                 raw_peer_infos: DashMap::with_shard_amount(small_map_shard_amount()),
                 conn_map: RwLock::new(OrderedHashMap::new()),
+                withdrawn_peer_infos: RwLock::new(OrderedHashMap::new()),
                 foreign_network: DashMap::with_shard_amount(small_map_shard_amount()),
                 group_trust_map: DashMap::with_shard_amount(small_map_shard_amount()),
                 group_trust_map_cache: DashMap::with_shard_amount(small_map_shard_amount()),
@@ -3194,11 +3317,16 @@ impl PeerRouteServiceImpl {
         let mut included_peer_ids = HashSet::new();
         let peer_infos = self.synced_route_info.peer_infos.read();
         let mut unreachable_peers_for_peer_info = session.unreachable_peers_for_peer_info.lock();
-        for (peer_id, peer_info) in peer_infos.iter() {
-            // Do not prune the rest of the table by origin timestamp: a peer
-            // that missed an entry (relay path came up later, peer restarted,
-            // relay switched) would never receive it again. The authoritative
-            // check is the per-peer acknowledged version below.
+        let last_sync_succ_timestamp = session.last_sync_succ_timestamp.load();
+        for (peer_id, peer_info) in peer_infos.iter().rev() {
+            // stop iter if last_update of peer info is older than session.last_sync_succ_timestamp
+            if let Some(last_update) = peer_info.last_update {
+                let last_update = SystemTime::try_from(last_update).unwrap();
+                if last_sync_succ_timestamp.is_some_and(|t| last_update < t) {
+                    break;
+                }
+            }
+
             if session.check_saved_peer_info_update_to_date(peer_info.peer_id, peer_info.version) {
                 continue;
             }
@@ -3267,8 +3395,14 @@ impl PeerRouteServiceImpl {
                 + conn_info.connected_peers.len() * std::mem::size_of::<PeerId>();
         };
 
-        for (peer_id, conn_info) in conn_map.iter() {
-            // same as peer infos: never prune the remainder by timestamp
+        let last_sync_succ_timestamp = session.last_sync_succ_timestamp.load();
+        for (peer_id, conn_info) in conn_map.iter().rev() {
+            // stop iter if last_update of conn info is older than session.last_sync_succ_timestamp
+            let last_update = TryInto::<SystemTime>::try_into(conn_info.last_update).unwrap();
+            if last_sync_succ_timestamp.is_some_and(|t| last_update < t) {
+                break;
+            }
+
             if session.check_saved_conn_version_update_to_date(*peer_id, conn_info.version.get()) {
                 continue;
             }
@@ -3511,6 +3645,11 @@ impl PeerRouteServiceImpl {
         let now = SystemTime::now();
         let mut to_remove = Vec::new();
         for (peer_id, peer_info) in self.synced_route_info.peer_infos.read().iter() {
+            // Our own row is self-originated and always authoritative: never
+            // GC it (a boot-time reachability gap must not tombstone ourselves).
+            if *peer_id == self.my_peer_id {
+                continue;
+            }
             if let Ok(d) = now.duration_since(peer_info.last_update.unwrap().try_into().unwrap())
                 && (d > REMOVE_DEAD_PEER_INFO_AFTER
                     || (d > REMOVE_UNREACHABLE_PEER_INFO_AFTER
@@ -3518,6 +3657,33 @@ impl PeerRouteServiceImpl {
             {
                 to_remove.push(*peer_id);
             }
+        }
+
+        // Tombstone every GC-removed peer so its entry cannot be resurrected by
+        // stale flooded copies circulating in the mesh (the resurrection
+        // ping-pong is what made dead entries live forever in dense topologies).
+        // Neighbour-declared tombstones get a short TTL: a link flap must not
+        // fence a live peer forever, and a re-claim on a live session clears it.
+        if !to_remove.is_empty() {
+            let withdrawn = to_remove
+                .iter()
+                .filter_map(|peer_id| {
+                    let peer_infos = self.synced_route_info.peer_infos.read();
+                    let conn_map = self.synced_route_info.conn_map.read();
+                    let peer_info_version = peer_infos.get(peer_id).map(|x| x.version)?;
+                    let conn_info_version =
+                        conn_map.get(peer_id).map(|x| x.version.get()).unwrap_or(0);
+                    Some(WithdrawnPeerInfo {
+                        peer_id: *peer_id,
+                        peer_info_version,
+                        conn_info_version,
+                        by_origin: false,
+                    })
+                })
+                .collect::<Vec<_>>();
+            self.synced_route_info
+                .withdraw_peer_infos(self.my_peer_id, &withdrawn);
+            self.synced_route_info.prune_expired_withdrawn_peer_infos();
         }
 
         self.synced_route_info
@@ -3594,9 +3760,13 @@ impl PeerRouteServiceImpl {
         let expected_dst_session_id = session.dst_session_id.load(Ordering::Relaxed);
         let (peer_infos, conn_info, foreign_network) =
             self.build_sync_request(&session, dst_peer_id);
+        let withdrawn_peer_infos = self.synced_route_info.list_withdrawn_peer_infos();
+        let route_info_summary = self.synced_route_info.build_route_info_summary();
         if peer_infos.is_none()
             && conn_info.is_none()
             && foreign_network.is_none()
+            && withdrawn_peer_infos.is_empty()
+            && route_info_summary.is_empty()
             && !session.need_sync_initiator_info.load(Ordering::Relaxed)
             && !(sync_as_initiator && session.we_are_initiator.load(Ordering::Relaxed))
         {
@@ -3633,6 +3803,8 @@ impl PeerRouteServiceImpl {
             peer_infos: peer_infos.clone().map(|x| RoutePeerInfos { items: x }),
             conn_info: conn_info.clone(),
             foreign_network_infos: foreign_network.clone(),
+            withdrawn_peer_infos,
+            route_info_summary,
         };
 
         let mut ctrl = BaseController::default();
@@ -3729,6 +3901,20 @@ impl PeerRouteServiceImpl {
                     }
                     session.update_last_sync_succ_timestamp(next_last_sync_succ_timestamp);
                     self.request_missing_peer_infos(&session, resp);
+
+                    // Apply the tombstones the dst sent back. They re-flood via
+                    // the normal sync rounds and ride along until their TTL ends.
+                    if !resp.withdrawn_peer_infos.is_empty()
+                        && self
+                            .synced_route_info
+                            .withdraw_peer_infos(self.my_peer_id, &resp.withdrawn_peer_infos)
+                    {
+                        self.update_route_table_and_cached_local_conn_bitmap();
+                    }
+
+                    // Anti-entropy: diff our database against the dst's summary
+                    // and re-send anything the dst is missing or holds older.
+                    self.process_peer_route_summary(&session, &resp.route_info_summary);
                 }
             }
         }
@@ -3763,6 +3949,52 @@ impl PeerRouteServiceImpl {
         };
 
         session.clean_dst_saved_map();
+    }
+
+    /// Anti-entropy (OSPF DBD/LSR analog): diff our route database against the
+    /// remote summary and force a re-send of every row the remote lacks or
+    /// holds at an older version. Re-sends reuse the existing watermark/pending
+    /// machinery and stop once the remote acks, so any desync caused by GC,
+    /// tombstones, restarts or bugs converges within one or two sync rounds.
+    /// Must be called with the session lock held.
+    fn process_peer_route_summary(
+        &self,
+        session: &SyncRouteSession,
+        summary: &[RouteInfoSummaryEntry],
+    ) {
+        // An empty summary means the remote database is empty (fresh restart):
+        // every local row must be pushed, so do not early-return here.
+        let remote: std::collections::HashMap<PeerId, (Version, Version)> = summary
+            .iter()
+            .map(|e| (e.peer_id, (e.peer_info_version, e.conn_info_version)))
+            .collect();
+
+        let peer_infos = self.synced_route_info.peer_infos.read();
+        let conn_map = self.synced_route_info.conn_map.read();
+        let mut pending_info = session.unreachable_peers_for_peer_info.lock();
+        let mut pending_conn = session.unreachable_peers_for_conn_info.lock();
+
+        for (peer_id, info) in peer_infos.iter() {
+            if *peer_id == session.dst_peer_id {
+                continue;
+            }
+            let remote_info_v = remote.get(peer_id).map(|x| x.0).unwrap_or(0);
+            if info.version > remote_info_v {
+                session.dst_saved_peer_info_versions.remove(peer_id);
+                pending_info.insert(*peer_id, info.version);
+            }
+        }
+        for (peer_id, conn) in conn_map.iter() {
+            if *peer_id == session.dst_peer_id {
+                continue;
+            }
+            let my_conn_v = conn.version.get();
+            let remote_conn_v = remote.get(peer_id).map(|x| x.1).unwrap_or(0);
+            if my_conn_v > remote_conn_v {
+                session.dst_saved_conn_info_version.remove(peer_id);
+                pending_conn.insert(*peer_id, my_conn_v);
+            }
+        }
     }
 }
 
@@ -3834,6 +4066,8 @@ impl OspfRouteRpc for RouteSessionManager {
                 raw_peer_infos,
                 conn_info,
                 foreign_network,
+                request.withdrawn_peer_infos,
+                request.route_info_summary,
             )
             .await;
 
@@ -4162,6 +4396,8 @@ impl RouteSessionManager {
         raw_peer_infos: Option<Vec<RawRoutePeerInfo>>,
         conn_info: Option<crate::proto::peer_rpc::sync_route_info_request::ConnInfo>,
         foreign_network: Option<RouteForeignNetworkInfos>,
+        withdrawn_peer_infos: Vec<crate::proto::peer_rpc::WithdrawnPeerInfo>,
+        route_info_summary: Vec<RouteInfoSummaryEntry>,
     ) -> Result<SyncRouteInfoResponse, Error> {
         let Some(service_impl) = self.service_impl.upgrade() else {
             return Err(Error::Stopped);
@@ -4207,6 +4443,17 @@ impl RouteSessionManager {
         }
 
         let _session_lock = session.lock.lock();
+
+        // Apply tombstones before processing any route info from this request,
+        // so the acceptance guards below see the freshest withdrawal floors.
+        let withdrawn_changed = !withdrawn_peer_infos.is_empty()
+            && service_impl
+                .synced_route_info
+                .withdraw_peer_infos(my_peer_id, &withdrawn_peer_infos);
+
+        // Anti-entropy: diff our database against the sender's summary and
+        // re-send anything the sender is missing or holds older.
+        service_impl.process_peer_route_summary(&session, &route_info_summary);
 
         if !service_impl.is_current_session(from_peer_id, &session)
             || !session.admit_inbound_locked(from_session_id, is_initiator)
@@ -4295,7 +4542,7 @@ impl RouteSessionManager {
             }
         }
 
-        if need_update_route_table || foreign_network_changed {
+        if need_update_route_table || withdrawn_changed || foreign_network_changed {
             service_impl.update_route_table_and_cached_local_conn_bitmap();
             service_impl.update_foreign_network_owner_map();
             if need_update_route_table
@@ -4334,7 +4581,7 @@ impl RouteSessionManager {
         // needs to be propagated to other peers.  Previously this was
         // unconditional, which created an A→B→A→B ping-pong storm even when
         // there was nothing new to propagate.
-        if need_update_route_table || foreign_network_changed {
+        if need_update_route_table || withdrawn_changed || foreign_network_changed {
             self.sync_now("sync_route_info");
         }
 
@@ -4344,6 +4591,8 @@ impl RouteSessionManager {
             error: None,
             missing_peer_ids,
             missing_conn_peer_ids,
+            withdrawn_peer_infos: service_impl.synced_route_info.list_withdrawn_peer_infos(),
+            route_info_summary: service_impl.synced_route_info.build_route_info_summary(),
         })
     }
 }
@@ -4469,6 +4718,30 @@ impl PeerRoute {
         else {
             return false;
         };
+
+        // Declare our own withdrawal (origin-declared tombstone): every node
+        // deletes our RoutePeerInfo row as soon as this propagates instead of
+        // aging it out via GC, and stale flooded copies can never resurrect it.
+        let peer_info_version = self
+            .service_impl
+            .synced_route_info
+            .peer_infos
+            .read()
+            .get(&self.my_peer_id)
+            .map(|info| info.version)
+            .unwrap_or(0);
+        self.service_impl
+            .synced_route_info
+            .withdraw_peer_infos(
+                self.my_peer_id,
+                &[WithdrawnPeerInfo {
+                    peer_id: self.my_peer_id,
+                    peer_info_version,
+                    conn_info_version,
+                    by_origin: true,
+                }],
+            );
+
         let sessions = direct_peers
             .peers
             .iter()
@@ -4536,7 +4809,8 @@ impl PeerRoute {
 
     async fn clear_expired_peer(service_impl: Arc<PeerRouteServiceImpl>) {
         loop {
-            // converge fast: check every 5s (was 60s)
+            // Scan frequently so the 15s unreachable window above actually
+            // reaps crashed peers in ~15-20s (upstream: 60s scan + 90s window).
             crate::foundation::time::sleep(Duration::from_secs(5)).await;
             service_impl.clear_expired_peer().await;
             // TODO: use debug log level for this.
@@ -5949,7 +6223,7 @@ mod tests {
             };
             let response = receiver
                 .session_mgr
-                .do_sync_route_info(2, 10, true, None, None, Some(conn_info), None)
+                .do_sync_route_info(2, 10, true, None, None, Some(conn_info), None, Vec::new(), Vec::new())
                 .await
                 .unwrap();
             assert_eq!(response.missing_peer_ids, vec![3]);
@@ -5959,7 +6233,7 @@ mod tests {
             // reports the missing peer; no periodic full topology scan is needed.
             let response = receiver
                 .session_mgr
-                .do_sync_route_info(2, 10, true, None, None, None, None)
+                .do_sync_route_info(2, 10, true, None, None, None, None, Vec::new(), Vec::new())
                 .await
                 .unwrap();
             assert_eq!(response.missing_peer_ids, vec![3]);
@@ -5997,6 +6271,8 @@ mod tests {
                     Some(infos.iter().map(raw_route_peer_info).collect()),
                     None,
                     None,
+                    Vec::new(),
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -6013,7 +6289,7 @@ mod tests {
             }
             let response = receiver
                 .session_mgr
-                .do_sync_route_info(2, 10, true, None, None, conn_info.clone(), None)
+                .do_sync_route_info(2, 10, true, None, None, conn_info.clone(), None, Vec::new(), Vec::new())
                 .await
                 .unwrap();
             assert!(response.missing_peer_ids.is_empty());
@@ -6337,7 +6613,7 @@ mod tests {
 
         route
             .session_mgr
-            .do_sync_route_info(2, 1, true, None, None, None, None)
+            .do_sync_route_info(2, 1, true, None, None, None, None, Vec::new(), Vec::new())
             .await
             .expect("initiator sync should succeed");
 
@@ -6379,7 +6655,7 @@ mod tests {
 
         let result = route
             .session_mgr
-            .do_sync_route_info(2, 1, false, None, None, None, None)
+            .do_sync_route_info(2, 1, false, None, None, None, None, Vec::new(), Vec::new())
             .await;
 
         assert!(matches!(result, Err(Error::Stopped)));
@@ -6395,7 +6671,7 @@ mod tests {
 
         route
             .session_mgr
-            .do_sync_route_info(2, 22, true, None, None, None, None)
+            .do_sync_route_info(2, 22, true, None, None, None, None, Vec::new(), Vec::new())
             .await
             .expect("new initiator generation should be accepted");
         let contact = session.last_contact_instant.load();
@@ -6416,6 +6692,8 @@ mod tests {
                 Some(vec![raw_route_peer_info(&stale_peer_info)]),
                 None,
                 None,
+                    Vec::new(),
+                    Vec::new(),
             )
             .await;
 
@@ -6466,7 +6744,7 @@ mod tests {
         let (peer_infos, raw_peer_infos) = sync_peer_info(v1.clone());
         route
             .session_mgr
-            .do_sync_route_info(2, 22, true, peer_infos, raw_peer_infos, None, None)
+            .do_sync_route_info(2, 22, true, peer_infos, raw_peer_infos, None, None, Vec::new(), Vec::new())
             .await
             .expect("v1 peer info should be accepted");
         assert_eq!(route.service_impl.get_peer_groups(3).as_ref(), &["legacy"]);
@@ -6475,7 +6753,7 @@ mod tests {
         let (peer_infos, raw_peer_infos) = sync_peer_info(v2);
         route
             .session_mgr
-            .do_sync_route_info(2, 22, true, peer_infos, raw_peer_infos, None, None)
+            .do_sync_route_info(2, 22, true, peer_infos, raw_peer_infos, None, None, Vec::new(), Vec::new())
             .await
             .expect("v2 peer info should be accepted");
         assert!(route.service_impl.get_peer_groups(3).is_empty());
@@ -6483,7 +6761,7 @@ mod tests {
         let (peer_infos, raw_peer_infos) = sync_peer_info(v1);
         route
             .session_mgr
-            .do_sync_route_info(2, 22, true, peer_infos, raw_peer_infos, None, None)
+            .do_sync_route_info(2, 22, true, peer_infos, raw_peer_infos, None, None, Vec::new(), Vec::new())
             .await
             .expect("stale peer info should be ignored");
 
@@ -6580,7 +6858,7 @@ mod tests {
             let session_mgr = route.session_mgr.clone();
             async move {
                 session_mgr
-                    .do_sync_route_info(2, 1, true, None, None, None, None)
+                    .do_sync_route_info(2, 1, true, None, None, None, None, Vec::new(), Vec::new())
                     .await
             }
         });

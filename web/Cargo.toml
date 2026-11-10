@@ -1,7 +1,7 @@
 [package]
 name = "dokitier-web"
 description = "dokitier embedded web console: topology, metrics, routing config."
-version = "2.7.0"
+version = "2.7.9"
 edition.workspace = true
 rust-version.workspace = true
 license-file = "../LICENSE"

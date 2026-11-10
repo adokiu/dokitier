@@ -112,6 +112,28 @@ message PeerGroupInfo {
   bytes group_proof = 2;
 }
 
+message WithdrawnPeerInfo {
+  uint32 peer_id = 1;
+  // Any RoutePeerInfo of `peer_id` with version <= this value must be dropped.
+  uint32 peer_info_version = 2;
+  // Any RouteConnInfo of `peer_id` with version <= this value must be dropped.
+  uint32 conn_info_version = 3;
+  // Set when the withdrawal was declared by the peer itself (graceful leave).
+  // Origin-declared tombstones are authoritative and live much longer than
+  // neighbour-declared ones (link flap must not fence a live peer forever).
+  bool by_origin = 4;
+}
+
+// LSDB header summary (OSPF DBD analog): one entry per known peer. Receivers
+// compare it against their own database and pull anything missing or older,
+// which makes route database desynchronization self-healing within one sync
+// round instead of depending on fragile heuristics.
+message RouteInfoSummaryEntry {
+  uint32 peer_id = 1;
+  uint32 peer_info_version = 2;
+  uint32 conn_info_version = 3;
+}
+
 message SyncRouteInfoRequest {
   uint32 my_peer_id = 1;
   uint64 my_session_id = 2;
@@ -122,6 +144,11 @@ message SyncRouteInfoRequest {
     RouteConnPeerList conn_peer_list = 7;
   }
   RouteForeignNetworkInfos foreign_network_infos = 6;
+  // Tombstones for peers whose route entries must be reaped network-wide
+  // (node left gracefully or was declared dead by its neighbours).
+  repeated WithdrawnPeerInfo withdrawn_peer_infos = 8;
+  // Sender's route database summary, see RouteInfoSummaryEntry.
+  repeated RouteInfoSummaryEntry route_info_summary = 9;
 }
 
 enum SyncRouteInfoError {
@@ -136,6 +163,10 @@ message SyncRouteInfoResponse {
   // Missing data for peers referenced by accepted topology. Empty in steady state.
   repeated uint32 missing_peer_ids = 4;
   repeated uint32 missing_conn_peer_ids = 5;
+  // Tombstones carried back towards the initiator, see SyncRouteInfoRequest.
+  repeated WithdrawnPeerInfo withdrawn_peer_infos = 6;
+  // Receiver's route database summary, see RouteInfoSummaryEntry.
+  repeated RouteInfoSummaryEntry route_info_summary = 7;
 }
 
 service OspfRouteRpc {
