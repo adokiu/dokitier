@@ -211,7 +211,7 @@ impl<R: IcmpProxyRuntime + 'static> IcmpProxyService<R> {
             },
         );
         if exit_flagged && crate::peers::peer_manager::diag_sample() {
-            tracing::info!(?action, "exit icmp packet engine decision");
+            tracing::info!(target: "CORE", ?action, "exit icmp packet engine decision");
         }
         match action {
             IcmpProxyAction::Pass => Some(packet),

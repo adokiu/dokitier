@@ -2646,7 +2646,7 @@ impl PeerOutboundPacketRouter {
             self.route.as_ref(),
         ) {
             if diag_sample() {
-                tracing::warn!(payload_len = data.buf_len(), "nic packet dropped by acl");
+                tracing::warn!(target: "CORE", payload_len = data.buf_len(), "nic packet dropped by acl");
             }
             return false;
         }
@@ -2949,6 +2949,7 @@ impl PeerOutboundPacketRouter {
 
         if is_exit_node && diag_sample() {
             tracing::info!(
+                target: "CORE",
                 dst = %ip_addr,
                 exit_peer = ?dst_peers,
                 "tun packet resolved to exit node"
@@ -2986,7 +2987,7 @@ impl PeerOutboundPacketRouter {
             }
             if let Err(e) = self.check_p2p_only_before_send(*peer_id, packet_policy) {
                 if diag_sample() {
-                    tracing::warn!(?e, dst = %ip_addr, ?peer_id, "send skipped by p2p-only policy");
+                    tracing::warn!(target: "CORE", ?e, dst = %ip_addr, ?peer_id, "send skipped by p2p-only policy");
                 }
                 errs.push(e);
                 continue;
@@ -3205,6 +3206,7 @@ impl PeerPacketRouter {
         let is_exit_packet = hdr.is_exit_node();
         if is_exit_packet && to_peer_id == self.my_peer_id && diag_sample() {
             tracing::info!(
+                target: "CORE",
                 from_peer_id,
                 "exit-flagged packet reached the local packet pipeline"
             );

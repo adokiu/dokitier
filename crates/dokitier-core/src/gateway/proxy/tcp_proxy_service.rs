@@ -468,7 +468,7 @@ impl<R: TcpProxyRuntime + 'static, F: VirtualTcpListenerFactory, C: TcpProxyDest
             },
         );
         if exit_flagged && crate::peers::peer_manager::diag_sample() {
-            tracing::info!(?action, mode = ?self.mode, "exit tcp packet engine decision");
+            tracing::info!(target: "CORE", ?action, mode = ?self.mode, "exit tcp packet engine decision");
         }
         match action {
             TcpProxyPacketAction::Handled { new_syn: _ } => {}
