@@ -1212,7 +1212,9 @@ impl NicCtx {
             .send_ip_packet(HostPacket::from_tun_packet(ret))
             .await
         {
-            tracing::trace!(?error, "[USER_PACKET] send_msg failed");
+            if dokitier_core::peers::peer_manager::diag_sample() {
+                tracing::warn!(target: "CORE", ?error, "[USER_PACKET] send_ip_packet failed");
+            }
         }
     }
 

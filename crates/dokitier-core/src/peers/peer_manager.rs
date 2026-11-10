@@ -204,7 +204,7 @@ fn random_peer_id() -> PeerId {
 /// either silent or logs below the production log level.
 static DIAG_SAMPLE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn diag_sample() -> bool {
+pub fn diag_sample() -> bool {
     use std::sync::atomic::Ordering;
     DIAG_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & 0x3F == 0
 }
@@ -2901,6 +2901,9 @@ impl PeerOutboundPacketRouter {
             msg,
             ip_addr
         );
+        if diag_sample() {
+            tracing::info!(target: "CORE", dst = %ip_addr, "send_msg_by_ip entry");
+        }
 
         msg.fill_peer_manager_hdr(self.my_peer_id, 0, PacketType::Data as u8);
         let filters_registered = !self.nic_packet_process_pipeline.load().is_empty();
@@ -2943,7 +2946,14 @@ impl PeerOutboundPacketRouter {
         };
 
         if dst_peers.is_empty() {
-            tracing::info!("no peer id for ip: {}", ip_addr);
+            if diag_sample() {
+                tracing::info!(
+                    target: "CORE",
+                    dst = %ip_addr,
+                    runtime_exit_nodes = ?self.exit_nodes.read().await.clone(),
+                    "tun packet unroutable: no peer id for ip"
+                );
+            }
             return Ok(());
         }
 
