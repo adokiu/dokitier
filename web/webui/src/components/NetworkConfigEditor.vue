@@ -490,11 +490,12 @@ function buildToml(f) {
   if (f.node_bandwidth_mbps !== '' && f.node_bandwidth_mbps != null) lines.push(`node_bandwidth_mbps = ${Number(f.node_bandwidth_mbps)}`)
   if (f.ipv6_public_addr_auto) lines.push('ipv6_public_addr_auto = true')
   if (f.ipv6_public_addr_provider) lines.push('ipv6_public_addr_provider = true')
-  if (f.proxy_network.filter(Boolean).length) {
-    for (const cidr of f.proxy_network.filter(Boolean)) {
-      lines.push('', '[[proxy_network]]', `cidr = ${str(cidr)}`)
-    }
-  }
+  // ALL remaining bare (top-level) keys MUST be emitted before ANY [[table]]
+  // section: in TOML every key after a section header belongs to that table.
+  // These used to be emitted after [[proxy_network]], which silently
+  // reassigned exit_nodes / outbound_interface / routes / socks5 / whitelists
+  // into the proxy_network table — exit routing then never applied (config
+  // get_exit_nodes() read the root table and found nothing).
   const routes = f.routes.split('\n').map((s) => s.trim()).filter(Boolean)
   if (routes.length) lines.push(`routes = [${routes.map(str).join(', ')}]`)
   const exits = f.exit_nodes.split('\n').map((s) => s.trim()).filter(Boolean)
@@ -505,6 +506,11 @@ function buildToml(f) {
   if (tcpw.length) lines.push(`tcp_whitelist = [${tcpw.map(str).join(', ')}]`)
   const udpw = f.udp_whitelist.split(',').map((s) => s.trim()).filter(Boolean)
   if (udpw.length) lines.push(`udp_whitelist = [${udpw.map(str).join(', ')}]`)
+  if (f.proxy_network.filter(Boolean).length) {
+    for (const cidr of f.proxy_network.filter(Boolean)) {
+      lines.push('', '[[proxy_network]]', `cidr = ${str(cidr)}`)
+    }
+  }
   for (const pf of f.port_forwards) {
     if (!pf.dst_addr) continue
     lines.push('', '[[port_forward]]')

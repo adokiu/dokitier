@@ -3211,7 +3211,7 @@ async function loadLiveBackfill() {
   if (!item || item.kind !== 'edge') return
   try {
     const network = item.network_name || (graph.edges || []).find((e) => keyOf(e.a, e.b) === keyOf(item.a, item.b))?.network_name || ''
-    const data = await api.boardHistory(network, item.a, item.b, '60s')
+    const data = await api.boardHistory(network, item.a, item.b, '60s', item.a_uuid, item.b_uuid)
     const key = keyOf(item.a, item.b)
     const map = new Map()
     for (const p of edgeSamples[key] || []) map.set(p.ts, p)
@@ -3227,7 +3227,7 @@ async function loadHistory() {
   if (historyRange.value === 'live') { syncLive(); return }
   try {
     const network = item.network_name || (graph.edges || []).find((e) => keyOf(e.a, e.b) === keyOf(item.a, item.b))?.network_name || ''
-    const data = await api.boardHistory(network, item.a, item.b, historyRange.value)
+    const data = await api.boardHistory(network, item.a, item.b, historyRange.value, item.a_uuid, item.b_uuid)
     historyPoints.value = mergePoints(data.points || [], item.samples || [])
     renderHistory()
   } catch {

@@ -44,7 +44,11 @@ export const api = {
   createNetwork: (body) => request('/api/board/networks/create', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body) }),
   boardLinks: () => request('/api/board/links'),
   boardRoutes: () => request('/api/board/routes'),
-  boardHistory: (network, a, b, range) => request(`/api/board/history?network=${encodeURIComponent(network)}&a=${a}&b=${b}&range=${range}`),
+  boardHistory: (network, a, b, range, aUuid, bUuid) => {
+    const q = `/api/board/history?network=${encodeURIComponent(network)}&a=${a}&b=${b}&range=${range}`
+    const extra = aUuid && bUuid ? `&a_uuid=${encodeURIComponent(aUuid)}&b_uuid=${encodeURIComponent(bUuid)}` : ''
+    return request(q + extra)
+  },
   boardNodes: () => request('/api/board/nodes'),
   createNode: (body) => request('/api/board/nodes', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body) }),
   nodeToken: (id) => request('/api/board/nodes/' + id + '/token'),

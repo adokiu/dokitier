@@ -3779,7 +3779,24 @@ async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
 /// Tier 1: older than 1h -> 60s buckets, tier 2: older than 24h -> 5min,
 /// tier 3: older than 7d -> 30min. Rows already on a bucket boundary are left
 /// alone so repeated runs stay cheap.
+///
+/// Set-based: one INSERT..SELECT per tier aggregates and rewrites in the
+/// database, grouped by the stable uuid pair (peer ids change on reconnect
+/// and would fragment history). The old row-by-row rewrite was millions of
+/// round-trips and never finished on a large table.
 async fn compact_link_metrics(state: &AppState) {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let result = compact_link_metrics_inner(state).await;
+    RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    if let Err(err) = result {
+        tracing::warn!(?err, "link metrics compaction failed");
+    }
+}
+
+async fn compact_link_metrics_inner(state: &AppState) -> Result<(), sqlx::Error> {
     let now_ts = now();
     let oldest = now_ts - 30 * 24 * 3600;
     // retention: nothing older than 30 days
@@ -3793,24 +3810,28 @@ async fn compact_link_metrics(state: &AppState) {
         (now_ts - 7 * 24 * 3600, 1800),
     ];
     for (cutoff, step) in tiers {
-        type Row = (String, i64, i64, Option<String>, Option<String>, i64, Option<f64>, Option<f64>);
-        let rows: Vec<Row> = sqlx::query_as(
-            "SELECT network, a, b, MAX(a_uuid), MAX(b_uuid), (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) \
+        let Ok(mut tx) = state.db.begin().await else {
+            continue;
+        };
+        let ins = sqlx::query(&q(
+            "INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) \
+             SELECT network, MIN(a), MIN(b), MAX(a_uuid), MAX(b_uuid), (ts / ?) * ?, AVG(latency_ms), AVG(loss_pct) \
              FROM link_metrics WHERE ts < ? AND ts >= ? AND ts % ? <> 0 \
-             GROUP BY network, a, b, bucket",
-        )
+             GROUP BY network, a_uuid, b_uuid, (ts / ?) * ?",
+        ))
         .bind(step)
         .bind(step)
         .bind(cutoff)
         .bind(oldest)
         .bind(step)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
-        if rows.is_empty() {
+        .bind(step)
+        .bind(step)
+        .execute(&mut *tx)
+        .await;
+        if ins.is_err() {
+            let _ = tx.rollback().await;
             continue;
         }
-        let Ok(mut tx) = state.db.begin().await else { continue };
         let del = sqlx::query(&q(
             "DELETE FROM link_metrics WHERE ts < ? AND ts >= ? AND ts % ? <> 0",
         ))
@@ -3823,32 +3844,9 @@ async fn compact_link_metrics(state: &AppState) {
             let _ = tx.rollback().await;
             continue;
         }
-        let mut ok = true;
-        for (network, a, b, a_uuid, b_uuid, bucket, latency, loss) in rows {
-            let ins = sqlx::query(&q(
-                "INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ))
-            .bind(network)
-            .bind(a)
-            .bind(b)
-            .bind(a_uuid)
-            .bind(b_uuid)
-            .bind(bucket)
-            .bind(latency)
-            .bind(loss)
-            .execute(&mut *tx)
-            .await;
-            if ins.is_err() {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            let _ = tx.commit().await;
-        } else {
-            let _ = tx.rollback().await;
-        }
+        let _ = tx.commit().await;
     }
+    Ok(())
 }
 
 fn spawn_history_maintenance(state: AppState) {
@@ -4119,6 +4117,11 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
     let mut nodes: std::collections::BTreeMap<(String, u32), Value> = std::collections::BTreeMap::new();
     let mut edges: std::collections::BTreeMap<(u32, u32, String), Value> = std::collections::BTreeMap::new();
     let mut peer_owner: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    // (network, peer_id) -> instance uuid: lets edges carry a stable two-node
+    // uuid pair so link history survives reconnects (peer ids change on every
+    // reconnect, instance ids do not).
+    let mut peer_uuid_by_net: std::collections::HashMap<(String, u32), String> =
+        std::collections::HashMap::new();
     // p2p group per (node_id, network) from the config the console pushed; the
     // agent snapshot does not carry it, so the topology view resolves it here.
     let version_rows: Vec<(String, String, String)> = sqlx::query_as(
@@ -4188,6 +4191,9 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
             let Some(topo) = inst.get("topology") else { continue };
             for n in topo.get("nodes").and_then(|v| v.as_array()).into_iter().flatten() {
                 if let Some(peer_id) = n.get("peer_id").and_then(|v| v.as_u64()) {
+                    if let Some(uuid) = n.get("instance_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        peer_uuid_by_net.insert((network.to_string(), peer_id as u32), uuid.to_string());
+                    }
                     let local = n.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
                     let mut node = n.clone();
                     node["network_name"] = json!(network);
@@ -4293,6 +4299,12 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
         }
     }
     for ((a, b, network), edge) in edges.iter_mut() {
+        if let Some(au) = peer_uuid_by_net.get(&(network.clone(), *a)) {
+            edge["a_uuid"] = json!(au);
+        }
+        if let Some(bu) = peer_uuid_by_net.get(&(network.clone(), *b)) {
+            edge["b_uuid"] = json!(bu);
+        }
         let mut edge_rx = 0.0f64;
         let mut edge_tx = 0.0f64;
         // Rates are reporter-scoped; look them up under the node whose tunnel
@@ -4548,6 +4560,10 @@ struct HistoryQuery {
     network: String,
     a: i64,
     b: i64,
+    #[serde(default)]
+    a_uuid: Option<String>,
+    #[serde(default)]
+    b_uuid: Option<String>,
     #[serde(default = "default_range")]
     range: String,
 }
@@ -4593,17 +4609,31 @@ async fn board_history(State(state): State<AppState>, axum::extract::Query(query
         "30d" => (7200, now() - 30 * 24 * 3600),
         _ => (600, now() - 24 * 3600),
     };
-    let a_uuid = resolve_peer_uuid(&state, &query.network, query.a);
-    let b_uuid = resolve_peer_uuid(&state, &query.network, query.b);
-    let rows: Result<Vec<(i64, Option<f64>, Option<f64>)>, sqlx::Error> = match (a_uuid, b_uuid) {
-        (Some(ua), Some(ub)) => {
-            let (lo, hi) = if ua <= ub { (ua, ub) } else { (ub, ua) };
+    // Preferred path: the caller passes the stable two-node uuid pair, so the
+    // history survives reconnects (peer ids change, instance ids do not).
+    let uuid_pair = match (query.a_uuid.clone(), query.b_uuid.clone()) {
+        (Some(ua), Some(ub)) if !ua.is_empty() && !ub.is_empty() => {
+            Some(if ua <= ub { (ua, ub) } else { (ub, ua) })
+        }
+        _ => {
+            // Fallback: resolve peer ids to uuids from live snapshots.
+            match (
+                resolve_peer_uuid(&state, &query.network, query.a),
+                resolve_peer_uuid(&state, &query.network, query.b),
+            ) {
+                (Some(ua), Some(ub)) => Some(if ua <= ub { (ua, ub) } else { (ub, ua) }),
+                _ => None,
+            }
+        }
+    };
+    let rows: Result<Vec<(i64, Option<f64>, Option<f64>)>, sqlx::Error> = match uuid_pair {
+        Some((lo, hi)) => {
             sqlx::query_as(&q(
                 "SELECT (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) FROM link_metrics WHERE network = ? AND a_uuid = ? AND b_uuid = ? AND ts > ? GROUP BY bucket ORDER BY bucket LIMIT 4000",
             )).bind(step).bind(step).bind(&query.network).bind(&lo).bind(&hi).bind(since)
               .fetch_all(&state.db).await
         }
-        _ => {
+        None => {
             sqlx::query_as(&q(
                 "SELECT (ts / ?) * ? AS bucket, AVG(latency_ms), AVG(loss_pct) FROM link_metrics WHERE network = ? AND a = ? AND b = ? AND ts > ? GROUP BY bucket ORDER BY bucket LIMIT 4000",
             )).bind(step).bind(step).bind(&query.network).bind(query.a).bind(query.b).bind(since)

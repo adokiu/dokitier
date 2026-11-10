@@ -357,6 +357,18 @@ impl OspfRouteTable {
                     continue;
                 };
 
+                // OSPF 2-Way requirement: an adjacency is only routed through
+                // when BOTH endpoints currently advertise each other. One
+                // side still listing the link (stale conn_info from a
+                // half-dead / one-way tunnel) must not put the edge into the
+                // graph — traffic forwarded into such an edge blackholes.
+                let bidirectional = lookup
+                    .connected_peers(*dst_peer_id)
+                    .is_some_and(|peers| peers.contains(&src_peer_id));
+                if !bidirectional {
+                    continue;
+                }
+
                 let mut cost = cost_calc.calculate_cost(src_peer_id, *dst_peer_id) as usize;
                 if peer_avoid_relay_data {
                     cost += AVOID_RELAY_COST;
