@@ -2,7 +2,6 @@ pub(crate) mod acl;
 pub(crate) mod admission;
 pub(crate) mod attached;
 pub(crate) mod conn;
-pub mod p2p_group;
 pub mod context;
 pub mod credential_manager;
 pub mod error;
