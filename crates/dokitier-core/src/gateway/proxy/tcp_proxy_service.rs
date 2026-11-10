@@ -452,6 +452,9 @@ impl<R: TcpProxyRuntime + 'static, F: VirtualTcpListenerFactory, C: TcpProxyDest
 
     async fn handle_peer_packet(self: Arc<Self>, mut packet: ZCPacket) -> Option<ZCPacket> {
         let snapshot = self.runtime.proxy_runtime_snapshot();
+        let exit_flagged = packet
+            .peer_manager_header()
+            .is_some_and(|header| header.is_exit_node());
         let action = self.engine.try_handle_peer_packet(
             self.mode,
             &mut packet,
@@ -464,6 +467,9 @@ impl<R: TcpProxyRuntime + 'static, F: VirtualTcpListenerFactory, C: TcpProxyDest
                 smoltcp_enabled: snapshot.smoltcp_enabled,
             },
         );
+        if exit_flagged && crate::peers::peer_manager::diag_sample() {
+            tracing::info!(?action, mode = ?self.mode, "exit tcp packet engine decision");
+        }
         match action {
             TcpProxyPacketAction::Handled { new_syn: _ } => {}
             TcpProxyPacketAction::Drop => return None,

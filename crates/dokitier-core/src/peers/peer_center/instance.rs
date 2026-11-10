@@ -110,7 +110,10 @@ impl PeerCenterBase {
                 });
                 loop {
                     let Some(center_peer) = Self::select_center_peer(&peer_mgr).await else {
-                        tracing::trace!("no center peer found, sleep 1 second");
+                        // Visible at info on purpose: a node stuck here loses
+                        // its peer-center map (all costs fall back to 500)
+                        // and this is the only hint it ever gets.
+                        tracing::info!("peer-center: no center peer found, sleep 1 second");
                         crate::foundation::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     };
@@ -120,7 +123,6 @@ impl PeerCenterBase {
                     };
 
                     ctx.center_peer.store(center_peer);
-                    tracing::trace!(?center_peer, "run periodic job");
                     let _g = lock.lock().await;
                     let stub = rpc_mgr
                         .rpc_client()
@@ -129,7 +131,27 @@ impl PeerCenterBase {
                             center_peer,
                             peer_mgr.network_name(),
                         );
-                    let ret = job_fn(stub, ctx.clone()).await;
+                    // Hard timeout around the whole job: the two periodic
+                    // jobs serialize on the shared lock, so ONE hung RPC
+                    // (lost response, dead center peer) used to deadlock the
+                    // other job forever — the node silently stopped
+                    // reporting and fetching its peer-center map.
+                    let ret = match tokio::time::timeout(
+                        Duration::from_secs(60),
+                        job_fn(stub, ctx.clone()),
+                    )
+                    .await
+                    {
+                        Ok(ret) => ret,
+                        Err(_) => {
+                            tracing::error!(
+                                ?center_peer,
+                                "peer-center periodic job timed out after 60s"
+                            );
+                            crate::foundation::time::sleep(Duration::from_secs(5)).await;
+                            continue;
+                        }
+                    };
                     drop(_g);
 
                     let Ok(sleep_time_ms) = ret else {
@@ -248,6 +270,13 @@ impl PeerCenterInstance {
 
         self.client
             .init_periodic_job(ctx, |client, ctx| async move {
+                if crate::peers::peer_manager::diag_sample() {
+                    tracing::info!(
+                        center_peer = ?ctx.center_peer.load(),
+                        map_entries = ctx.job_ctx.global_peer_map.read().unwrap().map.len(),
+                        "peer-center fetch tick"
+                    );
+                }
                 if ctx
                     .job_ctx
                     .global_peer_map_update_time
@@ -287,13 +316,8 @@ impl PeerCenterInstance {
                     resp.digest
                 );
 
-                eprintln!("BW_GLOBAL entries={}", resp.global_peer_map.len());
                 for (peer_id, info) in &resp.global_peer_map {
                     if info.bandwidth_up_mbps > 0.0 && info.bandwidth_down_mbps > 0.0 {
-                        eprintln!(
-                            "BW_GLOBAL peer={peer_id} up={} down={}",
-                            info.bandwidth_up_mbps, info.bandwidth_down_mbps
-                        );
                         crate::peers::link_policy::set_node_bandwidth_silent(
                             *peer_id,
                             info.bandwidth_up_mbps,
@@ -338,14 +362,16 @@ impl PeerCenterInstance {
         self.client
             .init_periodic_job(ctx, |client, ctx| async move {
                 let my_node_id = ctx.my_peer_id;
+                if crate::peers::peer_manager::diag_sample() {
+                    tracing::info!(
+                        center_peer = ?ctx.center_peer.load(),
+                        "peer-center report tick"
+                    );
+                }
                 let mut peers = ctx.job_ctx.peer_mgr.list_peers().await;
                 if let Some(bw) = crate::peers::link_policy::node_bandwidth(my_node_id) {
                     peers.bandwidth_up_mbps = bw.up_mbps;
                     peers.bandwidth_down_mbps = bw.down_mbps;
-                    eprintln!(
-                        "BW_REPORT my={my_node_id} up={} down={}",
-                        bw.up_mbps, bw.down_mbps
-                    );
                 }
                 let peer_list = peers.direct_peers.keys().copied().collect();
                 let job_ctx = &ctx.job_ctx;

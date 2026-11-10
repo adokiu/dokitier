@@ -24,16 +24,17 @@ use super::{
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub struct UdpNatKey {
+    /// FULL-CONE NAT: the mapping is keyed by the client endpoint ONLY. One
+    /// NAT entry (and one outbound socket) serves every destination the
+    /// client sends to, and replies from ANY remote on that socket are
+    /// mapped back to the client. The previous per-(src,dst) keying was
+    /// symmetric NAT, which broke UDP hole punching / P2P through exit nodes.
     pub src_socket: SocketAddr,
-    pub dst_socket: SocketAddr,
 }
 
 impl UdpNatKey {
-    pub fn new(src_socket: SocketAddr, dst_socket: SocketAddr) -> Self {
-        Self {
-            src_socket,
-            dst_socket,
-        }
+    pub fn new(src_socket: SocketAddr) -> Self {
+        Self { src_socket }
     }
 }
 
@@ -257,15 +258,23 @@ impl UdpProxyEngine {
             "udp nat packet request received"
         );
 
-        let nat_key = UdpNatKey::new(
-            SocketAddr::new(ipv4.src_addr().into(), udp_packet.src_port()),
-            SocketAddr::new(origin_dst_ip.into(), udp_packet.dst_port()),
-        );
+        let nat_key = UdpNatKey::new(SocketAddr::new(
+            ipv4.src_addr().into(),
+            udp_packet.src_port(),
+        ));
         let deny_dst = SocketAddr::new(real_dst_ip.into(), udp_packet.dst_port());
+        // FULL-CONE: the deny decision is per destination, evaluated on every
+        // packet — one client entry serves many destinations.
+        if runtime.should_deny_udp_proxy(deny_dst) {
+            tracing::debug!(
+                ?deny_dst,
+                "dst socket is in running listeners, ignore it"
+            );
+            return UdpProxyAction::Drop;
+        }
         let nat_entry = match self.nat_table.entry(nat_key) {
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
-                let denied = runtime.should_deny_udp_proxy(deny_dst);
                 let nat_entry = Arc::new(UdpNatEntry::new(
                     hdr.from_peer_id.get(),
                     hdr.to_peer_id.get(),
@@ -273,21 +282,13 @@ impl UdpProxyEngine {
                     real_dst_ip,
                     origin_dst_ip,
                     virtual_ipv4,
-                    denied,
+                    false,
                 ));
                 self.nat_ids.insert(nat_entry.id(), nat_key);
                 tracing::info!(?packet, ?ipv4, ?udp_packet, "udp nat table entry created");
                 entry.insert(nat_entry).clone()
             }
         };
-
-        if nat_entry.is_denied() {
-            tracing::debug!(
-                dst_port = udp_packet.dst_port(),
-                "dst socket is in running listeners, ignore it"
-            );
-            return UdpProxyAction::Drop;
-        }
 
         nat_entry.mark_active();
         UdpProxyAction::ForwardToSocket {

@@ -199,6 +199,16 @@ fn random_peer_id() -> PeerId {
     }
 }
 
+/// 1-in-64 sampler for rate-limited diagnostics on the packet paths. Exit-node
+/// routing failures are otherwise invisible: every drop site on the way is
+/// either silent or logs below the production log level.
+static DIAG_SAMPLE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn diag_sample() -> bool {
+    use std::sync::atomic::Ordering;
+    DIAG_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & 0x3F == 0
+}
+
 /// Peer id must stay stable for the lifetime of the process for a given
 /// instance: console config patches rebuild the peer manager, and re-rolling
 /// the id on every rebuild leaves the previous incarnation's route rows alive
@@ -2625,6 +2635,9 @@ impl PeerOutboundPacketRouter {
             |_| false,
             self.route.as_ref(),
         ) {
+            if diag_sample() {
+                tracing::warn!(payload_len = data.buf_len(), "nic packet dropped by acl");
+            }
             return false;
         }
 
@@ -2924,6 +2937,14 @@ impl PeerOutboundPacketRouter {
             return Ok(());
         }
 
+        if is_exit_node && diag_sample() {
+            tracing::info!(
+                dst = %ip_addr,
+                exit_peer = ?dst_peers,
+                "tun packet resolved to exit node"
+            );
+        }
+
         self.counters
             .compress_tx_bytes_before
             .add(msg.buf_len() as u64);
@@ -2954,6 +2975,9 @@ impl PeerOutboundPacketRouter {
                 self.mark_recent_traffic_with_policy(*peer_id, packet_policy);
             }
             if let Err(e) = self.check_p2p_only_before_send(*peer_id, packet_policy) {
+                if diag_sample() {
+                    tracing::warn!(?e, dst = %ip_addr, ?peer_id, "send skipped by p2p-only policy");
+                }
                 errs.push(e);
                 continue;
             }
@@ -3168,6 +3192,13 @@ impl PeerPacketRouter {
         let to_peer_id = hdr.to_peer_id.get();
         let packet_type = hdr.packet_type;
         let is_encrypted = hdr.is_encrypted();
+        let is_exit_packet = hdr.is_exit_node();
+        if is_exit_packet && to_peer_id == self.my_peer_id && diag_sample() {
+            tracing::info!(
+                from_peer_id,
+                "exit-flagged packet reached the local packet pipeline"
+            );
+        }
         if to_peer_id != self.my_peer_id {
             if drop_relay_data {
                 let ingress_connection = ingress.peer_connection();

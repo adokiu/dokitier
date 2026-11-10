@@ -199,14 +199,21 @@ impl<R: IcmpProxyRuntime + 'static> IcmpProxyService<R> {
 
     async fn handle_peer_packet(self: Arc<Self>, packet: ZCPacket) -> Option<ZCPacket> {
         let snapshot = self.runtime.proxy_runtime_snapshot();
-        match self.engine.handle_peer_packet(
+        let exit_flagged = packet
+            .peer_manager_header()
+            .is_some_and(|header| header.is_exit_node());
+        let action = self.engine.handle_peer_packet(
             &packet,
             IcmpProxyContext {
                 virtual_ipv4: snapshot.virtual_ipv4,
                 enable_exit_node: snapshot.enable_exit_node,
                 no_tun: snapshot.no_tun,
             },
-        ) {
+        );
+        if exit_flagged && crate::peers::peer_manager::diag_sample() {
+            tracing::info!(?action, "exit icmp packet engine decision");
+        }
+        match action {
             IcmpProxyAction::Pass => Some(packet),
             IcmpProxyAction::SendToSocket {
                 destination,
