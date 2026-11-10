@@ -56,8 +56,8 @@ use crate::{
         },
         peer_rpc::{
             ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey, OspfRouteRpc,
-            OspfRouteRpcClientFactory, OspfRouteRpcServer, PeerGroupInfo, PeerIdVersion,
-            BandwidthProbeRpcServer, PeerIdentityType, PublicIpv6AddrRpcServer,
+            OspfRouteRpcClientFactory, OspfRouteRpcServer, DirectConnMetric, PeerGroupInfo,
+            PeerIdVersion, BandwidthProbeRpcServer, PeerIdentityType, PublicIpv6AddrRpcServer,
             RouteForeignNetworkInfos,
             RouteForeignNetworkSummary, RoutePeerInfo, RoutePeerInfos, RouteInfoSummaryEntry,
             SyncRouteInfoError,
@@ -1243,6 +1243,28 @@ pub fn new_updated_self_route_peer_info(
         } else {
             Vec::new()
         },
+
+        // Decentralized link-metric flood: advertise OUR measured metrics for
+        // every direct link. Quantized by the publishers (ms / permille), so
+        // the content-diff version bump only fires on significant change.
+        direct_conn_metrics: crate::peers::link_policy::direct_conn_metrics()
+            .into_iter()
+            .map(|(peer, (latency_ms, loss_perm))| {
+                (
+                    peer,
+                    DirectConnMetric {
+                        latency_ms: latency_ms.max(0) as u32,
+                        loss_perm,
+                    },
+                )
+            })
+            .collect(),
+        bandwidth_up_mbps: crate::peers::link_policy::node_bandwidth(my_peer_id)
+            .map(|bw| bw.up_mbps)
+            .unwrap_or(0.0),
+        bandwidth_down_mbps: crate::peers::link_policy::node_bandwidth(my_peer_id)
+            .map(|bw| bw.down_mbps)
+            .unwrap_or(0.0),
 
         ..Default::default()
     }
@@ -5409,6 +5431,15 @@ impl Drop for PeerRoute {
 
 #[async_trait::async_trait]
 impl Route for PeerRoute {
+    fn get_peer_route_info(&self, peer_id: PeerId) -> Option<RoutePeerInfo> {
+        self.service_impl
+            .synced_route_info
+            .peer_infos
+            .read()
+            .unwrap()
+            .get(&peer_id)
+            .cloned()
+    }
     async fn open(&self, interface: RouteInterfaceBox) -> Result<u8, ()> {
         *self.service_impl.interface.lock().await = Some(interface);
         self.start().await;

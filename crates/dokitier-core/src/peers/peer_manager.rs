@@ -2020,6 +2020,16 @@ impl PeerCenterPeerManagerTrait for PeerManagerCore {
     async fn list_routes(&self) -> Vec<CoreRoute> {
         self.get_route().list_routes().await
     }
+
+    /// The flooded RoutePeerInfo advertised by `peer_id` (direct-link metrics
+    /// + node bandwidth). Sync: the cost calculators read it while building
+    /// route tables.
+    fn get_peer_route_info(
+        &self,
+        peer_id: PeerId,
+    ) -> Option<dokitier_proto::peer_rpc::RoutePeerInfo> {
+        self.get_route().get_peer_route_info(peer_id)
+    }
 }
 
 pub(crate) async fn close_peer_conn(

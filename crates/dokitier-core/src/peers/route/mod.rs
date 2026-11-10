@@ -128,6 +128,14 @@ pub trait Route {
     async fn list_conn_snapshots(&self) -> std::collections::HashMap<PeerId, Vec<PeerId>> {
         Default::default()
     }
+
+    /// The flooded RoutePeerInfo advertised by `peer_id` (contains its
+    /// direct-link metrics when the peer publishes them). Sync by design: the
+    /// cost calculators read it while building route tables. Returns None for
+    /// routes that do not flood peer infos.
+    fn get_peer_route_info(&self, _peer_id: PeerId) -> Option<RoutePeerInfo> {
+        None
+    }
     async fn get_next_hop_with_policy(
         &self,
         peer_id: PeerId,

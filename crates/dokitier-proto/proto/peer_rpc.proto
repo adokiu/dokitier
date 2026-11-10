@@ -19,6 +19,15 @@ message TrustedCredentialPubkeyProof {
   bytes credential_hmac = 2;
 }
 
+// Application-layer metrics of one DIRECT link, advertised by the node that
+// owns the link (latency measured on its own conn, loss = permille of the
+// recent ping window). Flooded inside RoutePeerInfo so every node can price
+// any link WITHOUT a peer-center aggregator.
+message DirectConnMetric {
+  uint32 latency_ms = 1;
+  uint32 loss_perm = 2;
+}
+
 message RoutePeerInfo {
   // means next hop in route table.
   uint32 peer_id = 1;
@@ -54,6 +63,13 @@ message RoutePeerInfo {
   // p2p group advertised by the origin peer; automatic direct / hole-punch
   // connections are only allowed inside the same group.
   string p2p_group = 25;
+
+  // Decentralized link-metric flood: the owner's measured metrics for each of
+  // its direct links. Version-bumps only on significant change (quantized),
+  // so the OSPF sync stays quiet.
+  map<uint32, DirectConnMetric> direct_conn_metrics = 26;
+  double bandwidth_up_mbps = 27;
+  double bandwidth_down_mbps = 28;
 }
 
 message PeerIdVersion {

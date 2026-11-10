@@ -333,3 +333,29 @@ a→b 与 b→a 走不同中继路径（上下行不对称）。
   带宽（对称）。纯依赖自动探测且未配置节点带宽时容量项仍可能轻微不对称（延迟
   项已对称，主代价不受影响）。
 - 平局（完全等代价路径）由 canonical_path_rank 统一裁决。
+
+## v8：去中心化链路指标泛洪（peer-center 退役前置，2026-11-10 21:20）
+
+### 背景
+Smart 模式代价的输入（直连链路延迟/丢包/带宽）依赖 peer-center 聚合点
+（min peer id 当聚合器，digest 增量拉取）。聚合点链路一卡或节点自身同步
+任务死锁（共享锁 + 无超时 RPC），单节点全盲、代价回退 500/跳。
+
+### 方案：指标随 OSPF LSA 泛洪（与路由同可靠性等级）
+1. **数据源**：conn 层 ping-pong 每轮把实测 (latency_ms, loss_perm) 推入
+   `link_policy::DIRECT_CONN_METRICS`（分片 map，60s TTL，非数据路径）。
+2. **泛洪**：`RoutePeerInfo` 新增 `direct_conn_metrics`（邻居→延迟/丢包，
+   ms/千分位量化）+ 节点带宽上下行。内容变化 → 自动版本递增 → 走现有
+   OSPF 可靠同步（ack 水位/摘要反熵/raw 字节透传——中继不解析也能转发，
+   旧版本节点字节级兼容）。量化保证延迟抖动不引发同步风暴。
+3. **消费**：`RouteCostCalculatorImpl::directed_info` 优先读本地路由表的
+   泛洪指标（内存读、零请求、零延迟），peer-center 降级为混合版本舰队
+   的回退源；节点带宽同理（泛洪值覆盖 peer-center 值）。
+4. **peer-center watchdog**（上轮）：report/fetch 任务 60s 硬超时 + tick
+   探针，共享锁死锁类别自愈。
+
+### 兼容性
+- proto 新字段：旧版本节点字节级透传（raw bytes 不解析），新节点解析；
+  旧节点自身不发布指标 → 其链路代价继续走 peer-center 回退。
+- peer-center 模块保留（带宽上报、混合版本回退），待全舰队 ≥本版本后
+  可评估退役。

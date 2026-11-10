@@ -38,6 +38,15 @@ pub trait PeerCenterPeerManagerTrait: Send + Sync + 'static {
     fn network_name(&self) -> String;
     fn get_rpc_mgr(&self) -> Weak<PeerRpcManager>;
     async fn list_routes(&self) -> Vec<CoreRoute>;
+
+    /// The flooded RoutePeerInfo advertised by `peer_id` (its direct-link
+    /// metrics and node bandwidth). Sync: read on the route-build path.
+    fn get_peer_route_info(
+        &self,
+        _peer_id: PeerId,
+    ) -> Option<dokitier_proto::peer_rpc::RoutePeerInfo> {
+        None
+    }
 }
 
 struct PeerCenterBase {
@@ -419,6 +428,8 @@ impl PeerCenterInstance {
 
     pub fn get_cost_calculator(&self) -> RouteCostCalculator {
         struct RouteCostCalculatorImpl {
+            peer_mgr: Arc<dyn PeerCenterPeerManagerTrait>,
+
             global_peer_map: Arc<RwLock<GlobalPeerMap>>,
 
             global_peer_map_clone: GlobalPeerMap,
@@ -430,12 +441,30 @@ impl PeerCenterInstance {
         }
 
         impl RouteCostCalculatorImpl {
+            /// Decentralized link metrics first: the flooded RoutePeerInfo
+            /// carried by the OSPF sync (peer-center only as fallback for
+            /// mixed-version fleets). The flooded data lives in this node's
+            /// route table — zero network requests, zero added latency.
+            fn direct_conn_metric(
+                &self,
+                owner: PeerId,
+                neighbor: PeerId,
+            ) -> Option<(i32, f32)> {
+                let info = self.peer_mgr.get_peer_route_info(owner)?;
+                let metric = info.direct_conn_metrics.get(&neighbor)?;
+                Some((metric.latency_ms as i32, metric.loss_perm as f32 / 1000.0))
+            }
+
             fn directed_info(&self, src: PeerId, dst: PeerId) -> Option<(i32, f32)> {
-                self.global_peer_map_clone
-                    .map
-                    .get(&src)
-                    .and_then(|src_peer_info| src_peer_info.direct_peers.get(&dst))
-                    .map(|info| (info.latency_ms, info.loss_rate))
+                self.direct_conn_metric(src, dst)
+                    .or_else(|| self.direct_conn_metric(dst, src))
+                    .or_else(|| {
+                        self.global_peer_map_clone
+                            .map
+                            .get(&src)
+                            .and_then(|src_peer_info| src_peer_info.direct_peers.get(&dst))
+                            .map(|info| (info.latency_ms, info.loss_rate))
+                    })
             }
         }
 
@@ -485,17 +514,37 @@ impl PeerCenterInstance {
             }
 
             fn begin_update(&mut self) {
-                let global_peer_map = self.global_peer_map.read().unwrap();
-                for (peer_id, info) in &global_peer_map.map {
-                    if info.bandwidth_up_mbps > 0.0 && info.bandwidth_down_mbps > 0.0 {
+                let peer_ids: Vec<PeerId>;
+                let snapshot;
+                {
+                    let global_peer_map = self.global_peer_map.read().unwrap();
+                    for (peer_id, info) in &global_peer_map.map {
+                        if info.bandwidth_up_mbps > 0.0 && info.bandwidth_down_mbps > 0.0 {
+                            crate::peers::link_policy::set_node_bandwidth_silent(
+                                *peer_id,
+                                info.bandwidth_up_mbps,
+                                info.bandwidth_down_mbps,
+                            );
+                        }
+                    }
+                    peer_ids = global_peer_map.map.keys().copied().collect();
+                    snapshot = global_peer_map.clone();
+                }
+                // Flooded node bandwidth wins: it arrives with the OSPF sync
+                // and does not depend on the peer-center aggregator.
+                for peer_id in peer_ids {
+                    if let Some(info) = self.peer_mgr.get_peer_route_info(peer_id)
+                        && info.bandwidth_up_mbps > 0.0
+                        && info.bandwidth_down_mbps > 0.0
+                    {
                         crate::peers::link_policy::set_node_bandwidth_silent(
-                            *peer_id,
+                            peer_id,
                             info.bandwidth_up_mbps,
                             info.bandwidth_down_mbps,
                         );
                     }
                 }
-                self.global_peer_map_clone = global_peer_map.clone();
+                self.global_peer_map_clone = snapshot;
                 self.last_policy_generation.store(
                     crate::peers::link_policy::generation(),
                     std::sync::atomic::Ordering::Relaxed,
@@ -515,6 +564,7 @@ impl PeerCenterInstance {
         }
 
         Box::new(RouteCostCalculatorImpl {
+            peer_mgr: self.peer_mgr.clone(),
             global_peer_map: self.global_peer_map.clone(),
             global_peer_map_clone: GlobalPeerMap::default(),
             last_update_time: AtomicCell::new(

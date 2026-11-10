@@ -120,6 +120,43 @@ fn peer_metrics_map() -> &'static RwLock<HashMap<PeerId, PeerMetrics>> {
     PEER_METRICS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+// ---------------------------------------------------------------------------
+// Direct-link metrics published by the conn layer and flooded via RoutePeerInfo
+// (decentralized peer-center replacement for cost inputs).
+// ---------------------------------------------------------------------------
+
+const DIRECT_CONN_METRICS_TTL_MS: u64 = 60_000;
+
+static DIRECT_CONN_METRICS: OnceLock<DashMap<PeerId, (i32, u32, u64)>> = OnceLock::new();
+
+fn direct_conn_metrics_map() -> &'static DashMap<PeerId, (i32, u32, u64)> {
+    DIRECT_CONN_METRICS.get_or_init(DashMap::new)
+}
+
+/// Conn layer: publish the measured (latency_ms, loss_perm) of a DIRECT link.
+/// Cheap: one sharded-map write per ping interval (~seconds), never on the
+/// data path.
+pub fn set_conn_metric(peer: PeerId, latency_ms: i32, loss_perm: u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    direct_conn_metrics_map().insert(peer, (latency_ms, loss_perm, now));
+}
+
+/// Snapshot of fresh (<=60s) direct-link metrics keyed by the neighbor peer.
+pub fn direct_conn_metrics() -> std::collections::BTreeMap<PeerId, (i32, u32)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    direct_conn_metrics_map()
+        .iter()
+        .filter(|(_, (_, _, ts))| now.saturating_sub(*ts) <= DIRECT_CONN_METRICS_TTL_MS)
+        .map(|(peer, (latency, loss, _))| (*peer, (*latency, *loss)))
+        .collect()
+}
+
 /// Publish measured transport metrics for a peer. Bumps the policy generation
 /// only when the change is significant, to avoid re-running OSPF every second.
 pub fn set_peer_metrics(peer: PeerId, metrics: PeerMetrics) {
