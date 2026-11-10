@@ -152,8 +152,14 @@ pub fn direct_conn_metrics() -> std::collections::BTreeMap<PeerId, (i32, u32)> {
         .unwrap_or(0);
     direct_conn_metrics_map()
         .iter()
-        .filter(|(_, (_, _, ts))| now.saturating_sub(*ts) <= DIRECT_CONN_METRICS_TTL_MS)
-        .map(|(peer, (latency, loss, _))| (*peer, (*latency, *loss)))
+        .filter(|entry| {
+            let (_, _, ts) = *entry.value();
+            now.saturating_sub(ts) <= DIRECT_CONN_METRICS_TTL_MS
+        })
+        .map(|entry| {
+            let (latency, loss, _) = *entry.value();
+            (*entry.key(), (latency, loss))
+        })
         .collect()
 }
 

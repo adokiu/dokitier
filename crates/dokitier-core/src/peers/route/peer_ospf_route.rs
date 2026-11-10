@@ -1175,6 +1175,9 @@ fn new_route_peer_info_with_version(easytier_version: String) -> RoutePeerInfo {
         ipv6_public_addr_prefix: None,
         ipv6_public_addr_lease: None,
         p2p_group: String::new(),
+        direct_conn_metrics: Default::default(),
+        bandwidth_up_mbps: 0.0,
+        bandwidth_down_mbps: 0.0,
     }
 }
 
@@ -5436,7 +5439,6 @@ impl Route for PeerRoute {
             .synced_route_info
             .peer_infos
             .read()
-            .unwrap()
             .get(&peer_id)
             .cloned()
     }

@@ -330,9 +330,9 @@ impl PeerConnPinger {
 
             // Publish the measured direct-link metrics for the decentralized
             // RoutePeerInfo flood (peer-center replacement for cost inputs).
-            let latency_ms = self.latency_stats.get_latency_us() / 1000;
+            let latency_ms: i32 = (self.latency_stats.get_latency_us() as i64 / 1000) as i32;
             let loss_perm = (loss_rate_1 * 1000.0).clamp(0.0, 1000.0) as u32;
-            crate::peers::link_policy::set_conn_metric(self.peer_id, latency_ms as i32, loss_perm);
+            crate::peers::link_policy::set_conn_metric(self.peer_id, latency_ms, loss_perm);
 
             tracing::trace!(
                 ?ret,
