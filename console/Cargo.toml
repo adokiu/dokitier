@@ -1,7 +1,7 @@
 [package]
 name = "dokitier-console"
 description = "dokitier standalone board: multi-node reverse-connected console."
-version = "2.7.11"
+version = "2.7.12"
 edition.workspace = true
 rust-version.workspace = true
 license-file = "../LICENSE"
@@ -21,7 +21,7 @@ serde_json.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 libc = "0.2"
-dokitier-controller = { version = "2.7.11", path = "../controller" }
+dokitier-controller = { version = "2.7.12", path = "../controller" }
 reqwest = { workspace = true, features = ["rustls", "json"] }
 futures = { workspace = true, features = ["std"] }
 sqlx = { workspace = true, features = ["runtime-tokio", "any", "sqlite", "postgres", "mysql", "tls-rustls"] }
