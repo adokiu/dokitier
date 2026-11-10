@@ -2947,10 +2947,11 @@ impl PeerOutboundPacketRouter {
 
         if dst_peers.is_empty() {
             if diag_sample() {
+                let runtime_exit_nodes = self.exit_nodes.read().await.clone();
                 tracing::info!(
                     target: "CORE",
                     dst = %ip_addr,
-                    runtime_exit_nodes = ?self.exit_nodes.read().await.clone(),
+                    ?runtime_exit_nodes,
                     "tun packet unroutable: no peer id for ip"
                 );
             }
