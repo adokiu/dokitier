@@ -579,7 +579,75 @@ async fn verify_node(db: &AnyPool, node_id: &str, token: &str) -> bool {
 /// Merge one agent snapshot into the in-memory runtime registry. This is the
 /// only place realtime values are produced; nothing here touches SQL.
 fn apply_snapshot_to_rt(state: &AppState, node_id: &str, data: &Value) {
+    apply_snapshot_to_rt_inner(state, node_id, data, true)
+}
+
+/// Per-second metrics frame: same rate/latency accounting as a snapshot, but
+/// the static topology stored in `rt.snapshot` must be preserved.
+fn apply_metrics_to_rt(state: &AppState, node_id: &str, data: &Value) {
+    apply_snapshot_to_rt_inner(state, node_id, data, false)
+}
+
+/// Expand the compact metrics wire format into the snapshot edge shape:
+/// edge = [a, b, [[latency_ms, loss_pct, rx_bytes, tx_bytes], ...]].
+fn expand_metrics(data: &Value) -> Value {
+    let mut out = data.clone();
+    let Some(instances) = out.get_mut("instances").and_then(|v| v.as_array_mut()) else {
+        return out;
+    };
+    for inst in instances.iter_mut() {
+        let Some(edges) = inst.get_mut("edges").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        let topology_edges: Vec<Value> = edges
+            .iter()
+            .filter_map(|edge| {
+                let arr = edge.as_array()?;
+                let a = *arr.first()?;
+                let b = *arr.get(1)?;
+                let tunnels = arr.get(2).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let tunnels: Vec<Value> = tunnels
+                    .iter()
+                    .filter_map(|t| {
+                        let t = t.as_array()?;
+                        Some(json!({
+                            "latency_ms": t.first().cloned().unwrap_or(Value::Null),
+                            "loss_pct": t.get(1).cloned().unwrap_or(Value::Null),
+                            "rx_bytes": t.get(2).cloned().unwrap_or(json!(0)),
+                            "tx_bytes": t.get(3).cloned().unwrap_or(json!(0)),
+                        }))
+                    })
+                    .collect();
+                Some(json!({"a": a, "b": b, "tunnels": tunnels}))
+            })
+            .collect();
+        inst["topology"] = json!({"edges": topology_edges});
+    }
+    out
+}
+
+fn apply_snapshot_to_rt_inner(state: &AppState, node_id: &str, data: &Value, replace_snapshot: bool) {
     let now_ts = now();
+    // UUIDs may be missing from metrics frames; fall back to the last static
+    // snapshot so dashboard link history keeps the same (uuid, uuid) key.
+    let fallback_uuid: std::collections::HashMap<i64, String> = state
+        .node_rt
+        .get(node_id)
+        .and_then(|rt| rt.snapshot.get("instances").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .map(|instances| {
+            let mut map = std::collections::HashMap::new();
+            for inst in instances {
+                for n in inst.pointer("/topology/nodes").and_then(|v| v.as_array()).into_iter().flatten() {
+                    let id = n.get("peer_id").and_then(|v| v.as_u64()).unwrap_or_default() as i64;
+                    if let Some(uuid) = n.get("instance_id").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+                        map.insert(id, uuid.to_string());
+                    }
+                }
+            }
+            map
+        })
+        .unwrap_or_default();
     let mut rx_total = 0u64;
     let mut tx_total = 0u64;
     let mut by_network: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
@@ -618,7 +686,10 @@ fn apply_snapshot_to_rt(state: &AppState, node_id: &str, data: &Value) {
                 let (a_uuid, b_uuid) = match (peer_uuid.get(&a), peer_uuid.get(&b)) {
                     (Some(ua), Some(ub)) if ua <= ub => (Some(ua.clone()), Some(ub.clone())),
                     (Some(ua), Some(ub)) => (Some(ub.clone()), Some(ua.clone())),
-                    _ => (peer_uuid.get(&a).cloned(), peer_uuid.get(&b).cloned()),
+                    _ => (
+                        peer_uuid.get(&a).cloned().or_else(|| fallback_uuid.get(&a).cloned()),
+                        peer_uuid.get(&b).cloned().or_else(|| fallback_uuid.get(&b).cloned()),
+                    ),
                 };
                 pending.push((network.to_string(), a, b, a_uuid, b_uuid, now_ts, latency, loss));
             }
@@ -637,12 +708,22 @@ fn apply_snapshot_to_rt(state: &AppState, node_id: &str, data: &Value) {
     rt.ts = now_ts;
     rt.last_seen = now_ts;
     rt.online = true;
-    rt.hostname = data.pointer("/instances/0/hostname").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    rt.version = data.pointer("/instances/0/version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if let Some(hostname) = data.pointer("/instances/0/hostname").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+        rt.hostname = hostname.to_string();
+    }
+    if let Some(version) = data.pointer("/instances/0/version").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+        rt.version = version.to_string();
+    }
     if !nets.is_empty() {
         rt.networks = Value::Array(nets);
     }
-    rt.snapshot = merged;
+    if replace_snapshot {
+        rt.snapshot = merged;
+    } else if rt.snapshot.is_object() {
+        // Metrics keep the static snapshot untouched; only refresh its
+        // timestamp so persisted rows do not look stale.
+        rt.snapshot["ts"] = json!(now_ts);
+    }
     if let Some(sys) = data.get("system").filter(|v| !v.is_null()) {
         rt.system = sys.clone();
         if let Some(listener) = sys.get("shared_listener").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
@@ -2428,6 +2509,11 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
             }
             Ok(())
         }
+        AgentFrame::Metrics { node_id, data } => {
+            let expanded = expand_metrics(&data);
+            apply_metrics_to_rt(state, &node_id, &expanded);
+            Ok(())
+        }
         AgentFrame::Result { node_id, .. } => {
             if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
                 rt.online = true;
@@ -3746,7 +3832,7 @@ async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
     let res = sqlx::query(&q("UPDATE nodes SET last_seen = ?, status = ?, \
             hostname = COALESCE(NULLIF(?, ''), hostname), \
             version = COALESCE(NULLIF(?, ''), version), \
-            networks = COALESCE(?, networks), snapshot = ?, \
+            networks = COALESCE(?, networks), snapshot = COALESCE(?, snapshot), \
             system_info = COALESCE(?, system_info), \
             public_ipv4 = COALESCE(?, public_ipv4), public_ipv6 = COALESCE(?, public_ipv6), \
             cpu_pct = ?, mem_pct = ?, mem_used = ?, mem_total = ?, \
@@ -3756,7 +3842,7 @@ async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
         .bind(rt.hostname.clone())
         .bind(rt.version.clone())
         .bind(if rt.networks.is_null() { None } else { Some(rt.networks.to_string()) })
-        .bind(rt.snapshot.to_string())
+        .bind(if rt.snapshot.is_null() { None } else { Some(rt.snapshot.to_string()) })
         .bind(if rt.system.is_null() { None } else { Some(rt.system.to_string()) })
         .bind(rt.public_ipv4.clone())
         .bind(rt.public_ipv6.clone())

@@ -542,6 +542,95 @@ async fn snapshot(manager: &NativeInstanceManager, public_ipv4: Option<&str>, pu
     })
 }
 
+/// Cheap fingerprint of everything that lives in the static snapshot: the
+/// instance set and the peers/routes this process knows. When it changes (a
+/// network is applied/deleted, a peer joins or leaves) the full topology is
+/// re-sent once; in steady state only the metrics frame goes out.
+async fn static_signature(manager: &NativeInstanceManager) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for instance in manager.instances() {
+        instance.instance_id().to_string().hash(&mut hasher);
+        instance.peer_manager().network_identity().network_name.hash(&mut hasher);
+        let mut peers: Vec<u32> = instance
+            .peer_snapshots()
+            .await
+            .iter()
+            .map(|peer| peer.peer_id)
+            .collect();
+        peers.sort_unstable();
+        peers.hash(&mut hasher);
+        let mut routes: Vec<u32> = instance
+            .route_snapshots()
+            .await
+            .iter()
+            .map(|route| route.peer_id)
+            .collect();
+        routes.sort_unstable();
+        routes.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Compact per-second report. Only numbers: edge counters/quality plus host
+/// load. Static topology (nodes, addresses, versions, tunnel types) is sent
+/// once per console connection by `snapshot`, not every tick — re-sending it
+/// per node per second made the fleet upload O(n^2) and far heavier than
+/// comparable agents.
+async fn metrics(
+    manager: &NativeInstanceManager,
+    public_ipv4: Option<&str>,
+    public_ipv6: Option<&str>,
+) -> Value {
+    let mut instances = Vec::new();
+    for instance in manager.instances() {
+        let identity = instance.peer_manager().network_identity();
+        let me = instance.peer_id();
+        let mut edges = Vec::new();
+        for peer in instance.peer_snapshots().await {
+            if peer.conns.is_empty() {
+                continue;
+            }
+            let tunnels: Vec<Value> = peer
+                .conns
+                .iter()
+                .map(|conn| {
+                    let stats = conn.stats.clone().unwrap_or_default();
+                    json!([
+                        (stats.latency_us > 0).then(|| stats.latency_us as f64 / 1000.0),
+                        conn.loss_rate as f64 * 100.0,
+                        stats.rx_bytes,
+                        stats.tx_bytes,
+                    ])
+                })
+                .collect();
+            edges.push(json!([me, peer.peer_id, tunnels]));
+        }
+        instances.push(json!({
+            "peer_id": me,
+            "network_name": identity.network_name,
+            "edges": edges,
+        }));
+    }
+    let (cpu_raw, mem_used, mem_total) = system_stats();
+    let cpu_pct = if cpu_raw.is_finite() { cpu_raw.clamp(0.0, 100.0) } else { 0.0 };
+    let mem_pct = if mem_total > 0 {
+        (mem_used as f64 * 100.0 / mem_total as f64).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    json!({
+        "ts": chrono::Utc::now().timestamp(),
+        "public_ipv4": public_ipv4,
+        "public_ipv6": public_ipv6,
+        "cpu_pct": cpu_pct,
+        "mem_used": mem_used,
+        "mem_total": mem_total,
+        "mem_pct": mem_pct,
+        "instances": instances,
+    })
+}
+
 async fn handle_command(
     manager: &std::sync::Arc<NativeInstanceManager>,
     config_path: Option<&std::path::Path>,
@@ -1149,6 +1238,18 @@ async fn session(
     let cipher = SessionCipher::new(&settings.token, &nonce, ts);
     tracing::info!(endpoint = %settings.url, node_id = %settings.node_id, "controller agent connected");
 
+    // Static topology: nodes, names, addresses, versions, tunnel types and
+    // route costs are reported once per console session. Anything that changes
+    // only across restarts or reconnects lives here, not in the per-second
+    // metrics frame.
+    let initial = serde_json::json!({
+        "type": "snapshot",
+        "node_id": settings.node_id,
+        "data": snapshot(manager, public_ipv4.as_deref(), public_ipv6.as_deref()).await,
+    });
+    transport.send(&cipher.encrypt(&initial)).await?;
+    let mut last_static_sig = static_signature(manager).await;
+
     let interval = Duration::from_secs(settings.interval_secs.max(1));
     let heartbeat_every = Duration::from_secs(settings.heartbeat_secs.max(5));
     let mut last_heartbeat = tokio::time::Instant::now();
@@ -1187,11 +1288,21 @@ async fn session(
             transport.send(&heartbeat).await?;
             last_heartbeat = tokio::time::Instant::now();
         }
-        let snap = serde_json::json!({
-            "type": "snapshot",
+        let sig = static_signature(manager).await;
+        if sig != last_static_sig {
+            let snapshot_frame = serde_json::json!({
+                "type": "snapshot",
+                "node_id": settings.node_id,
+                "data": snapshot(manager, public_ipv4.as_deref(), public_ipv6.as_deref()).await,
+            });
+            transport.send(&cipher.encrypt(&snapshot_frame)).await?;
+            last_static_sig = sig;
+        }
+        let frame = serde_json::json!({
+            "type": "metrics",
             "node_id": settings.node_id,
-            "data": snapshot(manager, public_ipv4.as_deref(), public_ipv6.as_deref()).await,
+            "data": metrics(manager, public_ipv4.as_deref(), public_ipv6.as_deref()).await,
         });
-        transport.send(&cipher.encrypt(&snap)).await?;
+        transport.send(&cipher.encrypt(&frame)).await?;
     }
 }

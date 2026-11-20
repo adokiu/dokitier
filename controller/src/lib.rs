@@ -71,6 +71,13 @@ pub enum AgentFrame {
         node_id: String,
         data: serde_json::Value,
     },
+    /// Per-second, compact metrics frame: only edge counters/quality and host
+    /// load. The full topology is sent once per console connection as a
+    /// `Snapshot`, so this frame carries no names/addresses/versions.
+    Metrics {
+        node_id: String,
+        data: serde_json::Value,
+    },
     Result {
         node_id: String,
         request_id: String,
