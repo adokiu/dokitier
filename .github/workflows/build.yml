@@ -46,16 +46,6 @@ jobs:
             target: i686-unknown-linux-musl
             asset: dokitier-core-x86
             zig: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-musl
-            asset: dokitier-core-mips
-            zig: true
-            allow_failure: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-musl
-            asset: dokitier-core-mipsel
-            zig: true
-            allow_failure: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: dokitier-core-windows-amd64.exe
@@ -99,10 +89,9 @@ jobs:
           pip install ziglang
           cargo install cargo-zigbuild --locked
 
-      - name: Build (full default features)
+      - name: Build (full default features, unix)
+        if: runner.os != 'Windows'
         shell: bash
-        env:
-          LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
         run: |
           set -e
           if [ "${{ matrix.zig }}" = "true" ]; then
@@ -112,11 +101,19 @@ jobs:
             cargo build --profile tiny -p dokitier --bin dokitier-core \
               --target ${{ matrix.target }}
           fi
-          ext=""
-          case "${{ matrix.target }}" in
-            *windows-msvc) ext=".exe" ;;
-          esac
-          cp "target/${{ matrix.target }}/tiny/dokitier-core${ext}" "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/tiny/dokitier-core" "${{ matrix.asset }}"
+          ls -l "${{ matrix.asset }}"
+
+      - name: Build (full default features, windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: |
+          set -e
+          cargo build --profile tiny -p dokitier --bin dokitier-core \
+            --target ${{ matrix.target }}
+          cp "target/${{ matrix.target }}/tiny/dokitier-core.exe" "${{ matrix.asset }}"
           ls -l "${{ matrix.asset }}"
 
       - name: Compress armv7 with UPX (OpenWrt flash budget)
