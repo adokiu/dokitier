@@ -603,8 +603,8 @@ fn expand_metrics(data: &Value) -> Value {
             .iter()
             .filter_map(|edge| {
                 let arr = edge.as_array()?;
-                let a = *arr.first()?;
-                let b = *arr.get(1)?;
+                let a = arr.first()?.clone();
+                let b = arr.get(1)?.clone();
                 let tunnels = arr.get(2).and_then(|v| v.as_array()).cloned().unwrap_or_default();
                 let tunnels: Vec<Value> = tunnels
                     .iter()
