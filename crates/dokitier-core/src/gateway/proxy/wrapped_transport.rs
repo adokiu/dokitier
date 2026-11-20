@@ -758,6 +758,7 @@ mod tests {
                         ..Default::default()
                     },
                     network_identity: NetworkIdentity {
+                        p2p_group: None,
                         network_name: "wrapped-transport-test".to_owned(),
                         network_secret: Some("secret".to_owned()),
                         network_secret_digest: None,

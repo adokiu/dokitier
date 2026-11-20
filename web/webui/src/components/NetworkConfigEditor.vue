@@ -163,6 +163,9 @@
         <ConfigField label="MTU" hint="TUN 设备的 MTU，默认非加密 1380、加密 1360。">
           <v-text-field v-model.number="form.flags.mtu" type="number" density="compact" variant="outlined" hide-details placeholder="1380" />
         </ConfigField>
+        <ConfigField label="数据包 TTL" hint="数据包每经过一个转发节点消耗 1 跳，耗尽即丢弃，用于防止路由环路；默认 16，范围 1-255。">
+          <v-text-field v-model.number="form.flags.packet_ttl" type="number" density="compact" variant="outlined" hide-details placeholder="16" />
+        </ConfigField>
         <ConfigField label="实例接收限速" hint="限制当前网络实例整体入站流量的总接收速率，默认无限制，单位 BPS（字节/秒）。">
           <v-text-field v-model.number="form.flags.instance_recv_bps_limit" type="number" density="compact" variant="outlined" hide-details placeholder="留空不限速" />
         </ConfigField>
@@ -346,6 +349,7 @@ const emptyForm = () => ({
   flags: {
     dev_name: '',
     mtu: '',
+    packet_ttl: '',
     instance_recv_bps_limit: '',
     relay_network_whitelist: '',
     latency_first: false,
@@ -557,10 +561,17 @@ function buildToml(f) {
 
   const flags = f.flags
   lines.push('', '[flags]')
+  // Numeric flags must be emitted as TOML integers, even when the value came
+  // back from parseToml() as a string (otherwise "64" is written quoted and the
+  // core rejects the config).
+  const numericFlagKeys = new Set(['mtu', 'instance_recv_bps_limit', 'packet_ttl'])
   for (const [key, value] of Object.entries(flags)) {
     if (value === '' || value == null) continue
     if (typeof value === 'boolean') lines.push(`${key} = ${value}`)
-    else if (typeof value === 'number') lines.push(`${key} = ${value}`)
+    else if (numericFlagKeys.has(key)) {
+      const numeric = Number(value)
+      if (Number.isFinite(numeric) && numeric > 0) lines.push(`${key} = ${numeric}`)
+    } else if (typeof value === 'number') lines.push(`${key} = ${value}`)
     else lines.push(`${key} = ${str(value)}`)
   }
   return lines.join('\n')
@@ -650,6 +661,7 @@ const errors = computed(() => {
   const mtu = Number(form.value.flags.mtu)
   if (form.value.flags.mtu !== '' && (!Number.isInteger(mtu) || mtu < 576 || mtu > 65535)) push(`MTU 无效：${form.value.flags.mtu}`)
   if (form.value.flags.instance_recv_bps_limit !== '' && Number(form.value.flags.instance_recv_bps_limit) <= 0) push('接收限速必须大于 0')
+  if (form.value.flags.packet_ttl !== '' && (!Number.isInteger(Number(form.value.flags.packet_ttl)) || Number(form.value.flags.packet_ttl) < 1 || Number(form.value.flags.packet_ttl) > 255)) push('数据包 TTL 必须是 1-255 的整数')
   if (form.value.node_bandwidth_mbps !== '' && !(Number(form.value.node_bandwidth_mbps) > 0)) push('节点带宽必须大于 0')
   for (const chain of form.value.acl_chains) {
     if (!chain.name.trim()) push('ACL 链名不能为空')

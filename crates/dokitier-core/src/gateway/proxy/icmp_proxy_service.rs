@@ -210,8 +210,16 @@ impl<R: IcmpProxyRuntime + 'static> IcmpProxyService<R> {
                 no_tun: snapshot.no_tun,
             },
         );
-        if exit_flagged && crate::peers::peer_manager::diag_sample() {
-            tracing::info!(target: "CORE", ?action, "exit icmp packet engine decision");
+        if crate::peers::peer_manager::diag_sample() {
+            // Record every inbound ICMP engine decision (not just exit-flagged
+            // ones): an overlay-IP echo consumed here never reaches the TUN and
+            // the ping silently dies, which used to be invisible.
+            tracing::info!(
+                target: "CORE",
+                exit_flagged,
+                ?action,
+                "icmp peer packet engine decision"
+            );
         }
         match action {
             IcmpProxyAction::Pass => Some(packet),

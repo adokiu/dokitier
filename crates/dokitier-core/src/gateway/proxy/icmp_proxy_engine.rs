@@ -90,6 +90,15 @@ impl IcmpProxyEngine {
         }
 
         let mapped_destination = ipv4.dst_addr();
+        // An echo addressed to this node's OWN virtual IP belongs to the local
+        // kernel: it must be delivered to the TUN so the kernel answers it.
+        // Letting it fall into the proxy path (exit flag set, or a proxy CIDR
+        // that happens to cover the overlay) consumed the request and made
+        // overlay-to-overlay pings disappear silently while TCP to the same
+        // address still worked.
+        if !context.no_tun && mapped_destination == virtual_ipv4 {
+            return IcmpProxyAction::Pass;
+        }
         let real_destination = self.cidr_table.lookup_v4(mapped_destination);
         let is_local_no_tun = context.no_tun && mapped_destination == virtual_ipv4;
         if real_destination.is_none() && !header.is_exit_node() && !is_local_no_tun {
@@ -415,6 +424,32 @@ mod tests {
         let ipv4 = Ipv4Packet::new_checked(reply.payload()).unwrap();
         assert_eq!(ipv4.src_addr(), "10.10.10.42".parse::<Ipv4Addr>().unwrap());
         assert_eq!(ipv4.dst_addr(), "10.0.0.2".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn echo_to_own_virtual_ip_always_passes_to_tun() {
+        // A proxy CIDR that covers the overlay subnet plus the exit flag used
+        // to route an overlay-to-overlay ping into the proxy path, where it was
+        // consumed instead of being delivered to the kernel. The local echo
+        // must pass through so the kernel can answer it.
+        let engine = engine(Some(ProxyCidrRule {
+            cidr: "10.0.0.0/8".parse().unwrap(),
+            mapped_cidr: None,
+        }));
+        let mut packet = echo_request("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        packet.mut_peer_manager_header().unwrap().set_exit_node(true);
+
+        assert!(matches!(
+            engine.handle_peer_packet(
+                &packet,
+                IcmpProxyContext {
+                    virtual_ipv4: Some("10.0.0.1".parse().unwrap()),
+                    enable_exit_node: true,
+                    ..Default::default()
+                }
+            ),
+            IcmpProxyAction::Pass
+        ));
     }
 
     #[test]

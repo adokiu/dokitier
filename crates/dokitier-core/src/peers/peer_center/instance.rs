@@ -456,13 +456,21 @@ impl PeerCenterInstance {
             }
 
             fn directed_info(&self, src: PeerId, dst: PeerId) -> Option<(i32, f32)> {
-                self.direct_conn_metric(src, dst)
-                    .or_else(|| self.direct_conn_metric(dst, src))
+                // Deterministic, node-independent resolution: both endpoints
+                // flood their own reading of this link, and a node only falls
+                // back to the other side when it has not received one of them
+                // yet. Resolving a fixed side first (lower peer id) keeps every
+                // node's edge weight identical, which is required for their
+                // SPF trees to agree. Without it each node can land on a
+                // different side's latency and next hops diverge into loops.
+                let (first, second) = if src <= dst { (src, dst) } else { (dst, src) };
+                self.direct_conn_metric(first, second)
+                    .or_else(|| self.direct_conn_metric(second, first))
                     .or_else(|| {
                         self.global_peer_map_clone
                             .map
-                            .get(&src)
-                            .and_then(|src_peer_info| src_peer_info.direct_peers.get(&dst))
+                            .get(&first)
+                            .and_then(|first_peer_info| first_peer_info.direct_peers.get(&second))
                             .map(|info| (info.latency_ms, info.loss_rate))
                     })
             }

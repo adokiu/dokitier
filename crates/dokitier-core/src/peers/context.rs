@@ -554,6 +554,16 @@ pub(crate) trait PeerContext: Send + Sync {
         Flags::default()
     }
 
+    /// Per-packet TTL budget in hops for data packets. The configuration value
+    /// 0 means "use the default". Every forwarding node decrements the budget
+    /// and drops the packet at zero, so routing loops cannot circle forever.
+    fn packet_ttl(&self) -> u8 {
+        match self.flags().packet_ttl {
+            0 => crate::peers::peer_manager::DEFAULT_PACKET_TTL,
+            ttl => ttl.min(u8::MAX as u32) as u8,
+        }
+    }
+
     fn packet_policy(&self) -> PeerPacketPolicy {
         PeerPacketPolicy::from_flags(&self.flags())
     }
@@ -1435,6 +1445,7 @@ pub(crate) mod tests {
     #[test]
     fn noop_peer_context_uses_runtime_secret_proof_prefix() {
         let context = NoopPeerContext::new(NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: Some("secret".to_string()),
             network_secret_digest: None,
@@ -1462,6 +1473,7 @@ pub(crate) mod tests {
     impl PeerContext for RuntimeConfigContext {
         fn network_identity(&self) -> NetworkIdentity {
             NetworkIdentity {
+                p2p_group: None,
                 network_name: "net".to_string(),
                 network_secret: Some("secret".to_string()),
                 network_secret_digest: None,
@@ -1537,6 +1549,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
             network_identity: NetworkIdentity {
+                p2p_group: None,
                 network_name: "config-net".to_owned(),
                 network_secret: Some("secret".to_owned()),
                 network_secret_digest: None,

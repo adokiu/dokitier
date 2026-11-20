@@ -97,6 +97,8 @@ message NetworkConfig {
   optional bool lazy_p2p = 58;
   optional bool need_p2p = 59;
   optional uint64 instance_recv_bps_limit = 60;
+  // data packet TTL in hops: origin sets the budget, every forward -1, drop at 0
+  optional uint32 packet_ttl = 78;
   optional bool disable_upnp = 61;
   optional bool ipv6_public_addr_provider = 62;
   optional bool ipv6_public_addr_auto = 63;

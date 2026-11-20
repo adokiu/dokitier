@@ -504,15 +504,12 @@ impl OspfRouteTable {
             crate::peers::link_policy::link_capacity_mbps(e.from, e.to)
         };
         // Traffic on this link that belongs to destinations OTHER than `dst`:
-        // our own per-destination counters for links leaving this node, the
-        // link owner's peer-center report for remote links. No measurement =>
-        // no penalty (anti-oscillation: a flow never counts against itself).
+        // the link owner's flooded/peer-center report, for EVERY node — the
+        // local side included. Using live local counters for our own links
+        // gave this node edge weights that nobody else could reproduce, which
+        // let the per-node SPF trees diverge into forwarding loops.
         let other_traffic_mbps = |e: &SmartEdge, dst: PeerId| -> f64 {
-            if e.from == my_peer_id {
-                (crate::peers::link_policy::link_total_rate(e.to)
-                    - crate::peers::link_policy::link_dst_rate(e.to, dst))
-                .max(0.0)
-            } else if e.forward_total_mbps > 0.0 {
+            if e.forward_total_mbps > 0.0 {
                 (e.forward_total_mbps
                     - e.dst_rates_mbps.get(&dst).copied().unwrap_or(0.0))
                 .max(0.0)
@@ -630,6 +627,7 @@ impl OspfRouteTable {
         let info = if changed {
             let old = old.unwrap();
             let old_total = Self::path_total_under_model(
+                my_peer_id,
                 old.next_hop_peer_id,
                 dst,
                 edges,
@@ -664,9 +662,12 @@ impl OspfRouteTable {
     }
 
     /// Best total cost from `from_hop` to `dst` under the same model, or None
-    /// when the old hop can no longer reach the destination.
+    /// when the old hop can no longer reach the destination. Edges entering
+    /// `my_peer_id` are excluded: a path that leads back through us is a
+    /// forwarding loop, not a valid reason to keep sticking to the old hop.
     #[allow(clippy::too_many_arguments)]
     fn path_total_under_model(
+        my_peer_id: PeerId,
         from_hop: PeerId,
         dst: PeerId,
         edges: &[SmartEdge],
@@ -681,6 +682,7 @@ impl OspfRouteTable {
             let weighted: Vec<(PeerId, PeerId, i64)> = edges
                 .iter()
                 .filter(|e| cap_of(e, dst) >= level)
+                .filter(|e| e.to != my_peer_id)
                 .map(|e| (e.from, e.to, base_of(e, util_of(e, dst))))
                 .collect();
             let reached = dijkstra_peer_edges(&weighted, from_hop);
@@ -1993,20 +1995,39 @@ impl SyncedRouteInfo {
                 && info.version > self.get_peer_info_version_with_default(info.peer_id)
                 && info.version > self_version_floor()
             {
-                // if dst peer send to us with higher version info of my peer, our peer id is duplicated
-                // TODO: handle this better. restart peer manager?
-                panic!("my peer id is duplicated");
-                // return Err(Error::DuplicatePeerId);
+                // A peer's row about US claiming a different incarnation. This
+                // is recoverable: it is either a stale row still in flight
+                // from our previous run or a genuinely duplicated identity.
+                // Panicking here turned a restart into a crash loop (any
+                // surviving old row could kill the new incarnation), so ignore
+                // the row and let our next announcement overwrite it.
+                tracing::warn!(
+                    ?my_peer_id,
+                    ?info.peer_id,
+                    info_version = info.version,
+                    info_route_id = info.peer_route_id,
+                    my_route_id = my_peer_route_id,
+                    "peer reports a different incarnation of my peer id; ignoring the stale row"
+                );
             }
         } else if info.peer_id == dst_peer_id {
             let Some(dst_peer_route_id) = dst_peer_route_id else {
                 return Ok(());
             };
 
-            if dst_peer_route_id != info.peer_route_id
-                && info.version < self.get_peer_info_version_with_default(info.peer_id)
-            {
-                // if dst peer send to us with lower version info of dst peer, dst peer id is duplicated
+            if dst_peer_route_id != info.peer_route_id {
+                // The session peer restarted: peer_route_id is per-process and
+                // the new incarnation legitimately re-anchors its versions.
+                // Rejecting here dropped the whole sync response, so the peer
+                // kept the previous incarnation's rows until they expired and
+                // then vanished from every route table (only a fleet-wide kill
+                // cleared it). The caller resets the stale state on incarnation
+                // change, so accept the row.
+                return Ok(());
+            }
+
+            if info.version < self.get_peer_info_version_with_default(info.peer_id) {
+                // Same incarnation, older row: a genuine duplicate/stale copy.
                 return Err(Error::DuplicatePeerId);
             }
         }
@@ -2065,6 +2086,50 @@ impl SyncedRouteInfo {
             // time between peers may not be synchronized, so update last_update to local now.
             // note only last_update with larger version will be updated to local saved peer info.
             route_info.last_update = Some(Timestamp::now());
+
+            // Incarnation change: `peer_route_id` is randomized per process, so
+            // a restarted peer shows up under the SAME (instance-derived) peer
+            // id with a NEW route id. Everything derived from the previous
+            // incarnation — its peer info, its adjacency conn_map row (the 2-way
+            // adjacency rule reads it), its tombstone and the raw bytes — is
+            // obsolete the moment the new incarnation claims itself. Accept the
+            // new row even when its re-anchored version is lower than the old
+            // watermark (a restarted process starts from its own clock floor),
+            // and drop the stale state so routes rebuild immediately. Only rows
+            // from the peer's own live session are authoritative; relayed rows
+            // must be newer than what we hold so a stale flood cannot revert us.
+            let incarnation_change = guard.get(&route_info.peer_id).and_then(|old| {
+                (old.peer_route_id != route_info.peer_route_id)
+                    .then_some((old.version, old.peer_route_id))
+            });
+            if let Some((old_version, old_route_id)) = incarnation_change {
+                let authoritative = route_info.peer_id == dst_peer_id;
+                if authoritative || route_info.version > old_version {
+                    let peer_id = route_info.peer_id;
+                    let new_route_id = route_info.peer_route_id;
+                    guard.remove(&peer_id);
+                    drop(guard);
+                    self.conn_map.write().remove(&peer_id);
+                    self.withdrawn_peer_infos.write().remove(&peer_id);
+                    self.raw_peer_infos.remove(&peer_id);
+                    guard = self.peer_infos.write();
+                    self.raw_peer_infos
+                        .insert(peer_id, raw_route_info.clone());
+                    guard.insert(peer_id, route_info);
+                    need_inc_version = true;
+                    drop(guard);
+                    tracing::info!(
+                        ?peer_id,
+                        old_route_id,
+                        new_route_id,
+                        ?authoritative,
+                        "peer incarnation changed; stale route state invalidated immediately"
+                    );
+                    continue;
+                }
+                continue;
+            }
+
             if guard
                 .get_mut(&route_info.peer_id)
                 .is_none_or(|old| route_info.version > old.version)
@@ -4321,9 +4386,18 @@ impl PeerRouteServiceImpl {
                             "stale non-initiator route sync rejected"
                         );
                     } else if err == Error::DuplicatePeerId as i32 {
-                        if !self.context.feature_flags().is_public_server {
-                            panic!("duplicate peer id");
-                        }
+                        // Recoverable route-sync conflict (stale vs new
+                        // incarnation of a stable peer id). Panicking here made
+                        // a restarted peer crash the whole core in a loop;
+                        // log it and force a fresh sync session instead.
+                        tracing::warn!(
+                            ?my_peer_id,
+                            ?dst_peer_id,
+                            "route sync reports a duplicate peer id; resetting sync session"
+                        );
+                        session
+                            .need_sync_initiator_info
+                            .store(true, Ordering::Relaxed);
                     } else {
                         tracing::error!(?ret, ?my_peer_id, ?dst_peer_id, "sync_route_info failed");
                         session

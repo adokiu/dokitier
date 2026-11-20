@@ -866,6 +866,7 @@ mod tests {
         let public = PublicKey::from(&private);
         let context = RelayTestContext {
             network_identity: NetworkIdentity {
+                p2p_group: None,
                 network_name: "test".to_owned(),
                 network_secret: Some("secret".to_owned()),
                 network_secret_digest: None,

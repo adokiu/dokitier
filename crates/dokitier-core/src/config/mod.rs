@@ -688,11 +688,13 @@ mod tests {
     #[test]
     fn network_identity_matches_secret_to_digest_identity() {
         let local = NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: Some("secret".to_string()),
             network_secret_digest: None,
         };
         let remote = NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: None,
             network_secret_digest: Some(digest("net", "secret")),
@@ -704,11 +706,13 @@ mod tests {
     #[test]
     fn network_identity_rejects_different_digest() {
         let local = NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: Some("secret".to_string()),
             network_secret_digest: None,
         };
         let remote = NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: None,
             network_secret_digest: Some(digest("net", "other")),
@@ -720,11 +724,13 @@ mod tests {
     #[test]
     fn network_identity_equal_values_have_equal_hash() {
         let local = NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: Some("secret".to_string()),
             network_secret_digest: None,
         };
         let remote = NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: None,
             network_secret_digest: Some(digest("net", "secret")),
@@ -741,6 +747,7 @@ mod tests {
     #[test]
     fn network_identity_derives_digest_from_plaintext_secret() {
         let identity = NetworkIdentity {
+            p2p_group: None,
             network_name: "net".to_string(),
             network_secret: Some("secret".to_string()),
             network_secret_digest: None,

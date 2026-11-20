@@ -89,6 +89,13 @@ message Flags {
   // Prefer direct credential peers that already relay to a destination over
   // advertising another direct edge to the same destination.
   bool prefer_peer_relay = 44 [(dokitier.flag) = { default: "false" }];
+
+  // Per-packet TTL in hops for every forwarded packet (data and control). The
+  // origin sets the budget, every forwarding node consumes one hop and the
+  // packet is dropped at zero, so a routing loop can never keep a packet
+  // circling the mesh (and RPC relay in large meshes still has enough hops).
+  // 0 means the default (16).
+  uint32 packet_ttl = 45 [(dokitier.flag) = { default: "16", form: true }];
 }
 
 

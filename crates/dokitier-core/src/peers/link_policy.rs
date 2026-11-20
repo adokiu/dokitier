@@ -383,10 +383,12 @@ pub fn link_capacity_mbps(src: PeerId, dst: PeerId) -> f64 {
         (None, None) => None,
     };
     let link = link_for(src, dst);
-    let metrics = peer_metrics(dst).or_else(|| peer_metrics(src));
+    // Every input must be data that all nodes see identically: link overrides
+    // and flooded node bandwidth. The old local probe fallback (peer_metrics)
+    // is node-local; feeding it into edge weights made each node's SPF tree
+    // disagree with everyone else's and forwarded packets into loops.
     link.and_then(|l| l.bandwidth_mbps)
         .or(node_bw)
-        .or_else(|| metrics.as_ref().map(|m| m.capacity_mbps).filter(|v| *v > 0.0))
         .unwrap_or_else(|| routing_weights().reference_bandwidth_mbps)
         .max(0.1)
 }
@@ -407,22 +409,18 @@ pub fn link_base_cost(
     if link.as_ref().is_some_and(|link| link.disabled) {
         return i32::MAX;
     }
-    let metrics = peer_metrics(dst).or_else(|| peer_metrics(src));
-    let proto = metrics.as_ref().map(|m| m.proto.as_str());
-    let effective_loss = metrics
-        .as_ref()
-        .map(|m| loss_pct.max(m.transport_loss_pct))
-        .unwrap_or(loss_pct);
     let global = routing_weights();
-    let weight = protocol_loss_weight(&global, proto);
+    // Loss and protocol come only from the flooded link metric (deterministic
+    // across nodes). The local probe counters used to raise this node's loss
+    // reading above everyone else's, which desynchronized the SPF trees.
     cost_with(
         &global,
         link.as_ref(),
         None,
-        weight,
+        1.0,
         utilization,
         latency_ms,
-        effective_loss,
+        loss_pct,
         false,
     )
 }

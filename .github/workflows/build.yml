@@ -38,7 +38,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf
+          # nightly + rust-src are required to rebuild std with panic_immediate_abort
+          # (the largest win for the size-constrained core binaries).
+          rustup toolchain install nightly --profile minimal --component rust-src
 
       - name: Install protoc + zig
         run: |
@@ -52,15 +55,43 @@ jobs:
           cargo zigbuild --profile release-fast -p dokitier-console --target x86_64-unknown-linux-musl
           cp target/x86_64-unknown-linux-musl/release-fast/dokitier-console dokitier-console-amd64
 
-      - name: Build core (amd64 musl)
+      - name: Build core (amd64 musl, tiny)
         run: |
-          cargo zigbuild --profile release-fast -p dokitier --bin dokitier-core --target x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release-fast/dokitier-core dokitier-core-amd64
+          FEATURES="management,tun,tcp-hole-punch,endpoint-discovery,quic,icmp-proxy"
+          cargo +nightly zigbuild --profile tiny -p dokitier --bin dokitier-core \
+            --target x86_64-unknown-linux-musl \
+            --no-default-features --features "$FEATURES" \
+            -Z build-std=std,panic_abort -Z build-std-features=panic_immediate_abort
+          cp target/x86_64-unknown-linux-musl/tiny/dokitier-core dokitier-core-amd64
 
-      - name: Build core (arm64 musl)
+      - name: Build core (arm64 musl, tiny)
         run: |
-          cargo zigbuild --profile release-fast -p dokitier --bin dokitier-core --target aarch64-unknown-linux-musl
-          cp target/aarch64-unknown-linux-musl/release-fast/dokitier-core dokitier-core-arm64
+          FEATURES="management,tun,tcp-hole-punch,endpoint-discovery,quic,icmp-proxy"
+          cargo +nightly zigbuild --profile tiny -p dokitier --bin dokitier-core \
+            --target aarch64-unknown-linux-musl \
+            --no-default-features --features "$FEATURES" \
+            -Z build-std=std,panic_abort -Z build-std-features=panic_immediate_abort
+          cp target/aarch64-unknown-linux-musl/tiny/dokitier-core dokitier-core-arm64
+
+      - name: Build core (armv7 musl, tiny)
+        run: |
+          FEATURES="management,tun,tcp-hole-punch,endpoint-discovery,quic,icmp-proxy"
+          cargo +nightly zigbuild --profile tiny -p dokitier --bin dokitier-core \
+            --target armv7-unknown-linux-musleabihf \
+            --no-default-features --features "$FEATURES" \
+            -Z build-std=std,panic_abort -Z build-std-features=panic_immediate_abort
+          cp target/armv7-unknown-linux-musleabihf/tiny/dokitier-core dokitier-core-armv7
+
+      - name: Report binary sizes
+        run: |
+          ls -l dokitier-console-amd64 dokitier-core-amd64 dokitier-core-arm64 dokitier-core-armv7
+          echo "15MiB budget check (armv7/OpenWrt):"
+          size=$(stat -c%s dokitier-core-armv7)
+          echo "dokitier-core-armv7 = $size bytes"
+          if [ "$size" -gt 15728640 ]; then
+            echo "::error::dokitier-core-armv7 is ${size} bytes (>15MiB); trim features or add compression"
+            exit 1
+          fi
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -70,6 +101,7 @@ jobs:
             dokitier-console-amd64
             dokitier-core-amd64
             dokitier-core-arm64
+            dokitier-core-armv7
             scripts/install.sh
 
       - name: Publish release
@@ -85,4 +117,5 @@ jobs:
             dokitier-console-amd64
             dokitier-core-amd64
             dokitier-core-arm64
+            dokitier-core-armv7
             scripts/install.sh

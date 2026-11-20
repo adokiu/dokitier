@@ -1962,6 +1962,7 @@ mod tests {
             },
         ));
         let network = NetworkIdentity {
+            p2p_group: None,
             network_name: "foreign".to_owned(),
             network_secret: Some("secret".to_owned()),
             network_secret_digest: None,

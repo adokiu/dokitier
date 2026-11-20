@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     net::{Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
@@ -42,7 +42,7 @@ pub struct PeerMap {
     peer_map: DashMap<PeerId, Arc<Peer>>,
     packet_send: PacketRecvChan,
     routes: RwLock<Vec<ArcRoute>>,
-    alive_client_urls: Arc<Mutex<HashMap<url::Url, HashSet<PeerConnId>>>>,
+    alive_client_urls: Arc<Mutex<HashMap<url::Url, HashMap<PeerConnId, PeerId>>>>,
 }
 
 impl PeerMap {
@@ -91,12 +91,13 @@ impl PeerMap {
         let close_notifier = peer_conn.get_close_notifier();
         let alive_conns_weak = Arc::downgrade(&self.alive_client_urls);
         let conn_id = close_notifier.get_conn_id();
+        let peer_id = peer_conn.get_peer_id();
         let alive_client_url: url::Url = conn_info.tunnel?.remote_addr?.into();
         self.alive_client_urls
             .lock()
             .entry(alive_client_url.clone())
             .or_default()
-            .insert(conn_id);
+            .insert(conn_id, peer_id);
 
         tokio::spawn(async move {
             if let Some(mut waiter) = close_notifier.get_waiter().await {
@@ -107,7 +108,7 @@ impl PeerMap {
             };
             let mut guard = alive_conns.lock();
             if let Some(conn_ids) = guard.get_mut(&alive_client_url) {
-                conn_ids.retain(|id| id != &conn_id);
+                conn_ids.remove(&conn_id);
                 if conn_ids.is_empty() {
                     guard.remove(&alive_client_url);
                 }
@@ -125,7 +126,26 @@ impl PeerMap {
     }
 
     pub fn is_client_url_alive(&self, url: &url::Url) -> bool {
-        self.alive_client_urls.lock().contains_key(url)
+        // A registered url is not enough: the client connection must still be
+        // owned by a live peer. When the remote side drops us (restart, peer
+        // removed, half-open tunnel) the TCP socket can stay ESTABLISHED while
+        // the peer is gone, so the old check kept reporting Connected forever
+        // and the manual connector never re-dialed — the bridge stayed dead
+        // until a fleet-wide restart. Requiring the conn to be present in the
+        // peer's directly-connected set makes the connector treat that state
+        // as dead and reconnect on its own.
+        let conns: Vec<(PeerConnId, PeerId)> = {
+            let guard = self.alive_client_urls.lock();
+            guard
+                .get(url)
+                .map(|conns| conns.iter().map(|(conn_id, peer_id)| (*conn_id, *peer_id)).collect())
+                .unwrap_or_default()
+        };
+        conns.iter().any(|(conn_id, peer_id)| {
+            self.peer_map
+                .get(peer_id)
+                .is_some_and(|peer| peer.get_directly_connections().contains(conn_id))
+        })
     }
 
     pub fn get_peer_by_id(&self, peer_id: PeerId) -> Option<Arc<Peer>> {

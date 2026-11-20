@@ -137,6 +137,7 @@ async fn peer_conn_noise_handshake_advertises_liveness_echo() {
         let public = PublicKey::from(&private);
         Arc::new(
             NoopPeerContext::new(NetworkIdentity {
+                p2p_group: None,
                 network_name: "net".to_owned(),
                 network_secret: Some("secret".to_owned()),
                 network_secret_digest: None,
@@ -179,11 +180,13 @@ async fn peer_conn_handshake_matches_plaintext_secret_identity() {
     let peer_session_store = Arc::new(PeerSessionStore::new());
     let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
     let client_ctx = Arc::new(NoopPeerContext::new(NetworkIdentity {
+        p2p_group: None,
         network_name: "net".to_string(),
         network_secret: Some("secret".to_string()),
         network_secret_digest: None,
     }));
     let server_ctx = Arc::new(NoopPeerContext::new(NetworkIdentity {
+        p2p_group: None,
         network_name: "net".to_string(),
         network_secret: Some("secret".to_string()),
         network_secret_digest: None,

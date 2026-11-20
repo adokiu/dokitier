@@ -182,6 +182,9 @@ impl PeerRpcManagerTransport for RpcTransport {
     }
 }
 
+/// Default data/control packet TTL in hops when the config leaves it unset.
+pub(crate) const DEFAULT_PACKET_TTL: u8 = 16;
+
 pub(crate) fn get_next_hop_policy(is_latency_first: bool) -> NextHopPolicy {
     if is_latency_first || crate::peers::link_policy::weighted_mode() {
         NextHopPolicy::LeastCost
@@ -528,10 +531,16 @@ impl PeerPacketFilter for NicPacketProcessor {
                 .nic_channel
                 .try_send(HostPacket::from_core_packet(packet))
             {
-                tracing::trace!(
-                    ?error,
-                    "dropping packet because nic channel cannot accept it"
-                );
+                // The NIC channel being full used to be a trace-only drop: the
+                // packet vanished between the peer pipeline and the TUN with
+                // no visible evidence. Sample it at CORE level.
+                if diag_sample() {
+                    tracing::warn!(
+                        target: "CORE",
+                        ?error,
+                        "dropping packet because nic channel cannot accept it"
+                    );
+                }
             }
             PeerPacketFilterResult::Consumed
         } else {
@@ -2771,6 +2780,7 @@ impl PeerOutboundPacketRouter {
             Some(&self.traffic_metrics),
             msg,
             dst_peer_id,
+            None,
         )
         .await;
         if result.is_ok() {
@@ -2936,6 +2946,7 @@ impl PeerOutboundPacketRouter {
                 Some(&self.traffic_metrics),
                 msg,
                 cur_to_peer_id,
+                None,
             )
             .await;
         }
@@ -3034,6 +3045,7 @@ impl PeerOutboundPacketRouter {
                 Some(&self.traffic_metrics),
                 msg,
                 *peer_id,
+                None,
             )
             .await
             {
@@ -3088,6 +3100,10 @@ pub(crate) struct PeerPacketRouter {
 }
 
 impl PeerPacketRouter {
+    fn packet_ttl(&self) -> u8 {
+        self.context.packet_ttl()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         packet_recv: PacketRecvChanReceiver,
@@ -3235,8 +3251,25 @@ impl PeerPacketRouter {
                 return;
             }
 
-            if hdr.forward_counter > 7 {
-                tracing::warn!(?hdr, "forward counter exceed, drop packet");
+            // Configured TTL (hops) applies to every forwarded packet, data and
+            // control alike. `forward_counter` counts how many nodes the packet
+            // already crossed; it is dropped once that count reaches the
+            // configured budget, so a routing loop can never keep circling the
+            // mesh. A fixed small cap is wrong here: RPC/route-info relay in a
+            // several-hundred-node mesh legitimately exceeds a handful of hops,
+            // so the budget must scale with the configured TTL instead.
+            let ttl = self.packet_ttl();
+            let hops_traveled = hdr.forward_counter;
+            if hops_traveled >= ttl {
+                tracing::warn!(
+                    target: "CORE",
+                    dst = to_peer_id,
+                    ingress = from_peer_id,
+                    packet_type,
+                    hops = hops_traveled,
+                    ttl,
+                    "packet TTL exhausted, drop packet (routing loop)"
+                );
                 return;
             }
 
@@ -3251,12 +3284,12 @@ impl PeerPacketRouter {
                 return;
             }
 
-            if hdr.forward_counter > 2 && hdr.is_latency_first() {
+            if hops_traveled >= 2 && hdr.is_latency_first() {
                 tracing::trace!(?hdr, "set_latency_first false because too many hop");
                 hdr.set_latency_first(false);
             }
 
-            hdr.forward_counter += 1;
+            hdr.forward_counter = hops_traveled.saturating_add(1);
 
             if from_peer_id == self.my_peer_id {
                 self.counters.compress_tx_bytes_before.add(buf_len as u64);
@@ -3305,12 +3338,31 @@ impl PeerPacketRouter {
                 tx_metrics,
                 ret,
                 to_peer_id,
+                Some(from_peer_id),
             )
             .await;
             if ret.is_err() {
-                tracing::error!(?ret, ?to_peer_id, ?from_peer_id, "forward packet error");
+                tracing::warn!(
+                    target: "CORE",
+                    ?ret,
+                    dst = to_peer_id,
+                    ingress = from_peer_id,
+                    "forward packet error"
+                );
             }
         } else {
+            // A data/control packet addressed to this node. Sample it so a
+            // delivery that never reaches the TUN can be told apart from one
+            // dropped later in the filter chain or the NIC channel.
+            if packet_type == PacketType::Data as u8 && diag_sample() {
+                tracing::info!(
+                    target: "CORE",
+                    from_peer_id,
+                    to_peer_id = self.my_peer_id,
+                    len = buf_len,
+                    "peer packet arrived for local delivery"
+                );
+            }
             if packet_type == PacketType::RelayHandshake as u8
                 || packet_type == PacketType::RelayHandshakeAck as u8
             {
@@ -3636,52 +3688,64 @@ pub(crate) async fn send_msg_internal(
     direct_tx_metrics: Option<&Arc<TrafficMetricRecorder>>,
     msg: ZCPacket,
     dst_peer_id: PeerId,
+    avoid_peer: Option<PeerId>,
 ) -> Result<(), Error> {
-    let policy = get_next_hop_policy(msg.peer_manager_header().unwrap().is_latency_first());
-    let is_latency_first = msg.peer_manager_header().unwrap().is_latency_first();
-    let packet_type = msg.peer_manager_header().unwrap().packet_type;
-    let msg_len = msg.buf_len() as u64;
-    let latency_first_gateway = if is_latency_first {
-        peers
-            .get_gateway_peer_id(dst_peer_id, policy.clone())
-            .await
-            .filter(|gateway| *gateway != dst_peer_id)
-    } else {
-        None
+    let (policy, is_latency_first, packet_type, msg_len) = {
+        let header = msg.peer_manager_header().unwrap();
+        (
+            get_next_hop_policy(header.is_latency_first()),
+            header.is_latency_first(),
+            header.packet_type,
+            msg.buf_len() as u64,
+        )
     };
-    let send_result = if let Some(gateway) = latency_first_gateway
-        && (peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway))
-    {
-        relay_peer_map.send_msg(msg, dst_peer_id, policy).await
-    } else if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
-        // Direct p2p link: the link peer IS the destination.
-        crate::peers::link_policy::add_link_dst_bytes(
-            dst_peer_id,
-            dst_peer_id,
-            msg_len,
-        );
-        peer.send_msg(msg).await
-    } else if peers.is_self(dst_peer_id) {
-        peers.send_msg_directly(msg, dst_peer_id).await
-    } else if foreign_network_client.has_next_hop(dst_peer_id) {
-        foreign_network_client.send_msg(msg, dst_peer_id).await
-    } else if let Some(gateway) = peers.get_gateway_peer_id(dst_peer_id, policy.clone()).await {
-        if peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway) {
-            relay_peer_map.send_msg(msg, dst_peer_id, policy).await
-        } else {
-            tracing::warn!(
-                ?gateway,
-                ?dst_peer_id,
-                "cannot send msg to peer through gateway"
-            );
-            Err(Error::RouteError(None))
+    // Loop-free next hop selection. The latency-first table is computed per
+    // node from a graph that can disagree with a neighbour's (metrics arrive
+    // at different times / incarnations), and two nodes may then point at each
+    // other: forwarding along it bounced packets between jp-akile and jp-gcp
+    // until the hop counter dropped them, so every relayed ping to that
+    // segment black-holed. Never send a forwarded packet back to the peer it
+    // just came from, and when the latency-first answer is unusable, use the
+    // other policy's answer instead of dropping the packet.
+    let gateway = resolve_loop_free_gateway(
+        peers,
+        foreign_network_client,
+        dst_peer_id,
+        is_latency_first,
+        avoid_peer,
+    )
+    .await;
+
+    let send_result = match gateway {
+        Some((gateway, gateway_policy)) if gateway != dst_peer_id => {
+            relay_peer_map
+                .send_msg(msg, dst_peer_id, gateway_policy)
+                .await
         }
-    } else if foreign_network_client.has_next_hop(dst_peer_id) {
-        // check foreign network again. so in happy path we can avoid extra check
-        foreign_network_client.send_msg(msg, dst_peer_id).await
-    } else {
-        tracing::debug!(?dst_peer_id, "no gateway for peer");
-        Err(Error::RouteError(None))
+        _ => {
+            if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
+                // Direct p2p link: the link peer IS the destination.
+                crate::peers::link_policy::add_link_dst_bytes(
+                    dst_peer_id,
+                    dst_peer_id,
+                    msg_len,
+                );
+                peer.send_msg(msg).await
+            } else if peers.is_self(dst_peer_id) {
+                peers.send_msg_directly(msg, dst_peer_id).await
+            } else if foreign_network_client.has_next_hop(dst_peer_id) {
+                foreign_network_client.send_msg(msg, dst_peer_id).await
+            } else {
+                tracing::warn!(
+                    target: "CORE",
+                    dst = dst_peer_id,
+                    ?policy,
+                    ?avoid_peer,
+                    "no route for packet; dropping"
+                );
+                Err(Error::RouteError(None))
+            }
+        }
     };
 
     if send_result.is_ok()
@@ -3691,6 +3755,53 @@ pub(crate) async fn send_msg_internal(
     }
 
     send_result
+}
+
+/// Pick a next hop that is both reachable from this node and not the peer the
+/// packet just arrived from. The requested policy is tried first; the other
+/// policy is the fallback. Returning `None` means there is genuinely no local
+/// route, and the caller reports the drop instead of silently looping.
+async fn resolve_loop_free_gateway(
+    peers: &PeerMap,
+    foreign_network_client: &Arc<ForeignNetworkClient>,
+    dst_peer_id: PeerId,
+    latency_first: bool,
+    avoid_peer: Option<PeerId>,
+) -> Option<(PeerId, NextHopPolicy)> {
+    // Smart/latency routing only weighs bandwidth, latency and loss (the route
+    // table already did that); hop count is deliberately not a tie-breaker.
+    // The only extra constraint here is loop safety: never hand a forwarded
+    // packet back to the peer it just came from. If the requested policy's
+    // answer would do that, fall back to the other policy's answer.
+    let policies: [NextHopPolicy; 2] = if latency_first {
+        [NextHopPolicy::LeastCost, NextHopPolicy::LeastHop]
+    } else {
+        [NextHopPolicy::LeastHop, NextHopPolicy::LeastCost]
+    };
+
+    for policy in policies {
+        let Some(gateway) = peers
+            .get_gateway_peer_id(dst_peer_id, policy.clone())
+            .await
+        else {
+            continue;
+        };
+        if Some(gateway) == avoid_peer {
+            continue;
+        }
+        if gateway == dst_peer_id
+            || peers.has_peer(gateway)
+            || foreign_network_client.has_next_hop(gateway)
+        {
+            return Some((gateway, policy));
+        }
+    }
+
+    if Some(dst_peer_id) != avoid_peer && peers.has_peer(dst_peer_id) {
+        return Some((dst_peer_id, NextHopPolicy::LeastHop));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -3807,6 +3918,7 @@ mod tests {
     impl PeerContext for SameNetworkContext {
         fn network_identity(&self) -> NetworkIdentity {
             NetworkIdentity {
+                p2p_group: None,
                 network_name: "test".to_string(),
                 network_secret: None,
                 network_secret_digest: None,
@@ -3908,6 +4020,7 @@ mod tests {
                 ..Default::default()
             },
             network_identity: NetworkIdentity {
+                p2p_group: None,
                 network_name: network_name.to_owned(),
                 network_secret: Some("secret".to_owned()),
                 network_secret_digest: None,

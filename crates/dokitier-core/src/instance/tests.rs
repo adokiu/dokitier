@@ -159,6 +159,7 @@ fn core_instance_config_round_trips_as_normalized_json() {
         crate::config::peers::PeerRuntimeConfig {
             core,
             network_identity: crate::config::NetworkIdentity {
+                p2p_group: None,
                 network_name: "default".to_owned(),
                 network_secret: Some("test".to_owned()),
                 network_secret_digest: None,
@@ -318,6 +319,7 @@ mod portable_runtime {
         let peer = PortablePeerManagerConfig::new(PeerRuntimeConfig {
             core,
             network_identity: NetworkIdentity {
+                p2p_group: None,
                 network_name: network_name.to_owned(),
                 network_secret: Some(String::new()),
                 network_secret_digest: None,

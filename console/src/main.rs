@@ -1,3 +1,12 @@
+// mimalloc instead of the default (musl) allocator: the console serves a
+// continuous stream of per-second topology frames and builds large JSON
+// responses, and the musl allocator aggressively retains freed memory. A
+// long-running console grew to ~590MB RSS and was OOM-killed on a 1.8GB
+// host; mimalloc purges free pages eagerly and keeps RSS near the live
+// working set.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{
     convert::Infallible,
     pin::Pin,
@@ -1271,6 +1280,9 @@ struct CreateNetworkBody {
     auto_connect: bool,
     #[serde(default)]
     no_tun: bool,
+    /// Data-packet TTL (hops) written into the generated [flags] section.
+    #[serde(default)]
+    packet_ttl: Option<u32>,
 }
 
 fn default_ip_mode() -> String { "auto".to_string() }
@@ -1491,10 +1503,17 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
         lines.push("[network_identity]".to_string());
         lines.push(format!("network_name = \"{name}\""));
         lines.push(format!("network_secret = \"{}\"", body.secret.replace('"', "\\\"")));
+        let mut flag_lines = Vec::new();
         if body.no_tun {
+            flag_lines.push("no_tun = true".to_string());
+        }
+        if let Some(ttl) = body.packet_ttl {
+            flag_lines.push(format!("packet_ttl = {}", ttl.clamp(1, 255)));
+        }
+        if !flag_lines.is_empty() {
             lines.push(String::new());
             lines.push("[flags]".to_string());
-            lines.push("no_tun = true".to_string());
+            lines.extend(flag_lines);
         }
         if body.auto_connect {
             // Peers must use the underlay address, never the VPN IP.
@@ -3755,13 +3774,40 @@ async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
         let _ = tx.rollback().await;
         return false;
     }
+    // Komari-style rollup ladder, step one: never persist per-second samples.
+    // Aggregate every closed minute into one row per (network, link) and keep
+    // the current (still open) minute in memory until it closes.
+    let current_minute = (now() / 60) * 60;
+    let mut buckets: std::collections::BTreeMap<
+        (String, i64, i64, Option<String>, Option<String>, i64),
+        (f64, u32, f64, u32),
+    > = std::collections::BTreeMap::new();
     for (network, a, b, a_uuid, b_uuid, ts, latency, loss) in &rt.pending_links {
+        let minute = (ts / 60) * 60;
+        if minute >= current_minute {
+            continue;
+        }
+        let entry = buckets
+            .entry((network.clone(), *a, *b, a_uuid.clone(), b_uuid.clone(), minute))
+            .or_insert((0.0, 0, 0.0, 0));
+        if let Some(value) = latency {
+            entry.0 += *value;
+            entry.1 += 1;
+        }
+        if let Some(value) = loss {
+            entry.2 += *value;
+            entry.3 += 1;
+        }
+    }
+    for ((network, a, b, a_uuid, b_uuid, ts), (lat_sum, lat_n, loss_sum, loss_n)) in buckets {
+        let latency = (lat_n > 0).then(|| lat_sum / lat_n as f64);
+        let loss = (loss_n > 0).then(|| loss_sum / loss_n as f64);
         let ins = sqlx::query(&q("INSERT INTO link_metrics (network, a, b, a_uuid, b_uuid, ts, latency_ms, loss_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))
             .bind(network)
             .bind(a)
             .bind(b)
-            .bind(a_uuid.clone())
-            .bind(b_uuid.clone())
+            .bind(a_uuid)
+            .bind(b_uuid)
             .bind(ts)
             .bind(latency)
             .bind(loss)
@@ -3799,17 +3845,19 @@ async fn compact_link_metrics(state: &AppState) {
 async fn compact_link_metrics_inner(state: &AppState) -> Result<(), sqlx::Error> {
     let now_ts = now();
     let oldest = now_ts - 30 * 24 * 3600;
-    // retention: nothing older than 30 days
-    let _ = sqlx::query("DELETE FROM link_metrics WHERE ts < ?")
-        .bind(oldest)
-        .execute(&state.db)
-        .await;
-    let tiers: [(i64, i64); 3] = [
-        (now_ts - 3600, 60),
-        (now_ts - 24 * 3600, 300),
-        (now_ts - 7 * 24 * 3600, 1800),
-    ];
-    for (cutoff, step) in tiers {
+    // Komari-style rollup ladder: seal progressively coarser buckets as data
+    // ages, then drop the finer rows of that window in the same transaction.
+    //   1m rows older than 10h  -> 5m buckets
+    //   5m rows older than 50h  -> 1h buckets
+    //   anything older than 30d -> deleted
+    // Only rows that are not yet aligned to the target step are rewritten, so
+    // a repeated run over an already compacted window is cheap.
+    let ladders: [(i64, i64); 2] = [(10 * 3600, 300), (50 * 3600, 3600)];
+    for (older_than, step) in ladders {
+        let cutoff = now_ts - older_than;
+        if cutoff <= oldest {
+            continue;
+        }
         let Ok(mut tx) = state.db.begin().await else {
             continue;
         };
@@ -3846,6 +3894,10 @@ async fn compact_link_metrics_inner(state: &AppState) -> Result<(), sqlx::Error>
         }
         let _ = tx.commit().await;
     }
+    let _ = sqlx::query(&q("DELETE FROM link_metrics WHERE ts < ?"))
+        .bind(oldest)
+        .execute(&state.db)
+        .await;
     Ok(())
 }
 
@@ -3943,12 +3995,13 @@ fn spawn_snapshot_flusher(state: AppState) {
                 state.rt_flush.insert(node_id.clone(), now_ts);
                 let state_clone = state.clone();
                 let id = node_id.clone();
-                let flushed_ts = rt.ts;
                 tokio::spawn(async move {
                     let _permit = permit;
                     if flush_one_node(state_clone.clone(), id.clone(), rt).await {
                         if let Some(mut live) = state_clone.node_rt.get_mut(&id) {
-                            live.pending_links.retain(|row| row.5 > flushed_ts);
+                            let current_minute = (now() / 60) * 60;
+                            live.pending_links
+                                .retain(|row| (row.5 / 60) * 60 >= current_minute);
                         }
                     } else {
                         // retry in the next cycle
@@ -4197,11 +4250,28 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
                     let local = n.get("local").and_then(|v| v.as_bool()).unwrap_or(false);
                     let mut node = n.clone();
                     node["network_name"] = json!(network);
+                    // The core reports each node's own p2p group as part of the
+                    // flooded route info; prefer it over the instance_id ->
+                    // network_instances reverse lookup, which misses nodes that
+                    // were never pushed through the console (or whose
+                    // instance_id changed) and left them in the default box.
                     let resolved_group = n
-                        .get("instance_id")
+                        .get("p2p_group")
                         .and_then(|v| v.as_str())
-                        .and_then(|uuid| instance_groups.get(uuid).cloned())
-                        .unwrap_or_else(|| if local { p2p_group.to_string() } else { String::new() });
+                        .filter(|group| !group.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            n.get("instance_id")
+                                .and_then(|v| v.as_str())
+                                .and_then(|uuid| instance_groups.get(uuid).cloned())
+                        })
+                        .unwrap_or_else(|| {
+                            if local {
+                                p2p_group.to_string()
+                            } else {
+                                String::new()
+                            }
+                        });
                     node["p2p_group"] = json!(resolved_group);
                     node["agent_node_id"] = json!(node_id);
                     let geo_owner = n
@@ -4296,6 +4366,28 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
             if let Some(country) = countries.get(owner) {
                 node["country_code"] = json!(country);
             }
+        }
+    }
+    // Remote peers are not in `peer_owner` (that map only tracks each agent's
+    // own peer id), so their alias/country were never resolved and the graph
+    // showed a bare peer id / raw hostname for nodes that do have a name in
+    // the console. Resolve them through the instance uuid the core reports.
+    for node in nodes.values_mut() {
+        if node.get("alias").is_some() {
+            continue;
+        }
+        let Some(owner) = node
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .and_then(|uuid| instance_nodes.get(uuid))
+        else {
+            continue;
+        };
+        if let Some(alias) = aliases.get(owner) {
+            node["alias"] = json!(alias);
+        }
+        if let Some(country) = countries.get(owner) {
+            node["country_code"] = json!(country);
         }
     }
     for ((a, b, network), edge) in edges.iter_mut() {

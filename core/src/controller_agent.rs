@@ -458,6 +458,7 @@ async fn snapshot(manager: &NativeInstanceManager, public_ipv4: Option<&str>, pu
             "hostname": node.hostname,
             "ipv4": node.ipv4_addr.map(|x| x.to_string()),
             "version": node.version,
+            "p2p_group": identity.p2p_group.clone().unwrap_or_default(),
             "local": true,
         })];
         for route in instance.route_snapshots().await {
@@ -470,6 +471,7 @@ async fn snapshot(manager: &NativeInstanceManager, public_ipv4: Option<&str>, pu
                 "hostname": route.hostname,
                 "ipv4": route.ipv4_addr.map(|x| x.to_string()),
                 "version": route.version,
+                "p2p_group": route.p2p_group,
                 "next_hop_peer_id": route.next_hop_peer_id,
                 "cost": route.cost,
                 "local": false,

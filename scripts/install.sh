@@ -1,5 +1,5 @@
 #!/bin/sh
-# dokitier core one-line installer (POSIX sh; works on systemd distros and Alpine/OpenRC)
+# dokitier core one-line installer (POSIX sh; works on systemd distros, Alpine/OpenRC and OpenWrt/procd)
 # Usage: wget -qO- <this-url> | sudo sh -s -- -e wss://console/api/agent/ws -t <token> -n <node-id>
 set -eu
 
@@ -59,6 +59,7 @@ arch="$(uname -m)"
 case "$arch" in
   x86_64|amd64) asset="dokitier-core-amd64" ;;
   aarch64|arm64) asset="dokitier-core-arm64" ;;
+  armv7l|armv7|armv7a|armhf) asset="dokitier-core-armv7" ;;
   *) echo "unsupported architecture: $arch"; exit 1 ;;
 esac
 
@@ -81,7 +82,8 @@ download() {
     fi
   elif command -v wget >/dev/null 2>&1; then
     if [ "$INSECURE" = "1" ]; then
-      wget -q --no-check-certificate -O "$dst" "$src"
+      # busybox wget on OpenWrt may not know --no-check-certificate.
+      wget -q --no-check-certificate -O "$dst" "$src" 2>/dev/null || wget -q -O "$dst" "$src"
     else
       wget -q -O "$dst" "$src"
     fi
@@ -94,7 +96,11 @@ echo "==> downloading $asset ($VERSION)"
 mkdir -p "$INSTALL_DIR"
 shift_tmp="$(mktemp)"
 download "$url" "$shift_tmp"
-install -m0755 "$shift_tmp" "$INSTALL_DIR/dokitier-core"
+# `install` is missing on some minimal OpenWrt/busybox builds.
+install -m0755 "$shift_tmp" "$INSTALL_DIR/dokitier-core" 2>/dev/null || {
+  cp "$shift_tmp" "$INSTALL_DIR/dokitier-core"
+  chmod 0755 "$INSTALL_DIR/dokitier-core"
+}
 rm -f "$shift_tmp"
 
 echo "==> writing $INSTALL_DIR/config.toml"
@@ -116,7 +122,9 @@ fi
 
 # Detect the init system: systemd, OpenRC (Alpine), or none.
 detect_init() {
-  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+  if [ -f /etc/openwrt_release ] && [ -x /sbin/procd ]; then
+    echo openwrt
+  elif [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     echo systemd
   elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
     echo openrc
@@ -153,6 +161,40 @@ UNIT
   systemctl restart "$SERVICE"
   sleep 2
   systemctl is-active "$SERVICE" && echo "==> dokitier core installed and running (${SERVICE})"
+elif [ "$INIT" = "openwrt" ]; then
+  echo "==> installing OpenWrt (procd) service ${SERVICE}"
+  RC_SERVICE="$(echo "$SERVICE" | tr . -)"
+  # dokitier needs a TUN device; install the kmod on OpenWrt when missing.
+  if [ ! -e /dev/net/tun ] && command -v opkg >/dev/null 2>&1; then
+    echo "==> /dev/net/tun missing; installing kmod-tun"
+    opkg update >/dev/null 2>&1 || true
+    opkg install kmod-tun >/dev/null 2>&1 || echo "==> WARNING: could not install kmod-tun; install it manually" >&2
+  fi
+  cat > "/etc/init.d/${RC_SERVICE}" <<UNIT
+#!/bin/sh /etc/rc.common
+START=99
+USE_PROCD=1
+
+start_service() {
+  procd_open_instance
+  procd_set_param command ${INSTALL_DIR}/dokitier-core -c ${INSTALL_DIR}/config.toml
+  procd_set_param respawn 3600 5 0
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_set_param limits nofile="65536 65536"
+  procd_close_instance
+}
+UNIT
+  chmod 0755 "/etc/init.d/${RC_SERVICE}"
+  "/etc/init.d/${RC_SERVICE}" enable >/dev/null 2>&1 || true
+  "/etc/init.d/${RC_SERVICE}" restart
+  sleep 2
+  if pidof dokitier-core >/dev/null 2>&1; then
+    echo "==> dokitier core installed and running (${RC_SERVICE})"
+  else
+    echo "==> WARNING: dokitier-core is not running; check logread -e dokitier" >&2
+    exit 1
+  fi
 elif [ "$INIT" = "openrc" ]; then
   echo "==> installing OpenRC service ${SERVICE}"
   # OpenRC does not accept dots in service names.
@@ -185,7 +227,7 @@ UNIT
     exit 1
   fi
 else
-  echo "==> no systemd or OpenRC detected; installed binary and config only in ${INSTALL_DIR}" >&2
+  echo "==> no supported init system (systemd/OpenRC/procd) detected; installed binary and config only in ${INSTALL_DIR}" >&2
   echo "==> create a service definition for ${INSTALL_DIR}/dokitier-core -c ${INSTALL_DIR}/config.toml manually" >&2
   exit 0
 fi

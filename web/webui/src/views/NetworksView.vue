@@ -90,6 +90,9 @@
           <div class="cfg-label-row"><span class="cfg-label">创建 TUN 接口</span></div>
           <v-switch v-model="form.tun" color="primary" density="compact" hide-details />
         </div>
+        <ConfigField label="数据包 TTL" hint="数据包每经过一个转发节点消耗 1 跳，耗尽即丢弃，用于防止路由环路；默认 16，范围 1-255。">
+          <v-text-field v-model.number="form.packet_ttl" type="number" density="compact" variant="outlined" hide-details placeholder="16" />
+        </ConfigField>
         <div class="switch-item">
           <div class="cfg-label-row">
             <span class="cfg-label">保存后自动生成并下发节点配置</span>
@@ -163,7 +166,7 @@ const saving = ref(false)
 const createError = ref('')
 const selected = ref({})
 const groups = ref({})
-const form = ref({ name: '', secret: '', ip_mode: 'auto', subnet: '', auto_connect: true, tun: true })
+const form = ref({ name: '', secret: '', ip_mode: 'auto', subnet: '', auto_connect: true, tun: true, packet_ttl: 16 })
 const snack = ref(false)
 const snackText = ref('')
 const snackColor = ref('success')
@@ -220,7 +223,7 @@ function generateSecret() {
 
 function openCreate() {
   createError.value = ''
-  form.value = { name: '', secret: '', ip_mode: 'auto', subnet: '', auto_connect: true, tun: true }
+  form.value = { name: '', secret: '', ip_mode: 'auto', subnet: '', auto_connect: true, tun: true, packet_ttl: 16 }
   generateSecret()
   selected.value = {}
   groups.value = {}
@@ -255,6 +258,7 @@ async function createNetwork(autoConnect) {
       nodes,
       auto_connect: autoConnect,
       no_tun: !form.value.tun,
+      packet_ttl: Number(form.value.packet_ttl) || 16,
     })
     if (!result.ok) throw new Error((result.failed && result.failed[0] && result.failed[0].error) || result.error || '创建失败')
     createOpen.value = false
