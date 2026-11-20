@@ -131,6 +131,8 @@ inherits = "release"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Nightly-only panic strategy: no landing pads and no panic formatting at all.
+# The release CI builds this profile with `-Z build-std=core,alloc,std,panic_abort`.
+panic = "immediate-abort"
 strip = "symbols"
 debug = false
