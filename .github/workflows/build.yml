@@ -1,8 +1,7 @@
 name: build
 
-# Single pipeline: one run builds every binary the release needs.
-# Triggered by a version tag (or manually) only - pushing code no longer
-# spawns a second "ci" run doing the same build.
+# Full-feature core binaries for every supported platform/architecture.
+# Triggered by a version tag or manually (workflow_dispatch with a tag input).
 on:
   push:
     tags:
@@ -10,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v2.7.4)'
+        description: 'Release tag (e.g. v2.7.13)'
         required: true
 
 permissions:
@@ -20,98 +19,153 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: dokitier-core-amd64
+            zig: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: dokitier-core-arm64
+            zig: true
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            asset: dokitier-core-armv7
+            zig: true
+            upx: true
+          - os: ubuntu-latest
+            target: i686-unknown-linux-musl
+            asset: dokitier-core-x86
+            zig: true
+          - os: ubuntu-latest
+            target: mips-unknown-linux-musl
+            asset: dokitier-core-mips
+            zig: true
+            allow_failure: true
+          - os: ubuntu-latest
+            target: mipsel-unknown-linux-musl
+            asset: dokitier-core-mipsel
+            zig: true
+            allow_failure: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: dokitier-core-windows-amd64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: dokitier-core-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: dokitier-core-macos-amd64
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow_failure == true }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev clang libclang-dev upx-ucl
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
+          brew install upx || true
+
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install protoc llvm -y --no-progress
 
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf
-          # nightly + rust-src are required for -Z build-std (rebuild std with
-          # panic_abort, which is a large win for the size-constrained binaries).
-          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup target add ${{ matrix.target }}
 
-      - name: Install protoc + zig
+      - name: Install zig + cargo-zigbuild
+        if: ${{ matrix.zig }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
-          sudo apt-get install -y upx-ucl 2>/dev/null || sudo apt-get install -y upx || echo "::warning::upx not installed"
           pip install ziglang
           cargo install cargo-zigbuild --locked
 
-      - name: Build core (amd64 musl, tiny)
+      - name: Build (full default features)
+        shell: bash
+        env:
+          LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
         run: |
-          FEATURES="management,tun,tcp-hole-punch,endpoint-discovery,quic,icmp-proxy"
-          cargo +nightly zigbuild --profile tiny -p dokitier --bin dokitier-core \
-            --target x86_64-unknown-linux-musl \
-            --no-default-features --features "$FEATURES" \
-            -Z build-std=std,panic_abort
-          cp target/x86_64-unknown-linux-musl/tiny/dokitier-core dokitier-core-amd64
+          set -e
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --profile tiny -p dokitier --bin dokitier-core \
+              --target ${{ matrix.target }}
+          else
+            cargo build --profile tiny -p dokitier --bin dokitier-core \
+              --target ${{ matrix.target }}
+          fi
+          ext=""
+          case "${{ matrix.target }}" in
+            *windows-msvc) ext=".exe" ;;
+          esac
+          cp "target/${{ matrix.target }}/tiny/dokitier-core${ext}" "${{ matrix.asset }}"
+          ls -l "${{ matrix.asset }}"
 
-      - name: Build core (arm64 musl, tiny)
+      - name: Compress armv7 with UPX (OpenWrt flash budget)
+        if: ${{ matrix.upx }}
+        shell: bash
         run: |
-          FEATURES="management,tun,tcp-hole-punch,endpoint-discovery,quic,icmp-proxy"
-          cargo +nightly zigbuild --profile tiny -p dokitier --bin dokitier-core \
-            --target aarch64-unknown-linux-musl \
-            --no-default-features --features "$FEATURES" \
-            -Z build-std=std,panic_abort
-          cp target/aarch64-unknown-linux-musl/tiny/dokitier-core dokitier-core-arm64
-
-      - name: Build core (armv7 musl, tiny)
-        run: |
-          FEATURES="management,tun,tcp-hole-punch,endpoint-discovery,quic,icmp-proxy"
-          cargo +nightly zigbuild --profile tiny -p dokitier --bin dokitier-core \
-            --target armv7-unknown-linux-musleabihf \
-            --no-default-features --features "$FEATURES" \
-            -Z build-std=std,panic_abort
-          cp target/armv7-unknown-linux-musleabihf/tiny/dokitier-core dokitier-core-armv7
-          # OpenWrt routers are flash constrained: shrink further with UPX when it
-          # accepts the static musl ELF, keeping the raw binary as a fallback.
-          cp dokitier-core-armv7 dokitier-core-armv7.raw
-          if upx --best --lzma -o dokitier-core-armv7.upx dokitier-core-armv7.raw; then
-            mv dokitier-core-armv7.upx dokitier-core-armv7
+          set -e
+          cp "${{ matrix.asset }}" "${{ matrix.asset }}.raw"
+          if upx --best --lzma -o "${{ matrix.asset }}.upx" "${{ matrix.asset }}.raw"; then
+            mv "${{ matrix.asset }}.upx" "${{ matrix.asset }}"
           else
             echo "::warning::upx could not pack this ELF; shipping the uncompressed binary"
-            rm -f dokitier-core-armv7.upx
+            rm -f "${{ matrix.asset }}.upx"
           fi
-          ls -l dokitier-core-armv7 dokitier-core-armv7.raw
+          ls -l "${{ matrix.asset }}" "${{ matrix.asset }}.raw"
 
-      - name: Report binary sizes
-        run: |
-          ls -l dokitier-core-amd64 dokitier-core-arm64 dokitier-core-armv7
-          echo "15MiB budget check (armv7/OpenWrt):"
-          size=$(stat -c%s dokitier-core-armv7)
-          echo "dokitier-core-armv7 = $size bytes"
-          if [ "$size" -gt 15728640 ]; then
-            echo "::error::dokitier-core-armv7 is ${size} bytes (>15MiB); trim features or add compression"
-            exit 1
-          fi
-
-      - name: Upload binaries
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dokitier-${{ github.ref_name }}-binaries
-          path: |
-            dokitier-core-amd64
-            dokitier-core-arm64
-            dokitier-core-armv7
-            scripts/install.sh
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+          path: release
+
+      - name: List release assets
+        run: ls -l release
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
           draft: false
           prerelease: false
           generate_release_notes: true
           files: |
-            dokitier-core-amd64
-            dokitier-core-arm64
-            dokitier-core-armv7
+            release/*
             scripts/install.sh

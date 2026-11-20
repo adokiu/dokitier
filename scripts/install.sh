@@ -58,8 +58,11 @@ fi
 arch="$(uname -m)"
 case "$arch" in
   x86_64|amd64) asset="dokitier-core-amd64" ;;
+  i386|i486|i586|i686) asset="dokitier-core-x86" ;;
   aarch64|arm64) asset="dokitier-core-arm64" ;;
   armv7l|armv7|armv7a|armhf) asset="dokitier-core-armv7" ;;
+  mips) asset="dokitier-core-mips" ;;
+  mipsel) asset="dokitier-core-mipsel" ;;
   *) echo "unsupported architecture: $arch"; exit 1 ;;
 esac
 
