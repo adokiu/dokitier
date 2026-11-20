@@ -111,9 +111,11 @@ jobs:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
         run: |
           set -e
-          cargo build --profile tiny -p dokitier --bin dokitier-core \
+          # custom profiles confuse the proto build script on Windows (it looks
+          # for a "release"/"debug" path component); use release there.
+          cargo build --release -p dokitier --bin dokitier-core \
             --target ${{ matrix.target }}
-          cp "target/${{ matrix.target }}/tiny/dokitier-core.exe" "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/dokitier-core.exe" "${{ matrix.asset }}"
           ls -l "${{ matrix.asset }}"
 
       - name: Compress armv7 with UPX (OpenWrt flash budget)
