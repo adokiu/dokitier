@@ -1,0 +1,92 @@
+name: throughput
+
+# Tunnel throughput regression bench. Runs entirely on the CI runner: two core
+# instances in Docker (no console, manual TOML config, key-authenticated) and
+# iperf3 between their overlay IPs. Nothing here touches production nodes.
+on:
+  workflow_dispatch:
+    inputs:
+      schemes:
+        description: 'Tunnel schemes to bench (space separated)'
+        required: false
+        default: 'tcp udp quic'
+      duration:
+        description: 'iperf3 duration per run (seconds)'
+        required: false
+        default: '15'
+      threshold_mbps:
+        description: 'Fail below this for udp/quic, 4 parallel streams (Mbps)'
+        required: false
+        default: '300'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: throughput-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: tunnel bench (${{ inputs.schemes }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build core (release-fast)
+        run: |
+          cargo build --profile release-fast -p dokitier --bin dokitier-core
+          ls -l target/release-fast/dokitier-core
+
+      - name: Enable TUN for the bench containers
+        run: |
+          set -e
+          sudo modprobe tun || true
+          if [ ! -e /dev/net/tun ]; then
+            sudo mkdir -p /dev/net
+            sudo mknod /dev/net/tun c 10 200
+            sudo chmod 666 /dev/net/tun
+          fi
+          ls -l /dev/net/tun
+          docker version
+
+      - name: Run throughput bench
+        env:
+          SCHEMES: ${{ inputs.schemes }}
+          DURATION: ${{ inputs.duration }}
+          THRESHOLD_MBPS: ${{ inputs.threshold_mbps }}
+        run: |
+          chmod +x ci/throughput-bench.sh
+          ci/throughput-bench.sh target/release-fast/dokitier-core "$SCHEMES"
+
+      - name: Upload bench logs
+        if: always()
+        run: |
+          mkdir -p bench-logs
+          for c in bench-n1 bench-n2; do
+            docker logs "$c" > "bench-logs/$c.log" 2>&1 || true
+          done
+          docker ps -a > bench-logs/docker-ps.txt 2>&1 || true
+          ip -br addr > bench-logs/ip.txt 2>&1 || true
+
+      - name: Publish logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-logs
+          path: bench-logs
+          if-no-files-found: ignore
