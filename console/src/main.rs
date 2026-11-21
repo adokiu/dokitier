@@ -25,9 +25,8 @@ use axum::{
     Json, Router,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures::{Stream, StreamExt};
-use dokitier_controller::{hash_token, proof, read_frame, write_frame, AgentFrame, ConsoleFrame, SessionCipher};
+use dokitier_controller::{hash_token, proof, read_frame, write_frame, AgentFrame, SessionCipher};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1408,7 +1407,7 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
     for (node_id,) in &node_ids {
         let (status, snapshot, system_info) = match state.node_rt.get(node_id) {
             Some(rt) => (
-                rt_status(rt, now_ts).to_string(),
+                rt_status(&rt, now_ts).to_string(),
                 rt.snapshot.to_string(),
                 rt.system.to_string(),
             ),
@@ -2766,8 +2765,10 @@ async fn nodes_payload(state: &AppState) -> Value {
         let rt = state.node_rt.get(&node_id).map(|r| r.clone());
         // Shared liveness rule: the nodes page, the topology page and the
         // networks page all read this same answer.
-        let live = rt.filter(|r| rt_status(r, now_ts) == "online");
+        // The shared rule decides; `live` is the same answer expressed as the
+        // Option the view builder reads fields from.
         let status = node_status(rt.as_ref(), now_ts).to_string();
+        let live: Option<&NodeRt> = if status == "online" { rt.as_ref() } else { None };
         let system_info = match meta.map(|m| m.system.clone()) {
             Some(value) if !value.is_null() => value,
             _ => live.as_ref().map(|r| r.system.clone()).unwrap_or(Value::Null),
