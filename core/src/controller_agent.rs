@@ -67,8 +67,7 @@ pub fn spawn(manager: std::sync::Arc<NativeInstanceManager>, settings: Controlle
         }
         tokio::spawn(async {
             let ips = detect_public_ips().await;
-            crate::shared_listener::set_public_ip(ips.0);
-            crate::shared_listener::set_public_ip6(ips.1);
+            publish_public_ips(ips.0, ips.1);
         });
         spawn_bandwidth_prober(manager.clone());
         if let Some(path) = config_path.as_deref() {
@@ -969,6 +968,63 @@ fn fetch_ip(agent: &ureq::Agent, url: &str, version: u8) -> Option<String> {
     parsed
 }
 
+/// Process-wide public-IP cache.
+///
+/// Detection can take a minute on a host whose egress is filtered (the probe
+/// list walks several providers with an 8 s timeout each). The controller
+/// handshake and the first topology snapshot must not wait for it, so the
+/// detector runs in the background and publishes here; `hello()` and the
+/// snapshot read the cache synchronously.
+struct PublicIpCache {
+    v4: std::sync::Mutex<Option<String>>,
+    v6: std::sync::Mutex<Option<String>>,
+    done: std::sync::atomic::AtomicBool,
+    ready: tokio::sync::Notify,
+}
+
+fn public_ip_cache() -> &'static PublicIpCache {
+    static CACHE: std::sync::OnceLock<PublicIpCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| PublicIpCache {
+        v4: std::sync::Mutex::new(None),
+        v6: std::sync::Mutex::new(None),
+        done: std::sync::atomic::AtomicBool::new(false),
+        ready: tokio::sync::Notify::new(),
+    })
+}
+
+/// Publish a finished detection pass: update the cache, the shared-listener
+/// advertisement and wake anyone waiting for the result.
+fn publish_public_ips(v4: Option<String>, v6: Option<String>) {
+    let cache = public_ip_cache();
+    if let Some(ip) = v4.clone().filter(|ip| !ip.is_empty()) {
+        *cache.v4.lock().unwrap() = Some(ip);
+    }
+    if let Some(ip) = v6.clone().filter(|ip| !ip.is_empty()) {
+        *cache.v6.lock().unwrap() = Some(ip);
+    }
+    crate::shared_listener::set_public_ip(v4);
+    crate::shared_listener::set_public_ip6(v6);
+    cache
+        .done
+        .store(true, std::sync::atomic::Ordering::Release);
+    cache.ready.notify_waiters();
+}
+
+/// Current best-known public addresses. Never blocks: an empty result just
+/// means the detector has not finished yet.
+fn cached_public_ips() -> (Option<String>, Option<String>) {
+    let cache = public_ip_cache();
+    let v4 = cache.v4.lock().unwrap().clone();
+    let v6 = cache.v6.lock().unwrap().clone();
+    (v4, v6)
+}
+
+fn public_ip_cache_ready() -> bool {
+    public_ip_cache()
+        .done
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn detect_ip_blocking(version: u8) -> Option<String> {
     // provider list and user agent mirror the Sakuio agent collector; ureq's
     // bundled webpki roots avoid depending on the host CA store
@@ -1151,7 +1207,9 @@ fn spawn_bandwidth_prober(manager: std::sync::Arc<NativeInstanceManager>) {
 }
 
 async fn hello(manager: &NativeInstanceManager, settings: &ControllerSettings) -> Value {
-    let public_ips = detect_public_ips().await;
+    // Synchronous read of the background detector's cache. Awaiting detection
+    // here used to delay the first controller connection by up to a minute.
+    let public_ips = cached_public_ips();
     crate::shared_listener::set_public_ip(public_ips.0.clone());
     let (hostname, version) = match manager.instances().first() {
         Some(instance) => {
@@ -1201,7 +1259,7 @@ async fn session(
     settings: &ControllerSettings,
     config_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    let (public_ipv4, public_ipv6) = detect_public_ips().await;
+    let (public_ipv4, public_ipv6) = cached_public_ips();
     let mut transport = tokio::time::timeout(
         Duration::from_secs(10),
         AgentTransport::connect(&settings.url),
@@ -1253,6 +1311,9 @@ async fn session(
     let interval = Duration::from_secs(settings.interval_secs.max(1));
     let heartbeat_every = Duration::from_secs(settings.heartbeat_secs.max(5));
     let mut last_heartbeat = tokio::time::Instant::now();
+    // The initial snapshot already carried the addresses when detection had
+    // finished before the handshake; otherwise the detector wakes this loop.
+    let mut public_ip_announced = public_ip_cache_ready();
     loop {
         match tokio::time::timeout(interval, transport.recv()).await {
             Ok(Ok(value)) => {
@@ -1288,12 +1349,28 @@ async fn session(
             transport.send(&heartbeat).await?;
             last_heartbeat = tokio::time::Instant::now();
         }
+        // Out-of-band public-IP announcement: the detector runs in the
+        // background so the handshake never waits for it, and this frame
+        // patches the console runtime (address + geo) as soon as it finishes.
+        let (v4_now, v6_now) = cached_public_ips();
+        if !public_ip_announced && public_ip_cache_ready() {
+            if v4_now.is_some() || v6_now.is_some() {
+                let frame = serde_json::json!({
+                    "type": "public_ip",
+                    "node_id": settings.node_id,
+                    "ipv4": v4_now,
+                    "ipv6": v6_now,
+                });
+                transport.send(&cipher.encrypt(&frame)).await?;
+                public_ip_announced = true;
+            }
+        }
         let sig = static_signature(manager).await;
         if sig != last_static_sig {
             let snapshot_frame = serde_json::json!({
                 "type": "snapshot",
                 "node_id": settings.node_id,
-                "data": snapshot(manager, public_ipv4.as_deref(), public_ipv6.as_deref()).await,
+                "data": snapshot(manager, v4_now.as_deref(), v6_now.as_deref()).await,
             });
             transport.send(&cipher.encrypt(&snapshot_frame)).await?;
             last_static_sig = sig;
@@ -1301,7 +1378,7 @@ async fn session(
         let frame = serde_json::json!({
             "type": "metrics",
             "node_id": settings.node_id,
-            "data": metrics(manager, public_ipv4.as_deref(), public_ipv6.as_deref()).await,
+            "data": metrics(manager, v4_now.as_deref(), v6_now.as_deref()).await,
         });
         transport.send(&cipher.encrypt(&frame)).await?;
     }

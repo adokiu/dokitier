@@ -75,6 +75,17 @@ pub trait RelayRouteTransport: Send + Sync {
         dst_peer_id: PeerId,
         policy: NextHopPolicy,
     ) -> Result<(), Error>;
+
+    /// Non-blocking variant used for forwarded data packets. Default keeps the
+    /// old behaviour so alternative transports stay compatible.
+    async fn try_send_msg_to_next_hop(
+        &self,
+        msg: ZCPacket,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Result<(), Error> {
+        self.send_msg_to_next_hop(msg, dst_peer_id, policy).await
+    }
 }
 
 pub struct PeerMapRelayRouteTransport {
@@ -110,6 +121,34 @@ impl RelayRouteTransport for PeerMapRelayRouteTransport {
         if self.peer_map.has_peer(next_hop) {
             self.peer_map.send_msg_directly(msg, next_hop).await
         } else if let Some(foreign_network_client) = &self.foreign_network_client {
+            foreign_network_client.send_msg(msg, next_hop).await
+        } else {
+            Err(Error::RouteError(Some(format!(
+                "next hop not found in direct peer map: {next_hop:?}"
+            ))))
+        }
+    }
+
+    async fn try_send_msg_to_next_hop(
+        &self,
+        msg: ZCPacket,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Result<(), Error> {
+        let Some(next_hop) = self.peer_map.get_gateway_peer_id(dst_peer_id, policy).await else {
+            return Err(Error::RouteError(Some(format!(
+                "next hop not found in route for peer {dst_peer_id:?}"
+            ))));
+        };
+        crate::peers::link_policy::add_link_dst_bytes(
+            next_hop,
+            dst_peer_id,
+            msg.buf_len() as u64,
+        );
+        if self.peer_map.has_peer(next_hop) {
+            self.peer_map.try_send_msg_directly(msg, next_hop)
+        } else if let Some(foreign_network_client) = &self.foreign_network_client {
+            // Foreign-network delivery has no non-blocking queue of its own.
             foreign_network_client.send_msg(msg, next_hop).await
         } else {
             Err(Error::RouteError(Some(format!(
@@ -230,6 +269,39 @@ impl RelayPeerMap {
         self.route_transport
             .send_msg_to_next_hop(msg, dst_peer_id, policy)
             .await
+    }
+
+    async fn try_send_via_next_hop(
+        &self,
+        msg: ZCPacket,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Result<(), Error> {
+        self.route_transport
+            .try_send_msg_to_next_hop(msg, dst_peer_id, policy)
+            .await
+    }
+
+    /// Non-blocking relay send for forwarded **data** packets: the shard worker
+    /// must never park on a congested relay hop. Packets that would need a new
+    /// relay session handshake (or the secure-mode encryption path) fall back to
+    /// the ordinary buffered send.
+    pub async fn try_send_msg(
+        self: &Arc<Self>,
+        msg: ZCPacket,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Result<(), Error> {
+        let is_forwarded = msg
+            .peer_manager_header()
+            .is_some_and(|hdr| hdr.from_peer_id.get() != self.my_peer_id);
+        if !is_forwarded {
+            return self.send_msg(msg, dst_peer_id, policy).await;
+        }
+        if self.is_secure_mode_enabled() {
+            return self.send_msg(msg, dst_peer_id, policy).await;
+        }
+        self.try_send_via_next_hop(msg, dst_peer_id, policy).await
     }
 
     pub async fn send_msg(

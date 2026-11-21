@@ -1,7 +1,16 @@
 name: build
 
-# Full-feature core binaries for every supported platform/architecture.
+# Full-feature binaries for every supported platform/architecture.
 # Triggered by a version tag or manually (workflow_dispatch with a tag input).
+#
+# Release asset naming (standardized):
+#   dokitier-core-<version>-<platform>-<arch>[-<flavor>][.exe]
+#   dokitier-console-<version>-<platform>-<arch>-min[.exe]
+# Examples:
+#   dokitier-core-2.7.15-linux-amd64
+#   dokitier-core-2.7.15-linux-armv7-min-upx    (size-trimmed, UPX)
+#   dokitier-core-2.7.15-linux-armv7-full-upx   (release profile, UPX)
+#   dokitier-console-2.7.15-windows-amd64-min.exe
 on:
   push:
     tags:
@@ -9,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v2.7.13)'
+        description: 'Release tag (e.g. v2.7.15)'
         required: true
 
 permissions:
@@ -52,7 +61,7 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: ${{ matrix.asset }}
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
     needs: webui
     strategy:
       fail-fast: false
@@ -60,41 +69,56 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            asset: dokitier-core-amd64
-            console_asset: dokitier-console-amd64
+            platform: linux
+            arch: amd64
+            ext: ''
             zig: true
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            asset: dokitier-core-arm64
-            console_asset: dokitier-console-arm64
+            platform: linux
+            arch: arm64
+            ext: ''
             zig: true
           - os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
-            asset: dokitier-core-armv7
-            console_asset: dokitier-console-armv7
+            platform: linux
+            arch: armv7
+            ext: ''
             zig: true
             upx: true
           - os: ubuntu-latest
             target: i686-unknown-linux-musl
-            asset: dokitier-core-x86
-            console_asset: dokitier-console-x86
+            platform: linux
+            arch: x86
+            ext: ''
             zig: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: dokitier-core-windows-amd64.exe
-            console_asset: dokitier-console-windows-amd64.exe
+            platform: windows
+            arch: amd64
+            ext: .exe
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: dokitier-core-macos-arm64
-            console_asset: dokitier-console-macos-arm64
+            platform: macos
+            arch: arm64
+            ext: ''
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset: dokitier-core-macos-amd64
-            console_asset: dokitier-console-macos-amd64
+            platform: macos
+            arch: amd64
+            ext: ''
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.allow_failure == true }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: ver
+        shell: bash
+        run: |
+          set -e
+          TAG='${{ inputs.tag || github.ref_name }}'
+          echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Download webui dist
         uses: actions/download-artifact@v4
@@ -131,15 +155,15 @@ jobs:
           pip install ziglang
           cargo install cargo-zigbuild --locked
 
-      - name: Build (full default features, unix)
+      - name: Build core (unix)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          CORE_ASSET: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.ext }}
         run: |
           set -e
-          # Only the size-constrained armv7/OpenWrt asset uses the size profile
-          # (opt-level="z" costs a large part of the data-plane throughput).
-          # Every other target ships the full release profile: opt-level=3,
-          # fat LTO, codegen-units=1 — no size trimming at all.
+          # Size-constrained armv7/OpenWrt uses the tiny profile; every other
+          # target ships the untrimmed release profile (opt-level=3, fat LTO).
           if [ "${{ matrix.upx }}" = "true" ]; then
             PROFILE=tiny
           else
@@ -153,26 +177,29 @@ jobs:
             cargo build --profile $PROFILE -p dokitier --bin dokitier-core \
               --target ${{ matrix.target }}
           fi
-          cp "target/${{ matrix.target }}/$PROFILE/dokitier-core" "${{ matrix.asset }}"
-          ls -l "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/$PROFILE/dokitier-core" "$CORE_ASSET"
+          ls -l "$CORE_ASSET"
 
-      - name: Build (full default features, windows)
+      - name: Build core (windows)
         if: runner.os == 'Windows'
         shell: bash
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          CORE_ASSET: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.ext }}
         run: |
           set -e
           # custom profiles confuse the proto build script on Windows (it looks
           # for a "release"/"debug" path component); use release there.
           cargo build --release -p dokitier --bin dokitier-core \
             --target ${{ matrix.target }}
-          cp "target/${{ matrix.target }}/release/dokitier-core.exe" "${{ matrix.asset }}"
-          ls -l "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/dokitier-core.exe" "$CORE_ASSET"
+          ls -l "$CORE_ASSET"
 
       - name: Build console (unix, embedded webui)
         if: runner.os != 'Windows'
         shell: bash
+        env:
+          CONSOLE_ASSET: dokitier-console-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-min${{ matrix.ext }}
         run: |
           set -e
           test -f web/webui/dist/index.html
@@ -183,70 +210,80 @@ jobs:
             cargo build --profile tiny -p dokitier-console --bin dokitier-console \
               --target ${{ matrix.target }}
           fi
-          cp "target/${{ matrix.target }}/tiny/dokitier-console" "${{ matrix.console_asset }}"
-          ls -l "${{ matrix.console_asset }}"
+          cp "target/${{ matrix.target }}/tiny/dokitier-console" "$CONSOLE_ASSET"
+          ls -l "$CONSOLE_ASSET"
 
       - name: Build console (windows, embedded webui)
         if: runner.os == 'Windows'
         shell: bash
         env:
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          CONSOLE_ASSET: dokitier-console-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-min${{ matrix.ext }}
         run: |
           set -e
           cargo build --release -p dokitier-console --bin dokitier-console \
             --target ${{ matrix.target }}
-          cp "target/${{ matrix.target }}/release/dokitier-console.exe" "${{ matrix.console_asset }}"
-          ls -l "${{ matrix.console_asset }}"
+          cp "target/${{ matrix.target }}/release/dokitier-console.exe" "$CONSOLE_ASSET"
+          ls -l "$CONSOLE_ASSET"
 
-      - name: Build armv7 performance variant (release-fast + UPX)
+      - name: Build armv7 full variant (release + UPX)
         if: ${{ matrix.upx }}
         shell: bash
+        env:
+          FULL_ASSET: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-full-upx${{ matrix.ext }}
         run: |
           set -e
           cargo zigbuild --profile release -p dokitier --bin dokitier-core \
             --target ${{ matrix.target }}
-          cp "target/${{ matrix.target }}/release/dokitier-core" dokitier-core-armv7-perf
-          if upx --best --lzma -o dokitier-core-armv7-perf.upx dokitier-core-armv7-perf; then
-            mv dokitier-core-armv7-perf.upx dokitier-core-armv7-perf
+          cp "target/${{ matrix.target }}/release/dokitier-core" "$FULL_ASSET"
+          if upx --best --lzma -o "$FULL_ASSET.upx" "$FULL_ASSET"; then
+            mv "$FULL_ASSET.upx" "$FULL_ASSET"
           else
-            rm -f dokitier-core-armv7-perf.upx
+            echo "::warning::upx could not pack the full armv7 build"
+            rm -f "$FULL_ASSET.upx"
           fi
-          ls -l dokitier-core-armv7-perf
+          ls -l "$FULL_ASSET"
 
-      - name: Upload armv7 performance artifact
+      - name: Upload armv7 full artifact
         if: ${{ matrix.upx }}
         uses: actions/upload-artifact@v4
         with:
-          name: dokitier-core-armv7-perf
-          path: dokitier-core-armv7-perf
+          name: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-full-upx${{ matrix.ext }}
+          path: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-full-upx${{ matrix.ext }}
           if-no-files-found: error
 
       - name: Compress armv7 with UPX (OpenWrt flash budget)
         if: ${{ matrix.upx }}
         shell: bash
+        env:
+          CORE_ASSET: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.ext }}
         run: |
           set -e
-          cp "${{ matrix.asset }}" "${{ matrix.asset }}.raw"
-          if upx --best --lzma -o "${{ matrix.asset }}.upx" "${{ matrix.asset }}.raw"; then
-            mv "${{ matrix.asset }}.upx" "${{ matrix.asset }}"
+          MIN_ASSET="dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-min-upx${{ matrix.ext }}"
+          cp "$CORE_ASSET" "$CORE_ASSET.raw"
+          if upx --best --lzma -o "$CORE_ASSET.upx" "$CORE_ASSET.raw"; then
+            mv "$CORE_ASSET.upx" "$MIN_ASSET"
+            rm -f "$CORE_ASSET" "$CORE_ASSET.raw"
           else
             echo "::warning::upx could not pack this ELF; shipping the uncompressed binary"
-            rm -f "${{ matrix.asset }}.upx"
+            rm -f "$CORE_ASSET.upx"
+            mv "$CORE_ASSET" "$MIN_ASSET"
+            rm -f "$CORE_ASSET.raw"
           fi
-          ls -l "${{ matrix.asset }}" "${{ matrix.asset }}.raw"
+          ls -l "$MIN_ASSET"
 
-      - name: Upload artifact
+      - name: Upload core artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.upx && '-min-upx' || '' }}${{ matrix.ext }}
+          path: dokitier-core-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.upx && '-min-upx' || '' }}${{ matrix.ext }}
           if-no-files-found: error
 
       - name: Upload console artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.console_asset }}
-          path: ${{ matrix.console_asset }}
+          name: dokitier-console-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-min${{ matrix.ext }}
+          path: dokitier-console-${{ steps.ver.outputs.value }}-${{ matrix.platform }}-${{ matrix.arch }}-min${{ matrix.ext }}
           if-no-files-found: error
 
   release:

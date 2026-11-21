@@ -1,5 +1,5 @@
 use crate::{config::EncryptionAlgorithm, packet::ZCPacket};
-use std::{collections::hash_map::DefaultHasher, hash::Hasher, sync::Arc};
+use std::sync::Arc;
 
 #[cfg(feature = "aes-gcm")]
 #[cfg_attr(
@@ -57,30 +57,34 @@ struct UnsupportedCipher {
     unavailable: bool,
 }
 
+/// Domain-separated SHA-256 key derivation.
+///
+/// The previous implementation used `std::collections::hash_map::DefaultHasher`
+/// (SipHash-1-3). Its output is an implementation detail of the standard
+/// library: it is not a stable contract across Rust releases, so two builds of
+/// the same node could derive different keys from the same network secret —
+/// a fleet-wide silent decryption failure after a toolchain bump. SHA-256 is a
+/// fixed, well-defined function and is safe to depend on.
+fn derive_key(secret: &str, domain: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"dokitier-network-secret-v1");
+    hasher.update((domain.len() as u32).to_be_bytes());
+    hasher.update(domain);
+    hasher.update((secret.len() as u64).to_be_bytes());
+    hasher.update(secret.as_bytes());
+    hasher.finalize().into()
+}
+
 pub fn derive_key_128(secret: &str) -> [u8; 16] {
+    let digest = derive_key(secret, b"aes128");
     let mut key = [0u8; 16];
-    let mut hasher = DefaultHasher::new();
-    hasher.write(secret.as_bytes());
-    key[0..8].copy_from_slice(&hasher.finish().to_be_bytes());
-    hasher.write(&key[0..8]);
-    key[8..16].copy_from_slice(&hasher.finish().to_be_bytes());
-    hasher.write(&key);
+    key.copy_from_slice(&digest[..16]);
     key
 }
 
 pub fn derive_key_256(secret: &str) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    let mut hasher = DefaultHasher::new();
-    hasher.write(secret.as_bytes());
-    hasher.write(b"dokitier-256bit-key");
-    for i in 0..4 {
-        let chunk_start = i * 8;
-        let chunk_end = chunk_start + 8;
-        hasher.write(&key[0..chunk_start]);
-        hasher.write(&[i as u8]);
-        key[chunk_start..chunk_end].copy_from_slice(&hasher.finish().to_be_bytes());
-    }
-    key
+    derive_key(secret, b"aes256")
 }
 
 impl Encryptor for NullCipher {
@@ -342,14 +346,14 @@ mod tests {
         assert_eq!(
             derive_key_128("secret"),
             [
-                86, 90, 25, 219, 78, 240, 193, 33, 168, 172, 88, 14, 218, 248, 78, 166,
+                2, 206, 42, 192, 32, 157, 49, 107, 163, 60, 45, 18, 4, 252, 117, 40,
             ]
         );
         assert_eq!(
             derive_key_256("secret"),
             [
-                199, 205, 248, 94, 194, 101, 97, 138, 79, 69, 167, 248, 140, 5, 165, 163, 192, 139,
-                166, 217, 166, 152, 28, 230, 146, 109, 150, 196, 66, 242, 231, 140,
+                107, 17, 127, 149, 213, 198, 67, 158, 152, 97, 93, 210, 152, 104, 19, 110, 119,
+                201, 239, 74, 160, 127, 3, 243, 98, 125, 135, 170, 175, 33, 208, 167,
             ]
         );
     }

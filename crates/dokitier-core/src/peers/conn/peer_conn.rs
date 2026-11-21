@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -271,6 +271,56 @@ impl PeerConnCloseNotify {
     }
 }
 
+/// Last-resort liveness backstop for a peer connection.
+///
+/// The ping/pong loop already closes a connection after consecutive failures,
+/// and transport errors close it immediately. This covers the case where that
+/// loop itself stops making progress (blocked sink, missed notification): if
+/// nothing at all is received for `RX_IDLE_LIMIT` the connection is declared
+/// dead so the connector re-dials instead of keeping a half-open tunnel alive
+/// forever.
+struct ConnWatchdog {
+    last_rx_ms: AtomicU64,
+    closed: AtomicBool,
+}
+
+/// A healthy idle connection still exchanges ping/pong at least every 32 s
+/// (`max_ping_interval`), so 120 s of complete silence means dead.
+const RX_IDLE_LIMIT: Duration = Duration::from_secs(120);
+const WATCHDOG_TICK: Duration = Duration::from_secs(10);
+
+fn monotonic_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<crate::foundation::time::Instant> =
+        std::sync::OnceLock::new();
+    EPOCH.get_or_init(crate::foundation::time::Instant::now).elapsed().as_millis() as u64
+}
+
+impl ConnWatchdog {
+    fn new() -> Self {
+        Self {
+            last_rx_ms: AtomicU64::new(monotonic_ms()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn touch_rx(&self) {
+        self.last_rx_ms
+            .store(monotonic_ms(), Ordering::Relaxed);
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn rx_idle(&self) -> Duration {
+        Duration::from_millis(monotonic_ms().saturating_sub(self.last_rx_ms.load(Ordering::Relaxed)))
+    }
+}
+
 pub struct PeerConn {
     conn_id: PeerConnId,
     origin: PeerConnectionOrigin,
@@ -297,6 +347,7 @@ pub struct PeerConn {
     remote_p2p_group: String,
 
     close_event_notifier: Arc<PeerConnCloseNotify>,
+    watchdog: Arc<ConnWatchdog>,
 
     ctrl_resp_sender: broadcast::Sender<ZCPacket>,
 
@@ -399,6 +450,7 @@ impl PeerConn {
             remote_p2p_group: String::new(),
 
             close_event_notifier: Arc::new(PeerConnCloseNotify::new(conn_id)),
+            watchdog: Arc::new(ConnWatchdog::new()),
 
             ctrl_resp_sender: ctrl_sender,
 
@@ -1311,6 +1363,7 @@ impl PeerConn {
         let sink = self.sink.clone();
         let sender = packet_recv_chan.clone();
         let close_event_notifier = self.close_event_notifier.clone();
+        let watchdog = self.watchdog.clone();
         let ctrl_sender = self.ctrl_resp_sender.clone();
         let conn_info_for_instrument = self.get_conn_info();
         let context = self.context.clone();
@@ -1339,6 +1392,7 @@ impl PeerConn {
                     }
 
                     let mut zc_packet = ret.unwrap();
+                    watchdog.touch_rx();
                     let buf_len = zc_packet.buf_len() as u64;
                     if let Some(payload_len) = data_packet_payload_len(&zc_packet)
                         && let Some(limiter) = recv_limiter.as_ref()
@@ -1367,11 +1421,10 @@ impl PeerConn {
                         if let Err(e) = ctrl_sender.send(zc_packet) {
                             tracing::error!(?e, "peer conn send ctrl resp error");
                         }
-                    } else if send_peer_packet_to_chan(&sender, zc_packet, ingress)
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    } else if send_peer_packet_to_chan(&sender, zc_packet, ingress).is_err() {
+                        // Router queue full: drop this packet but keep the
+                        // connection (and every other flow) moving.
+                        continue;
                     }
                 }
 
@@ -1407,6 +1460,36 @@ impl PeerConn {
         let close_event_notifier = self.close_event_notifier.clone();
         let conn_id = self.conn_id;
 
+        // Independent RX-idle backstop: if the ping/pong loop itself stops
+        // making progress (blocked sink, lost notification), nothing else would
+        // ever declare this half-open tunnel dead and the connector would keep
+        // treating it as alive. Any received packet resets the timer; a healthy
+        // idle link still exchanges ping/pong within 32 s.
+        {
+            let watchdog = self.watchdog.clone();
+            let close_notifier = self.close_event_notifier.clone();
+            self.tasks.spawn(async move {
+                loop {
+                    crate::foundation::time::sleep(WATCHDOG_TICK).await;
+                    if close_notifier.is_closed() || watchdog.is_closed() {
+                        break;
+                    }
+                    let idle = watchdog.rx_idle();
+                    if idle > RX_IDLE_LIMIT {
+                        tracing::warn!(
+                            ?conn_id,
+                            idle_secs = idle.as_secs(),
+                            "peer conn rx idle watchdog: closing half-open connection"
+                        );
+                        watchdog.mark_closed();
+                        close_notifier.notify_close();
+                        break;
+                    }
+                }
+                Ok(())
+            });
+        }
+
         self.tasks.spawn(
             async move {
                 pingpong.pingpong().await;
@@ -1427,6 +1510,27 @@ impl PeerConn {
             return Err(error.into());
         }
         Ok(())
+    }
+
+    /// Non-blocking send for the forwarding hot path.
+    ///
+    /// A congested peer must never stall the packet router: with the async
+    /// `send_msg` a full per-connection queue parks the caller until the
+    /// transport drains, which serializes every other flow behind one slow
+    /// link. Data packets are droppable by definition, so the data plane uses
+    /// this variant and lets the congestion surface as a link-loss metric that
+    /// the SPF cost model routes around.
+    pub fn try_send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
+        match self.sink.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(crate::tunnel::TunnelError::BufferFull) => {
+                Err(Error::Tunnel(crate::tunnel::TunnelError::BufferFull))
+            }
+            Err(_) => {
+                self.close_event_notifier.notify_close();
+                Err(Error::PeerNoConnectionError(self.get_peer_id()))
+            }
+        }
     }
 
     pub fn get_remote_p2p_group(&self) -> &str {

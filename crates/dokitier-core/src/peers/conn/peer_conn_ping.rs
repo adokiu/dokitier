@@ -332,7 +332,14 @@ impl PeerConnPinger {
             // RoutePeerInfo flood (peer-center replacement for cost inputs).
             let latency_ms: i32 =
                 (self.latency_stats.get_latency_us::<u32>() / 1000) as i32;
-            let loss_perm = (loss_rate_1 * 1000.0).clamp(0.0, 1000.0) as u32;
+            let mut loss_perm = (loss_rate_1 * 1000.0).clamp(0.0, 1000.0) as u32;
+            // Fold in data-plane congestion observed since the last round: a
+            // full per-connection queue is a signal for the SPF cost model to
+            // route around this link, and it is invisible in pong loss.
+            let congestion = crate::peers::link_policy::take_tx_congestion(self.peer_id);
+            if congestion > 0 {
+                loss_perm = loss_perm.max((congestion.min(50) * 20) as u32).min(1000);
+            }
             crate::peers::link_policy::set_conn_metric(self.peer_id, latency_ms, loss_perm);
 
             tracing::trace!(

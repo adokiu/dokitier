@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use quanta::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
-    Mutex, RwLock,
+    Mutex,
     mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 use tokio::task::JoinSet;
@@ -817,7 +817,7 @@ pub(crate) struct PeerManagerTrafficCounters {
 pub struct PeerManagerCore {
     my_peer_id: PeerId,
     tasks: Mutex<JoinSet<()>>,
-    packet_recv: Arc<Mutex<Option<PacketRecvChanReceiver>>>,
+    packet_recv: Arc<Mutex<Option<Vec<PacketRecvChanReceiver>>>>,
     peers: Arc<PeerMap>,
     peer_rpc_mgr: Arc<super::peer_rpc::PeerRpcManager>,
     peer_rpc_tspt: Arc<RpcTransport>,
@@ -834,7 +834,7 @@ pub struct PeerManagerCore {
     peer_session_store: Arc<PeerSessionStore>,
     encryptor: Arc<dyn Encryptor + 'static>,
     data_compress_algo: CompressorAlgo,
-    exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
+    exit_nodes: Arc<ArcSwap<Vec<IpAddr>>>,
     acl_filter: Arc<AclFilter>,
     context: Arc<CorePeerContext>,
     runtime_config: CoreRuntimeConfigStore,
@@ -1037,7 +1037,21 @@ impl PeerManagerCore {
         let stats_manager = core_context.stats_manager();
         let acl_filter = Arc::new(AclFilter::new());
         let context: ArcPeerContext = core_context.clone();
-        let (packet_send, packet_recv) = super::create_packet_recv_chan();
+        // One router worker per CPU (capped): a slow forwarding decision or a
+        // congested peer must not head-of-line block unrelated flows. Flows are
+        // hashed to a worker by (from,to), so per-pair ordering is preserved.
+        // `DOKITIER_ROUTER_SHARDS` overrides the count (diagnostics / tests).
+        let router_shards = std::env::var("DOKITIER_ROUTER_SHARDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|shards| *shards > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .clamp(1, 8)
+            });
+        let (packet_send, packet_recv) = super::create_sharded_packet_recv_chan(router_shards);
         let peers = Arc::new(PeerMap::new(
             packet_send.clone(),
             context.clone(),
@@ -1156,7 +1170,7 @@ impl PeerManagerCore {
         ));
         let peer_packet_process_pipeline = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let nic_packet_process_pipeline = Arc::new(ArcSwap::from_pointee(Vec::new()));
-        let exit_nodes = Arc::new(RwLock::new(exit_nodes));
+        let exit_nodes = Arc::new(ArcSwap::from_pointee(exit_nodes));
         let relay_peer_map = super::relay_peer_map::new_relay_peer_map(
             peers.clone(),
             Some(foreign_network_client.clone()),
@@ -1874,7 +1888,7 @@ impl PeerManagerCore {
     }
 
     pub async fn update_exit_nodes(&self, exit_nodes: Vec<IpAddr>) {
-        *self.exit_nodes.write().await = exit_nodes;
+        self.exit_nodes.store(std::sync::Arc::new(exit_nodes));
     }
 
     /// Shares the network's current exit nodes, including later updates, while
@@ -1940,34 +1954,36 @@ impl PeerManagerCore {
     }
 
     async fn start_peer_recv(&self) {
-        let packet_recv = self.packet_recv.lock().await.take().unwrap();
+        let packet_recvs = self.packet_recv.lock().await.take().unwrap();
         let is_credential_node =
             self.context.network_identity().network_secret.is_none() && self.is_secure_mode_enabled;
-        let router = PeerPacketRouter::new(
-            packet_recv,
-            self.my_peer_id,
-            self.peers.clone(),
-            self.peer_packet_process_pipeline.clone(),
-            self.foreign_network_client.clone(),
-            self.relay_peer_map.clone(),
-            self.foreign_network_manager.clone(),
-            self.encryptor.clone(),
-            self.data_compress_algo,
-            self.acl_filter.clone(),
-            self.context.clone(),
-            self.is_secure_mode_enabled,
-            self.route.clone(),
-            is_credential_node,
-            self.traffic_metrics.clone(),
-            self.context.stats_manager(),
-            self.network_name.clone(),
-            self.counters.self_tx_packets.clone(),
-            self.counters.self_tx_bytes.clone(),
-            self.counters.compress_tx_bytes_before.clone(),
-            self.counters.compress_tx_bytes_after.clone(),
-        );
+        for packet_recv in packet_recvs {
+            let router = PeerPacketRouter::new(
+                packet_recv,
+                self.my_peer_id,
+                self.peers.clone(),
+                self.peer_packet_process_pipeline.clone(),
+                self.foreign_network_client.clone(),
+                self.relay_peer_map.clone(),
+                self.foreign_network_manager.clone(),
+                self.encryptor.clone(),
+                self.data_compress_algo,
+                self.acl_filter.clone(),
+                self.context.clone(),
+                self.is_secure_mode_enabled,
+                self.route.clone(),
+                is_credential_node,
+                self.traffic_metrics.clone(),
+                self.context.stats_manager(),
+                self.network_name.clone(),
+                self.counters.self_tx_packets.clone(),
+                self.counters.self_tx_bytes.clone(),
+                self.counters.compress_tx_bytes_before.clone(),
+                self.counters.compress_tx_bytes_after.clone(),
+            );
 
-        self.tasks.lock().await.spawn(router.run());
+            self.tasks.lock().await.spawn(router.run());
+        }
     }
 
     pub(crate) async fn run(&self) -> Result<(), Error> {
@@ -2568,7 +2584,7 @@ pub(crate) struct PeerOutboundPacketRouter {
     nic_packet_process_pipeline: NicPacketPipeline,
     encryptor: Arc<dyn Encryptor>,
     data_compress_algo: CompressorAlgo,
-    exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
+    exit_nodes: Arc<ArcSwap<Vec<IpAddr>>>,
     recent_traffic: RecentTrafficTracker,
     traffic_metrics: Arc<TrafficMetricRecorder>,
     acl_filter: Arc<AclFilter>,
@@ -2588,7 +2604,7 @@ impl PeerOutboundPacketRouter {
         nic_packet_process_pipeline: NicPacketPipeline,
         encryptor: Arc<dyn Encryptor>,
         data_compress_algo: CompressorAlgo,
-        exit_nodes: Arc<RwLock<Vec<IpAddr>>>,
+        exit_nodes: Arc<ArcSwap<Vec<IpAddr>>>,
         recent_traffic: RecentTrafficTracker,
         traffic_metrics: Arc<TrafficMetricRecorder>,
         acl_filter: Arc<AclFilter>,
@@ -2845,7 +2861,7 @@ impl PeerOutboundPacketRouter {
             .context
             .is_ip_in_same_network(&std::net::IpAddr::V4(*ipv4_addr))
         {
-            for exit_node in self.exit_nodes.read().await.iter() {
+            for exit_node in self.exit_nodes.load().iter() {
                 let IpAddr::V4(exit_node) = exit_node else {
                     continue;
                 };
@@ -2885,7 +2901,7 @@ impl PeerOutboundPacketRouter {
             dst_peers.push(peer_id);
         } else if !ipv6_addr.is_unicast_link_local() {
             // NOTE: never route link local address to exit node.
-            for exit_node in self.exit_nodes.read().await.iter() {
+            for exit_node in self.exit_nodes.load().iter() {
                 let IpAddr::V6(exit_node) = exit_node else {
                     continue;
                 };
@@ -2958,7 +2974,7 @@ impl PeerOutboundPacketRouter {
 
         if dst_peers.is_empty() {
             if diag_sample() {
-                let runtime_exit_nodes = self.exit_nodes.read().await.clone();
+                let runtime_exit_nodes = self.exit_nodes.load().to_vec();
                 tracing::info!(
                     target: "CORE",
                     dst = %ip_addr,
@@ -3729,7 +3745,25 @@ pub(crate) async fn send_msg_internal(
     // connected to fall back to gateway resolution.
     let send_result = if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
         crate::peers::link_policy::add_link_dst_bytes(dst_peer_id, dst_peer_id, msg_len);
-        peer.send_msg(msg).await
+        // Data packets are droppable and must never block the router on a
+        // congested link; control/RPC packets keep the awaiting send because
+        // their callers already apply a timeout and expect delivery.
+        if packet_type == PacketType::Data as u8 {
+            match peer.try_send_msg(msg) {
+                Ok(()) => Ok(()),
+                Err(crate::peers::error::Error::Tunnel(
+                    crate::tunnel::TunnelError::BufferFull,
+                )) => {
+                    crate::peers::link_policy::record_tx_congestion(dst_peer_id);
+                    Err(crate::peers::error::Error::Tunnel(
+                        crate::tunnel::TunnelError::BufferFull,
+                    ))
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            peer.send_msg(msg).await
+        }
     } else if peers.is_self(dst_peer_id) {
         peers.send_msg_directly(msg, dst_peer_id).await
     } else if foreign_network_client.has_next_hop(dst_peer_id) {
@@ -3738,9 +3772,18 @@ pub(crate) async fn send_msg_internal(
         if gateway != dst_peer_id
             && (peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway))
         {
-            relay_peer_map
-                .send_msg(msg, dst_peer_id, gateway_policy)
-                .await
+            // Forwarded data must not park the shard worker on a congested
+            // relay hop; control/RPC keeps the buffered send (it has its own
+            // timeout and expects delivery).
+            if packet_type == PacketType::Data as u8 {
+                relay_peer_map
+                    .try_send_msg(msg, dst_peer_id, gateway_policy)
+                    .await
+            } else {
+                relay_peer_map
+                    .send_msg(msg, dst_peer_id, gateway_policy)
+                    .await
+            }
         } else if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
             peer.send_msg(msg).await
         } else {

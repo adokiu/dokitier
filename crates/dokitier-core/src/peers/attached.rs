@@ -576,6 +576,12 @@ mod tests {
             host_routing: HostRoutingPolicy::default(),
         };
         let mut portable = PortablePeerManagerConfig::new(runtime);
+        // A peer id is derived from the persisted instance id, so two test
+        // managers built from the same snapshot would claim the same identity —
+        // exactly what a real deployment prevents by giving every node its own
+        // instance id. Give each manager its own.
+        portable.snapshot.runtime.core.node.instance_id =
+            Some(*uuid::Uuid::new_v4().as_bytes());
         portable.snapshot.acl_group_declarations = vec![PeerGroupIdentity {
             group_name: "ops".to_owned(),
             group_secret: "ops-secret".to_owned(),
@@ -630,6 +636,10 @@ mod tests {
         address: Ipv4Addr,
     ) -> (Arc<PeerManagerCore>, HostPacketReceiver) {
         let mut snapshot = store.snapshot().peer.as_ref().clone();
+        // The exit peer is a separate node: it must not inherit the network's
+        // persisted identity (peer id is derived from the instance id).
+        snapshot.runtime.core.node.peer_id = None;
+        snapshot.runtime.core.node.instance_id = None;
         snapshot.runtime.core.routes.ipv4 = Some(IpPrefix {
             address: address.into(),
             prefix_len: 24,
@@ -801,7 +811,7 @@ mod tests {
         address: Ipv4Addr,
         present: bool,
     ) {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let waited = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let found = peer.list_route_snapshots().await.iter().any(|route| {
                     route.peer_id == attached_peer_id

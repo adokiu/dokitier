@@ -42,9 +42,29 @@ pub struct MpscTunnel<T> {
     task: JoinHandle<()>,
 }
 
+/// Per-connection send queue depth.
+///
+/// 32 was far too small: a single 100 ms scheduling hiccup inside the writer
+/// task filled it, the data path then either blocked on `send().await` or
+/// dropped, and TCP throughput collapsed while the CPU idled. The queue is a
+/// plain bounded channel of `ZCPacket` (packet headers are zero-copy), so a
+/// deeper queue costs only pointers.
+const SEND_QUEUE_DEPTH: usize = 2048;
+
 impl<T: Tunnel> MpscTunnel<T> {
+    /// Queue depth for a connection. 2048 covers a ~100 Mbit/s link at a 200 ms
+    /// RTT; high-throughput links can raise it with
+    /// `DOKITIER_SEND_QUEUE_DEPTH` instead of rebuilding.
+    fn send_queue_depth() -> usize {
+        std::env::var("DOKITIER_SEND_QUEUE_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|depth| *depth >= 64)
+            .unwrap_or(SEND_QUEUE_DEPTH)
+    }
+
     pub fn new(tunnel: T, send_timeout: Option<Duration>) -> Self {
-        let (tx, mut rx) = channel(32);
+        let (tx, mut rx) = channel(Self::send_queue_depth());
         let (stream, mut sink) = tunnel.split();
 
         let task = tokio::spawn(async move {

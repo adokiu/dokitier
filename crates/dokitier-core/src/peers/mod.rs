@@ -27,6 +27,7 @@ pub(crate) mod test_support;
 mod tests;
 
 use crate::packet::ZCPacket;
+use std::sync::Arc;
 use tokio::sync::mpsc::error::{SendError, TryRecvError, TrySendError};
 
 use self::conn::peer_conn::PeerConnId;
@@ -111,17 +112,49 @@ impl PeerPacketEnvelope {
     }
 }
 
+/// Fan-in to the packet router.
+///
+/// The router runs one worker per shard so a single slow packet (route
+/// resolution for a relayed destination, RPC-triggering control packet, a
+/// congested peer) cannot head-of-line block every other flow. Sharding is by
+/// `(from_peer_id, to_peer_id)` so all packets of one peer pair stay ordered in
+/// one worker — the protocols above (KCP/QUIC/TCP-over-tunnel) rely on that.
 #[derive(Clone)]
-pub struct PacketRecvChan(tokio::sync::mpsc::Sender<PeerPacketEnvelope>);
+pub struct PacketRecvChan(Arc<Vec<tokio::sync::mpsc::Sender<PeerPacketEnvelope>>>);
+
+/// Per-queue depth. These queues sit between the connection read loops and the
+/// router workers; they absorb bursts without ever parking a read loop.
+const ROUTER_QUEUE_DEPTH: usize = 1024;
 
 impl PacketRecvChan {
+    fn shard_for(&self, packet: &ZCPacket) -> usize {
+        if self.0.len() <= 1 {
+            return 0;
+        }
+        let header = packet.peer_manager_header();
+        let key = header
+            .map(|h| (h.from_peer_id.get() as u64) << 32 | h.to_peer_id.get() as u64)
+            .unwrap_or(0);
+        // Fibonacci hashing: cheap, and adjacent peer ids do not collide.
+        ((key.wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 32) as usize % self.0.len()
+    }
+
     /// Injects a packet produced by a local subsystem. Local injection never carries
     /// the privileges of an attached peer connection.
     pub async fn send(&self, packet: ZCPacket) -> Result<(), SendError<ZCPacket>> {
-        self.0
+        let shard = self.shard_for(&packet);
+        self.0[shard]
             .send(PeerPacketEnvelope::local(packet))
             .await
             .map_err(|error| SendError(error.0.packet))
+    }
+
+    fn try_send_envelope(
+        &self,
+        envelope: PeerPacketEnvelope,
+    ) -> Result<(), TrySendError<PeerPacketEnvelope>> {
+        let shard = self.shard_for(&envelope.packet);
+        self.0[shard].try_send(envelope)
     }
 }
 
@@ -134,23 +167,53 @@ impl PacketRecvChanReceiver {
 }
 
 pub fn create_packet_recv_chan() -> (PacketRecvChan, PacketRecvChanReceiver) {
-    let (sender, receiver) = tokio::sync::mpsc::channel(128);
-    (PacketRecvChan(sender), PacketRecvChanReceiver(receiver))
+    let (sender, receivers) = create_sharded_packet_recv_chan(1);
+    (sender, receivers.into_iter().next().expect("one shard"))
 }
 
-pub(crate) async fn send_peer_packet_to_chan(
+/// Router fan-in with `shards` independent queues. Each receiver is drained by
+/// its own worker (see `PeerManager::start_peer_recv`).
+pub fn create_sharded_packet_recv_chan(
+    shards: usize,
+) -> (PacketRecvChan, Vec<PacketRecvChanReceiver>) {
+    let shards = shards.max(1);
+    let mut senders = Vec::with_capacity(shards);
+    let mut receivers = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        let (sender, receiver) = tokio::sync::mpsc::channel(ROUTER_QUEUE_DEPTH);
+        senders.push(sender);
+        receivers.push(PacketRecvChanReceiver(receiver));
+    }
+    (PacketRecvChan(Arc::new(senders)), receivers)
+}
+
+/// Packets dropped because the router queue was full.
+///
+/// Exposed for the metrics frame and the 1-in-64 diagnostic log; the data path
+/// only does one relaxed increment when it happens.
+pub static ROUTER_QUEUE_FULL_DROPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Hand a packet to the router.
+///
+/// This is the upstream edge of the data plane, so it must never park: the
+/// previous `send().await` fallback propagated backpressure from a busy router
+/// into every connection read loop, which in turn stalled unrelated flows.
+/// When the bounded queue is full the packet is dropped (data traffic is
+/// droppable by definition) and the drop is counted so congestion is visible
+/// instead of silently blocking.
+pub(crate) fn send_peer_packet_to_chan(
     sender: &PacketRecvChan,
     packet: ZCPacket,
     ingress: PeerPacketIngress,
 ) -> Result<(), SendError<ZCPacket>> {
     let envelope = PeerPacketEnvelope::from_peer(packet, ingress);
-    match sender.0.try_send(envelope) {
+    match sender.try_send_envelope(envelope) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(envelope)) => sender
-            .0
-            .send(envelope)
-            .await
-            .map_err(|error| SendError(error.0.packet)),
+        Err(TrySendError::Full(envelope)) => {
+            ROUTER_QUEUE_FULL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(SendError(envelope.packet))
+        }
         Err(TrySendError::Closed(envelope)) => Err(SendError(envelope.packet)),
     }
 }

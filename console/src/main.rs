@@ -968,7 +968,19 @@ async fn lookup_and_store_geo(state: AppState, node_id: String, ip: String) {
     let provider = get_setting(&state.db, "geo_provider")
         .await
         .unwrap_or_else(|| DEFAULT_GEO_PROVIDER.to_string());
-    let Some(info) = fetch_geo(&client, &provider, &ip).await else {
+    // The configured provider can be rate limited or go paid-only (ipapi.co
+    // started returning HTTP 429 for everyone).  Fall back through the other
+    // known providers so a node is not left permanently flag-less.
+    let mut info = fetch_geo(&client, &provider, &ip).await;
+    if info.is_none() {
+        for fallback in GEO_PROVIDERS.iter().filter(|p| **p != provider) {
+            if let Some(found) = fetch_geo(&client, fallback, &ip).await {
+                info = Some(found);
+                break;
+            }
+        }
+    }
+    let Some(info) = info else {
         // Provider hiccup (rate limit / timeout / Chinese endpoint): forget the
         // attempt stamp so the next snapshot retries instead of leaving the node
         // flag-less until the console restarts.
@@ -2455,6 +2467,16 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
                 if !hostname.is_empty() { rt.hostname = hostname.clone(); }
                 if !version.is_empty() { rt.version = version.clone(); }
                 if !networks.is_empty() { rt.networks = Value::Array(networks.clone()); }
+                // Keep the announced addresses in the runtime registry too: the
+                // snapshot path uses rt.public_ipv4/ipv6 to retry geo resolution
+                // when the first attempt failed, and without these it can never
+                // see an address and the node keeps an empty flag forever.
+                if public_ipv4.as_deref().filter(|v| !v.is_empty()).is_some() {
+                    rt.public_ipv4 = public_ipv4.clone();
+                }
+                if public_ipv6.as_deref().filter(|v| !v.is_empty()).is_some() {
+                    rt.public_ipv6 = public_ipv6.clone();
+                }
                 rt.online = true;
                 rt.last_seen = now();
             }
@@ -2491,6 +2513,9 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
                 });
             }
             if let Some(ip) = public_ipv4.clone().or(public_ipv6.clone()) {
+                // a fresh handshake must resolve immediately instead of waiting
+                // out the snapshot cool-down of a previous failed attempt
+                state.geo_attempts.remove(&node_id);
                 let id = node_id.clone();
                 let state_for_geo = state.clone();
                 tokio::spawn(async move { lookup_and_store_geo(state_for_geo, id, ip).await });
@@ -2528,6 +2553,38 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
         AgentFrame::Metrics { node_id, data } => {
             let expanded = expand_metrics(&data);
             apply_metrics_to_rt(state, &node_id, &expanded);
+            Ok(())
+        }
+        AgentFrame::PublicIp { node_id, ipv4, ipv6 } => {
+            // Out-of-band address announcement: the agent's detector runs in
+            // the background (it can take a minute on filtered egress), so the
+            // address arrives after the handshake. Patch the runtime entry and
+            // persist it; do NOT touch the static topology snapshot here, it is
+            // owned by the Snapshot frame.
+            let v4 = ipv4.filter(|ip| !ip.is_empty());
+            let v6 = ipv6.filter(|ip| !ip.is_empty());
+            if v4.is_none() && v6.is_none() {
+                return Ok(());
+            }
+            if let Some(mut rt) = state.node_rt.get_mut(&node_id) {
+                if v4.is_some() {
+                    rt.public_ipv4 = v4.clone();
+                }
+                if v6.is_some() {
+                    rt.public_ipv6 = v6.clone();
+                }
+                rt.online = true;
+                rt.last_seen = now();
+            }
+            update_public_ip(&state.db, &node_id, v4.as_deref(), v6.as_deref()).await;
+            // Geo/flag resolution is what actually needs the address; clear the
+            // cool-down so this announcement resolves immediately.
+            state.geo_attempts.remove(&node_id);
+            if let Some(ip) = v4.or(v6) {
+                let state_for_geo = state.clone();
+                let id = node_id.clone();
+                tokio::spawn(async move { lookup_and_store_geo(state_for_geo, id, ip).await });
+            }
             Ok(())
         }
         AgentFrame::Result { node_id, .. } => {
@@ -3768,13 +3825,32 @@ async fn quic_accept_loop(state: AppState, endpoint: quinn::Endpoint) {
             tracing::info!(remote = ?conn.remote_address(), "quic agent connected");
             let Ok((mut send, mut recv)) = conn.accept_bi().await else { eprintln!("quic stream open failed"); return };
             eprintln!("quic stream accepted");
-            let Ok(_start) = read_frame(&mut recv).await else { eprintln!("quic start frame missing"); return; };
+            match tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut recv)).await {
+                Ok(Ok(start)) => eprintln!("quic start frame ok: {start}"),
+                Ok(Err(err)) => { eprintln!("quic start frame read failed: {err}"); return; }
+                Err(_) => { eprintln!("quic start frame timeout"); return; }
+            }
             let nonce = uuid::Uuid::new_v4().to_string();
             let ts = now();
-            if write_frame(&mut send, &json!({"type":"challenge","nonce":nonce,"ts":ts})).await.is_err() { return; }
-            let Ok(hello) = read_frame(&mut recv).await else { return };
-            let Ok(frame) = serde_json::from_value::<AgentFrame>(hello) else { return };
-            let AgentFrame::Hello { node_id, proof: client_proof, hostname, version, networks, .. } = &frame else { return };
+            if let Err(err) = write_frame(&mut send, &json!({"type":"challenge","nonce":nonce,"ts":ts})).await {
+                eprintln!("quic challenge write failed: {err}");
+                return;
+            }
+            eprintln!("quic challenge sent");
+            let hello = match tokio::time::timeout(std::time::Duration::from_secs(15), read_frame(&mut recv)).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => { eprintln!("quic hello read failed: {err}"); return; }
+                Err(_) => { eprintln!("quic hello timeout"); return; }
+            };
+            eprintln!("quic hello frame: {hello}");
+            let Ok(frame) = serde_json::from_value::<AgentFrame>(hello) else {
+                eprintln!("quic hello deserialize failed");
+                return;
+            };
+            let AgentFrame::Hello { node_id, proof: client_proof, hostname, version, networks, .. } = &frame else {
+                eprintln!("quic first payload is not hello");
+                return;
+            };
             let Some(token) = verify_proof(&state.db, node_id, &nonce, ts, client_proof).await else {
                 eprintln!("quic proof invalid for {node_id}");
                 let _ = write_frame(&mut send, &json!({"type":"error","error":"invalid node proof"})).await;
@@ -5651,6 +5727,21 @@ mod runtime_tests {
         assert!(node["rx_bps"].as_f64().unwrap() > 0.0);
 
         // 5) explicit flush writes snapshot, telemetry and link history
+        // Link history is rolled up per closed minute (per-second rows are
+        // never persisted), so seed one sample that belongs to a closed
+        // minute; the live one from the frames stays in memory until it seals.
+        if let Some(mut rt) = state.node_rt.get_mut("n1") {
+            rt.pending_links.push((
+                "netA".to_string(),
+                11,
+                22,
+                Some("u1".to_string()),
+                Some("u2".to_string()),
+                now() - 120,
+                Some(12.0),
+                Some(0.0),
+            ));
+        }
         let rt = state.node_rt.get("n1").unwrap().clone();
         assert!(flush_one_node(state.clone(), "n1".to_string(), rt).await);
         let (snapshot_after, rx_bps): (String, f64) =
@@ -5682,20 +5773,21 @@ mod runtime_tests {
                     .unwrap();
             }
         };
-        // two raw samples older than 1h, off bucket boundaries
-        insert(now_ts - 7200 + 7, 10.0).await;
-        insert(now_ts - 7200 + 19, 20.0).await;
+        // two raw samples older than the first rollup tier (10h -> 5m buckets),
+        // off bucket boundaries
+        insert(now_ts - 11 * 3600 + 7, 10.0).await;
+        insert(now_ts - 11 * 3600 + 19, 20.0).await;
         // one sample beyond the 30 day retention window
         insert(now_ts - 31 * 24 * 3600, 30.0).await;
 
         compact_link_metrics(&state).await;
 
-        let raw_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics WHERE ts % 60 <> 0")
+        let raw_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics WHERE ts % 300 <> 0")
             .fetch_one(&state.db)
             .await
             .unwrap();
         assert_eq!(raw_left, 0, "raw off-bucket samples must be aggregated away");
-        let aggregated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics WHERE ts % 60 = 0")
+        let aggregated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM link_metrics WHERE ts % 300 = 0")
             .fetch_one(&state.db)
             .await
             .unwrap();

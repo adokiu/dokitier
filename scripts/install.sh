@@ -10,6 +10,7 @@ ENDPOINT=""
 TOKEN=""
 NODE_ID=""
 VERSION="latest"
+VARIANT=""
 GH_PROXY=""
 INSTALL_DIR="$DEFAULT_INSTALL_DIR"
 SERVICE="$DEFAULT_SERVICE"
@@ -23,6 +24,7 @@ usage() {
   -t <token>           node token
   -n <node_id>         node id registered in console
   --version <ver>      release tag or "latest" (default: latest)
+  --variant <flavor>   build flavor suffix, e.g. full-upx (armv7 default: min-upx)
   --github-proxy <url> proxy prefix for github downloads
   --install-dir <dir>  install directory (default: /opt/dokitier)
   --service-name <n>   service name for systemd/OpenRC (default: dokitier-core)
@@ -38,6 +40,7 @@ while [ $# -gt 0 ]; do
     -t) TOKEN="$2"; shift 2 ;;
     -n) NODE_ID="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
+    --variant) VARIANT="$2"; shift 2 ;;
     --github-proxy) GH_PROXY="$2"; shift 2 ;;
     --install-dir) INSTALL_DIR="$2"; shift 2 ;;
     --service-name) SERVICE="$2"; shift 2 ;;
@@ -55,21 +58,68 @@ if [ -z "$ENDPOINT" ] || [ -z "$TOKEN" ] || [ -z "$NODE_ID" ]; then
   exit 1
 fi
 
-arch="$(uname -m)"
-case "$arch" in
-  x86_64|amd64) asset="dokitier-core-amd64" ;;
-  i386|i486|i586|i686) asset="dokitier-core-x86" ;;
-  aarch64|arm64) asset="dokitier-core-arm64" ;;
-  armv7l|armv7|armv7a|armhf) asset="dokitier-core-armv7" ;;
-  mips) asset="dokitier-core-mips" ;;
-  mipsel) asset="dokitier-core-mipsel" ;;
-  *) echo "unsupported architecture: $arch"; exit 1 ;;
+# Standardized release asset naming:
+#   dokitier-core-<version>-<platform>-<arch>[-<flavor>][.exe]
+# e.g. dokitier-core-2.7.15-linux-amd64
+#      dokitier-core-2.7.15-linux-armv7-min-upx   (small-flash OpenWrt build)
+#      dokitier-core-2.7.15-windows-amd64.exe
+if [ "$VERSION" = "latest" ]; then
+  api="https://api.github.com/repos/${REPO}/releases/latest"
+  if command -v curl >/dev/null 2>&1; then
+    VERSION="$(curl -fsSL "$api" 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  elif command -v wget >/dev/null 2>&1; then
+    VERSION="$(wget -q -O - "$api" 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  fi
+  if [ -z "$VERSION" ]; then
+    echo "failed to resolve the latest release tag" >&2
+    exit 1
+  fi
+fi
+case "$VERSION" in
+  v*) version_num="${VERSION#v}" ;;
+  *) version_num="$VERSION" ;;
 esac
 
+os="$(uname -s)"
+case "$os" in
+  Linux) platform="linux" ;;
+  Darwin) platform="macos" ;;
+  MINGW*|MSYS*|CYGWIN*) platform="windows" ;;
+  *) echo "unsupported platform: $os" >&2; exit 1 ;;
+esac
+
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|amd64) arch="amd64" ;;
+  i386|i486|i586|i686) arch="x86" ;;
+  aarch64|arm64) arch="arm64" ;;
+  armv7l|armv7|armv7a|armhf) arch="armv7" ;;
+  *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+esac
+
+ext=""
+[ "$platform" = "windows" ] && ext=".exe"
+
+# armv7/OpenWrt defaults to the size-trimmed UPX build; everything else uses
+# the untrimmed release binary. Override with --variant.
+if [ -z "$VARIANT" ] && [ "$platform" = "linux" ] && [ "$arch" = "armv7" ]; then
+  VARIANT="min-upx"
+fi
+case "$VARIANT" in
+  "") flavor="" ;;
+  *) flavor="-${VARIANT}" ;;
+esac
+
+asset="dokitier-core-${version_num}-${platform}-${arch}${flavor}${ext}"
+
+case "$VERSION" in
+  v*) release_tag="$VERSION" ;;
+  *) release_tag="v$VERSION" ;;
+esac
 if [ "$VERSION" = "latest" ]; then
   url="https://github.com/${REPO}/releases/latest/download/${asset}"
 else
-  url="https://github.com/${REPO}/releases/download/${VERSION}/${asset}"
+  url="https://github.com/${REPO}/releases/download/${release_tag}/${asset}"
 fi
 if [ -n "$GH_PROXY" ]; then
   url="${GH_PROXY%/}/${url}"

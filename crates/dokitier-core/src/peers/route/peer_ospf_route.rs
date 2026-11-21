@@ -1137,6 +1137,20 @@ static UPDATE_PEER_INFO_PERIOD: Duration = Duration::from_secs(3600);
 static REMOVE_DEAD_PEER_INFO_AFTER: Duration = Duration::from_secs(3660);
 static FORCE_USE_CONN_LIST: AtomicBool = AtomicBool::new(false);
 
+/// OSPF Database Description cadence. Every session exchanges its full route
+/// database summary at least this often, even with no incremental delta, so a
+/// peer that lost rows (restart, GC, dropped batch) is repaired without
+/// waiting for unrelated traffic. 300 nodes × ~20 B per summary row is a few
+/// KB per peer per period — negligible.
+const FULL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// OSPF LSRefreshTime analog: re-originate our own LSA (new sequence number)
+/// even when nothing changed. This is the last-resort self-healing layer: a
+/// lost LSA is re-flooded network-wide within one interval, independent of any
+/// per-session bookkeeping. The upstream default (1800 s) is too slow for a
+/// console-managed overlay where a missing row means an unreachable node.
+const LS_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
 // if a peer is unreachable for `REMOVE_UNREACHABLE_PEER_INFO_AFTER` time, we can remove it because
 // 1. all the ospf sessions between two zone are already destroy, new created session will resend the peer info.
 // 2. all the dst_saved_peer_info_version in all sessions already remove the peer info, the peer info will be propagated
@@ -1149,6 +1163,40 @@ static REMOVE_UNREACHABLE_PEER_INFO_AFTER: Duration = Duration::from_secs(15);
 
 fn route_peer_inst_id(info: &RoutePeerInfo) -> Option<uuid::Uuid> {
     info.inst_id.map(Into::into)
+}
+
+/// Keep only the sender's own connection row from a conn-info payload.
+///
+/// Used for credential peers that do not have `allow_relay`: we must not adopt
+/// their view of other nodes, but their own adjacency to us is what makes the
+/// OSPF 2-Way check succeed for the us<->peer edge.
+fn filter_conn_info_to_peer(conn_info: &ConnInfo, peer_id: PeerId) -> Option<ConnInfo> {
+    match conn_info {
+        ConnInfo::ConnPeerList(list) => {
+            let rows: Vec<PeerConnInfo> = list
+                .peer_conn_infos
+                .iter()
+                .filter(|row| row.peer_id.map(|p| p.peer_id) == Some(peer_id))
+                .cloned()
+                .collect();
+            if rows.is_empty() {
+                return None;
+            }
+            Some(ConnInfo::ConnPeerList(RouteConnPeerList {
+                peer_conn_infos: rows,
+            }))
+        }
+        ConnInfo::ConnBitmap(bitmap) => {
+            let idx = bitmap.peer_ids.iter().position(|p| p.peer_id == peer_id)?;
+            let connected: Vec<PeerId> = bitmap.get_connected_peers(idx).into_iter().collect();
+            Some(ConnInfo::ConnPeerList(RouteConnPeerList {
+                peer_conn_infos: vec![PeerConnInfo {
+                    peer_id: bitmap.peer_ids.get(idx).cloned(),
+                    connected_peer_ids: connected,
+                }],
+            }))
+        }
+    }
 }
 
 fn is_foreign_network_info_newer(
@@ -1872,10 +1920,28 @@ impl SyncedRouteInfo {
         }
     }
 
+    /// Drop local GC tombstones for peers whose rows we explicitly requested
+    /// from a live neighbour (OSPF LSR semantics).
+    ///
+    /// A tombstone exists to stop stale *unsolicited* copies from resurrecting
+    /// a peer we withdrew. When the peer is still advertised by a live neighbour
+    /// in its connection list, we ask for its rows by id; the answer is not a
+    /// stale copy and must be accepted, otherwise a transient unreachability
+    /// fences the peer for the whole tombstone TTL and the route table stays
+    /// incomplete until a fleet-wide restart.
+    fn release_withdrawn_floor_for(&self, peer_ids: &[PeerId]) {
+        if peer_ids.is_empty() {
+            return;
+        }
+        let mut tombstones = self.withdrawn_peer_infos.write();
+        for peer_id in peer_ids {
+            tombstones.remove(peer_id);
+        }
+    }
+
     /// Some(peer_info_version floor) when a RoutePeerInfo of this peer with the
     /// given version must be dropped.
-    fn blocked_peer_info_floor(&self, peer_id: PeerId, version: Version) -> Option<Version> {
-        self.withdrawn_peer_infos
+    fn blocked_peer_info_floor(&self, peer_id: PeerId, version: Version) -> Option<Version> {        self.withdrawn_peer_infos
             .read()
             .get(&peer_id)
             .filter(|state| state.expires_at > SystemTime::now() && state.peer_info_version >= version)
@@ -1884,12 +1950,19 @@ impl SyncedRouteInfo {
 
     /// True when a RouteConnInfo of this peer with the given version must be
     /// dropped.
+    ///
+    /// Only a *strictly older* row is stale: an equal version is the same
+    /// adjacency state re-announced (bitmap retransmission, or the answer to an
+    /// LSR for a row we GC'd), and dropping it keeps the peer unreachable for
+    /// the whole tombstone TTL. Accepting it cannot resurrect a dead node by
+    /// itself — the node only re-enters the SPF graph once its peer-info row is
+    /// accepted, and that one still passes the strict tombstone floor.
     fn conn_info_blocked(&self, peer_id: PeerId, version: Version) -> bool {
         self.withdrawn_peer_infos
             .read()
             .get(&peer_id)
             .is_some_and(|state| {
-                state.expires_at > SystemTime::now() && state.conn_info_version >= version
+                state.expires_at > SystemTime::now() && state.conn_info_version > version
             })
     }
 
@@ -2298,6 +2371,45 @@ impl SyncedRouteInfo {
         } else {
             false
         }
+    }
+
+    /// OSPF LSA refresh for our own router-LSA.
+    ///
+    /// Re-originates the row even when its content did not change, so a copy
+    /// that was lost anywhere in the mesh (dropped batch, GC at a remote,
+    /// summarization gap) is flooded again. `seq` (= `version`) must increase,
+    /// otherwise correct receivers discard the refresh as stale.
+    fn refresh_my_peer_info(&self, my_peer_id: PeerId) -> bool {
+        let guard = self.peer_infos.upgradable_read();
+        let Some(old) = guard.get(&my_peer_id).cloned() else {
+            return false;
+        };
+        let new_version = (old.version + 1).max(self_version_floor());
+        let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
+        let mut new = old;
+        new.version = new_version;
+        new.last_update = Some(Timestamp::now());
+        guard.insert(my_peer_id, new);
+        drop(guard);
+        self.version.inc();
+        true
+    }
+
+    /// LSA refresh for our own connection-list row (see `refresh_my_peer_info`).
+    fn refresh_my_conn_info(&self, my_peer_id: PeerId) -> bool {
+        let guard = self.conn_map.upgradable_read();
+        let Some(old) = guard.get(&my_peer_id).cloned() else {
+            return false;
+        };
+        let new_version = (old.version.get() + 1).max(self_version_floor());
+        let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
+        let mut new = old;
+        new.version = new_version.into();
+        new.last_update = SystemTime::now();
+        guard.insert(my_peer_id, new);
+        drop(guard);
+        self.version.inc();
+        true
     }
 
     fn update_my_conn_info(&self, my_peer_id: PeerId, connected_peers: BTreeSet<PeerId>) -> bool {
@@ -2756,6 +2868,13 @@ struct SyncRouteSession {
 
     last_sync_succ_timestamp: AtomicCell<Option<SystemTime>>,
 
+    /// Next time this session must exchange a full database summary even when
+    /// there is no incremental delta to send. This is the OSPF Database
+    /// Description exchange: without it a session that has "nothing new" would
+    /// never learn that the remote lost (restarted / GC'd) a row, because
+    /// summaries are only piggybacked on requests that actually carry data.
+    dd_due_at: AtomicCell<Instant>,
+
     // Last time any sync interaction (inbound request or successful
     // response) confirmed the peer still holds this session. Drives the
     // responder liveness timeout; initialized at session creation.
@@ -2798,6 +2917,9 @@ impl SyncRouteSession {
             missing_peer_ids: parking_lot::Mutex::new(BTreeSet::new()),
 
             last_sync_succ_timestamp: AtomicCell::new(None),
+            // Due immediately: the first exchange on a fresh session is always
+            // a full summary.
+            dd_due_at: AtomicCell::new(Instant::now()),
 
             last_contact_instant: AtomicCell::new(Instant::now()),
 
@@ -2817,6 +2939,23 @@ impl SyncRouteSession {
 
             lock: parking_lot::Mutex::new(()),
         }
+    }
+
+    /// True when a periodic full-summary exchange is due (OSPF DD). Cheap:
+    /// one atomic load per sync round.
+    fn full_sync_due(&self) -> bool {
+        Instant::now() >= self.dd_due_at.load()
+    }
+
+    fn schedule_next_full_sync(&self) {
+        self.dd_due_at
+            .store(Instant::now() + FULL_SYNC_INTERVAL);
+    }
+
+    /// Force the next exchange to be a full summary (used when the remote's
+    /// session generation changed, i.e. it restarted).
+    fn force_full_sync_now(&self) {
+        self.dd_due_at.store(Instant::now());
     }
 
     fn check_saved_peer_info_update_to_date(&self, peer_id: PeerId, version: Version) -> bool {
@@ -2966,6 +3105,9 @@ impl SyncRouteSession {
             self.dst_saved_foreign_network_versions.clear();
 
             self.last_sync_succ_timestamp.store(None);
+            // The remote is a new generation: exchange a full summary on the
+            // very next round instead of waiting for the periodic DD.
+            self.force_full_sync_now();
             self.unreachable_peers_for_peer_info.lock().clear();
             self.unreachable_peers_for_conn_info.lock().clear();
             self.missing_peer_ids.lock().clear();
@@ -3133,6 +3275,11 @@ struct PeerRouteServiceImpl {
     last_update_my_foreign_network: AtomicCell<Option<Instant>>,
 
     peer_info_last_update: AtomicCell<Instant>,
+
+    /// Next self-LSA refresh (OSPF LSRefreshTime analog). Re-originates our own
+    /// router-LSA and connection list even without a semantic change, so any
+    /// copy lost in the mesh is rebuilt without operator intervention.
+    my_lsa_refresh_at: AtomicCell<Instant>,
 }
 
 impl Debug for PeerRouteServiceImpl {
@@ -3210,6 +3357,7 @@ impl PeerRouteServiceImpl {
             last_update_my_foreign_network: AtomicCell::new(None),
 
             peer_info_last_update: AtomicCell::new(Instant::now()),
+            my_lsa_refresh_at: AtomicCell::new(Instant::now() + LS_REFRESH_INTERVAL),
         }
     }
 
@@ -3764,10 +3912,24 @@ impl PeerRouteServiceImpl {
             }
             let info = peer_infos.get(peer_id);
             let conn = conn_map.get(peer_id);
-            // GC and trust rejection remove both records. Do not resurrect them
-            // unless a later accepted topology update references this peer again.
             if info.is_none() && conn.is_none() {
-                return false;
+                // Both rows are gone locally. Two very different cases:
+                //  * GC after transient unreachability leaves a tombstone; the
+                //    live neighbour still advertises the peer, so it is exactly
+                //    the row we must request (LSR semantics, the response is
+                //    allowed to clear the local tombstone);
+                //  * an explicit local removal / trust rejection leaves no
+                //    tombstone and must never be resurrected.
+                if self
+                    .synced_route_info
+                    .blocked_peer_info_floor(*peer_id, 0)
+                    .is_none()
+                {
+                    return false;
+                }
+                missing_peer_ids.push(*peer_id);
+                missing_conn_peer_ids.push(*peer_id);
+                return true;
             }
             let missing_info = info.is_none_or(|p| p.version == 0);
             // Non-relaying credential nodes do not advertise connection rows.
@@ -3796,6 +3958,8 @@ impl PeerRouteServiceImpl {
         session: &SyncRouteSession,
         response: &SyncRouteInfoResponse,
     ) {
+        #[cfg(test)]
+        let _ = (response.missing_peer_ids.len(), response.missing_conn_peer_ids.len());
         if response.missing_peer_ids.is_empty() && response.missing_conn_peer_ids.is_empty() {
             return;
         }
@@ -3831,16 +3995,15 @@ impl PeerRouteServiceImpl {
         let mut included_peer_ids = HashSet::new();
         let peer_infos = self.synced_route_info.peer_infos.read();
         let mut unreachable_peers_for_peer_info = session.unreachable_peers_for_peer_info.lock();
-        let last_sync_succ_timestamp = session.last_sync_succ_timestamp.load();
-        for (peer_id, peer_info) in peer_infos.iter().rev() {
-            // stop iter if last_update of peer info is older than session.last_sync_succ_timestamp
-            if let Some(last_update) = peer_info.last_update {
-                let last_update = SystemTime::try_from(last_update).unwrap();
-                if last_sync_succ_timestamp.is_some_and(|t| last_update < t) {
-                    break;
-                }
-            }
-
+        // NOTE: `peer_infos` is a DashMap: its iteration order is arbitrary and
+        // stable only within one pass. The old code stopped the scan at the
+        // first entry whose `last_update` predated the last successful sync
+        // (`break`), which skipped every remaining entry in that shard order —
+        // including rows this session had never sent. That is exactly the
+        // "some peers are missing from the route table after a restart, and
+        // only a fleet-wide restart fixes it" symptom. Per-entry dedup already
+        // exists in `check_saved_peer_info_update_to_date`, so scan everything.
+        for (peer_id, peer_info) in peer_infos.iter() {
             if session.check_saved_peer_info_update_to_date(peer_info.peer_id, peer_info.version) {
                 continue;
             }
@@ -3993,27 +4156,56 @@ impl PeerRouteServiceImpl {
     }
 
     async fn update_my_infos(&self) -> bool {
+        let my_lsa_refreshed = self.refresh_my_lsa_if_due();
         let my_peer_info_updated = self.update_my_peer_info();
         let my_conn_info_updated = self.update_my_conn_info().await;
         let my_foreign_network_updated = self.update_my_foreign_network().await;
         let mut untrusted_changed = false;
-        if my_peer_info_updated || my_conn_info_updated {
+        if my_peer_info_updated || my_conn_info_updated || my_lsa_refreshed {
             untrusted_changed = self.refresh_credential_trusts_and_disconnect().await;
         }
 
         let mut public_ipv6_state_updated = false;
-        if my_peer_info_updated || my_conn_info_updated || untrusted_changed {
+        if my_peer_info_updated || my_conn_info_updated || my_lsa_refreshed || untrusted_changed {
             self.update_route_table_and_cached_local_conn_bitmap();
             self.update_foreign_network_owner_map();
             public_ipv6_state_updated = self.notify_public_ipv6_route_change();
         }
-        if my_peer_info_updated {
+        if my_peer_info_updated || my_lsa_refreshed {
             self.update_peer_info_last_update();
         }
         my_peer_info_updated
             || my_conn_info_updated
+            || my_lsa_refreshed
             || my_foreign_network_updated
+            || untrusted_changed
             || public_ipv6_state_updated
+    }
+
+    /// Re-origin our own LSA when the refresh interval elapsed.
+    ///
+    /// Deliberately independent of session state: even if every per-session
+    /// acknowledgement map is wrong (the failure mode that previously required
+    /// restarting the whole fleet), a version bump floods the row again and the
+    /// periodic DD exchange picks up whatever is still missing.
+    fn refresh_my_lsa_if_due(&self) -> bool {
+        let now = Instant::now();
+        if now < self.my_lsa_refresh_at.load() {
+            return false;
+        }
+        self.my_lsa_refresh_at
+            .store(now + LS_REFRESH_INTERVAL);
+        let peer_refreshed = self.synced_route_info.refresh_my_peer_info(self.my_peer_id);
+        let conn_refreshed = self.synced_route_info.refresh_my_conn_info(self.my_peer_id);
+        if peer_refreshed || conn_refreshed {
+            tracing::debug!(
+                my_peer_id = ?self.my_peer_id,
+                peer_refreshed,
+                conn_refreshed,
+                "self LSA refresh (LSRefreshTime)"
+            );
+        }
+        peer_refreshed || conn_refreshed
     }
 
     async fn refresh_acl_groups(&self) -> bool {
@@ -4276,11 +4468,17 @@ impl PeerRouteServiceImpl {
             self.build_sync_request(&session, dst_peer_id);
         let withdrawn_peer_infos = self.synced_route_info.list_withdrawn_peer_infos();
         let route_info_summary = self.synced_route_info.build_route_info_summary();
+        // OSPF DD: periodically exchange the full summary even when this round
+        // would have no data to send. Without it, a remote that silently lost
+        // rows (restart, GC, dropped batch) never triggers a re-send because
+        // anti-entropy is piggybacked on data-carrying requests only.
+        let force_exchange = session.full_sync_due();
         if peer_infos.is_none()
             && conn_info.is_none()
             && foreign_network.is_none()
             && withdrawn_peer_infos.is_empty()
             && route_info_summary.is_empty()
+            && !force_exchange
             && !session.need_sync_initiator_info.load(Ordering::Relaxed)
             && !(sync_as_initiator && session.we_are_initiator.load(Ordering::Relaxed))
         {
@@ -4372,6 +4570,8 @@ impl PeerRouteServiceImpl {
                 session
                     .need_sync_initiator_info
                     .store(true, Ordering::Relaxed);
+                // Do not spin: retry the DD on the normal cadence.
+                session.schedule_next_full_sync();
             }
             Ok(resp) => {
                 if let Some(err) = resp.error {
@@ -4438,6 +4638,7 @@ impl PeerRouteServiceImpl {
                     // Anti-entropy: diff our database against the dst's summary
                     // and re-send anything the dst is missing or holds older.
                     self.process_peer_route_summary(&session, &resp.route_info_summary);
+                    session.schedule_next_full_sync();
                 }
             }
         }
@@ -4995,7 +5196,10 @@ impl RouteSessionManager {
 
         let mut need_update_route_table = false;
         let mut untrusted_peers = Vec::new();
-        let mut accepted_conn_info = None;
+        let mut accepted_conn_info: Option<&ConnInfo> = None;
+        // Owns the filtered conn_info for non-relaying credential peers; it must
+        // outlive the borrow stored in `accepted_conn_info`.
+        let mut accepted_conn_owned: Option<ConnInfo> = None;
 
         if let Some(peer_infos) = &peer_infos {
             // Step 9b: credential peers can only propagate their own route info
@@ -5014,6 +5218,21 @@ impl RouteSessionManager {
                 (peer_infos, raw_peer_infos.as_ref().unwrap())
             };
             if !pi.is_empty() {
+                // Rows we asked for by id (missing_peer_ids / LSR) are answers
+                // to our own request, not stale unsolicited copies: release the
+                // local GC tombstone so a peer that was only transiently
+                // unreachable is restored instead of staying fenced for the
+                // full tombstone TTL.
+                let solicited: Vec<PeerId> = {
+                    let missing = session.missing_peer_ids.lock();
+                    pi.iter()
+                        .map(|info| info.peer_id)
+                        .filter(|peer_id| missing.contains(peer_id))
+                        .collect()
+                };
+                service_impl
+                    .synced_route_info
+                    .release_withdrawn_floor_for(&solicited);
                 let trust_admin_groups_without_proof = service_impl
                     .context
                     .network_identity()
@@ -5038,11 +5257,45 @@ impl RouteSessionManager {
             }
         }
 
-        // Step 9b: credential peers' conn_info depends on allow_relay flag
+        // Step 9b: credential peers' conn_info depends on allow_relay flag.
+        //
+        // A non-relaying credential peer must not teach us other nodes'
+        // adjacencies, but its *own* adjacency to us is directly observed and is
+        // required for the OSPF 2-Way check: without that row the edge
+        // us<->credential is pruned and the attached peer never becomes
+        // routable. So keep exactly the sender's own row.
         if let Some(conn_info) = &conn_info {
-            let accept_conn_info =
-                !from_is_credential || credential_info.map(|tc| tc.allow_relay).unwrap_or(false);
-            if accept_conn_info {
+            let allow_relay = credential_info.map(|tc| tc.allow_relay).unwrap_or(false);
+            accepted_conn_owned = if !from_is_credential || allow_relay {
+                Some(conn_info.clone())
+            } else {
+                filter_conn_info_to_peer(conn_info, from_peer_id)
+            };
+            if let Some(conn_info) = accepted_conn_owned.as_ref() {
+                // Same LSR rule as for peer info: a connection row we asked for
+                // by id is an answer to our own request, so a local GC
+                // tombstone must not fence it. Without this the bitmap carrying
+                // the recovered row is dropped and the peer stays unreachable
+                // for the full tombstone TTL.
+                let solicited: Vec<PeerId> = {
+                    let missing = session.missing_peer_ids.lock();
+                    let ids: Vec<PeerId> = match conn_info {
+                        ConnInfo::ConnBitmap(bitmap) => {
+                            bitmap.peer_ids.iter().map(|p| p.peer_id).collect()
+                        }
+                        ConnInfo::ConnPeerList(list) => list
+                            .peer_conn_infos
+                            .iter()
+                            .filter_map(|row| row.peer_id.map(|p| p.peer_id))
+                            .collect(),
+                    };
+                    ids.into_iter()
+                        .filter(|peer_id| missing.contains(peer_id))
+                        .collect()
+                };
+                service_impl
+                    .synced_route_info
+                    .release_withdrawn_floor_for(&solicited);
                 service_impl.synced_route_info.update_conn_info(conn_info);
                 session.update_dst_saved_conn_info_version(conn_info, from_peer_id);
                 accepted_conn_info = Some(conn_info);
@@ -6145,6 +6398,11 @@ mod tests {
         install_credential_grant(&service_impl, leaf_a_key, false);
         install_credential_grant(&service_impl, leaf_b_key, false);
         install_conn_row(&service_impl, 2, [3, 4]);
+        // OSPF 2-Way adjacency: an edge only enters the SPF graph when both
+        // endpoints advertise it. The leaves are directly connected to us, so
+        // their own rows must list us as well.
+        install_conn_row(&service_impl, 3, [1]);
+        install_conn_row(&service_impl, 4, [1]);
 
         assert!(service_impl.reconcile_my_conn_info(&snapshot, false));
         assert_eq!(

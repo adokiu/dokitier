@@ -71,6 +71,19 @@ pub enum AgentFrame {
         node_id: String,
         data: serde_json::Value,
     },
+    /// Public address of the node, sent once after the background detector
+    /// finishes. The hello/snapshot path must never wait for the detector (it
+    /// can take tens of seconds on a censored/resolver-broken host), so the
+    /// address is announced out-of-band instead of blocking the first
+    /// connection. The console only patches the runtime entry and resolves
+    /// geo; it does not replace the static topology snapshot.
+    PublicIp {
+        node_id: String,
+        #[serde(default)]
+        ipv4: Option<String>,
+        #[serde(default)]
+        ipv6: Option<String>,
+    },
     /// Per-second, compact metrics frame: only edge counters/quality and host
     /// load. The full topology is sent once per console connection as a
     /// `Snapshot`, so this frame carries no names/addresses/versions.

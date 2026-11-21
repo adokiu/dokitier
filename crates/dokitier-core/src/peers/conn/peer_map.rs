@@ -179,6 +179,37 @@ impl PeerMap {
         peer_id == self.my_peer_id
     }
 
+    /// Non-blocking variant of [`send_msg_directly`] for the forwarding hot
+    /// path: a congested destination returns `BufferFull` instead of parking the
+    /// router worker.
+    pub fn try_send_msg_directly(
+        &self,
+        msg: ZCPacket,
+        dst_peer_id: PeerId,
+    ) -> Result<(), Error> {
+        if dst_peer_id == self.my_peer_id {
+            let packet_send = self.packet_send.clone();
+            // Local injection is a queue hand-off, not a transport write; the
+            // spawn keeps it off the forwarding worker.
+            tokio::spawn(async move {
+                let ret = packet_send
+                    .send(msg)
+                    .await
+                    .with_context(|| "send msg to self failed");
+                if ret.is_err() {
+                    tracing::error!("send msg to self failed: {:?}", ret);
+                }
+            });
+            return Ok(());
+        }
+        match self.get_peer_by_id(dst_peer_id) {
+            Some(peer) => peer.try_send_msg(msg),
+            None => Err(Error::RouteError(Some(format!(
+                "peer map try send directly: no connected peer {dst_peer_id}"
+            )))),
+        }
+    }
+
     pub async fn send_msg_directly(&self, msg: ZCPacket, dst_peer_id: PeerId) -> Result<(), Error> {
         if dst_peer_id == self.my_peer_id {
             let packet_send = self.packet_send.clone();
