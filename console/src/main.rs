@@ -265,7 +265,7 @@ fn rt_snapshot_strings(state: &AppState) -> Vec<String> {
     state
         .node_rt
         .iter()
-        .filter(|e| now_ts - e.value().ts <= RT_FRESH_SECS)
+        .filter(|e| rt_status(e.value(), now_ts) == "online")
         .map(|e| e.value().snapshot.to_string())
         .collect()
 }
@@ -278,15 +278,8 @@ fn rt_nodes_status_snapshot(state: &AppState) -> Vec<(String, String, String)> {
         .iter()
         .map(|e| {
             let rt = e.value();
-            // Metrics freshness alone decides the status: a snapshot every
-            // second refreshes rt.ts, so fresh metrics prove the agent is
-            // alive. A briefly missing command channel must not flip the node
-            // to offline; a dead node stops snapshotting and goes stale here.
-            let status = if now_ts - rt.ts <= RT_FRESH_SECS {
-                "online"
-            } else {
-                "offline"
-            };
+            // Metrics freshness alone decides the status, via the shared rule.
+            let status = rt_status(rt, now_ts);
             (e.key().clone(), status.to_string(), rt.snapshot.to_string())
         })
         .collect()
@@ -300,13 +293,8 @@ fn rt_nodes_full(state: &AppState) -> Vec<(String, String, String, String)> {
         .iter()
         .map(|e| {
             let rt = e.value();
-            // Same rule as rt_nodes_status_snapshot: fresh metrics win; a
-            // missing command channel must not override them.
-            let status = if now_ts - rt.ts <= RT_FRESH_SECS {
-                "online"
-            } else {
-                "offline"
-            };
+            // Same shared rule as every other endpoint.
+            let status = rt_status(rt, now_ts);
             (e.key().clone(), status.to_string(), rt.snapshot.to_string(), rt.traffic.to_string())
         })
         .collect()
@@ -317,6 +305,27 @@ fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default
 /// Agents send a snapshot every second; a node counts as live only while its
 /// latest snapshot is at most this old.
 const RT_FRESH_SECS: i64 = 5;
+
+/// The one and only liveness rule.
+///
+/// Every endpoint (networks, topology, nodes, board overview, routing push,
+/// bandwidth sampling) must answer "is this node online" through this function
+/// instead of re-deriving it: the rule used to be copy-pasted with different
+/// conditions (`ts` alone, `online && ts`, `online && ts` with a 30s window),
+/// so the same node could look online on one page and offline on another. The
+/// value stored in `NodeRt::online` is only a hint — the timestamp decides —
+/// so a stale `online` flag can never resurrect a dead node.
+fn node_status(rt: Option<&NodeRt>, now_ts: i64) -> &'static str {
+    match rt {
+        Some(rt) if now_ts - rt.ts <= RT_FRESH_SECS => "online",
+        _ => "offline",
+    }
+}
+
+/// `node_status` for a node currently present in the memory registry.
+fn rt_status(rt: &NodeRt, now_ts: i64) -> &'static str {
+    node_status(Some(rt), now_ts)
+}
 
 async fn init_db(db: &AnyPool) -> anyhow::Result<()> {
     let nodes_ddl = if is_mysql() {
@@ -960,7 +969,13 @@ async fn lookup_and_store_geo(state: AppState, node_id: String, ip: String) {
     let provider = get_setting(&state.db, "geo_provider")
         .await
         .unwrap_or_else(|| DEFAULT_GEO_PROVIDER.to_string());
-    let Some(info) = fetch_geo(&client, &provider, &ip).await else { return };
+    let Some(info) = fetch_geo(&client, &provider, &ip).await else {
+        // Provider hiccup (rate limit / timeout / Chinese endpoint): forget the
+        // attempt stamp so the next snapshot retries instead of leaving the node
+        // flag-less until the console restarts.
+        state.geo_attempts.remove(&node_id);
+        return;
+    };
     if let Some(code) = info.country.clone() {
         if code.len() == 2 {
             let _ = sqlx::query(&q("UPDATE nodes SET country_code = ? WHERE node_id = ?"))
@@ -1147,7 +1162,7 @@ fn spawn_bandwidth_sampler(state: AppState) {
             let totals: (f64, f64) = state
                 .node_rt
                 .iter()
-                .filter(|e| e.value().online && now_ts - e.value().ts <= RT_FRESH_SECS)
+                .filter(|e| rt_status(e.value(), now_ts) == "online")
                 .fold((0.0, 0.0), |acc, e| (acc.0 + e.value().rx_bps, acc.1 + e.value().tx_bps));
             let rx = totals.0;
             let tx = totals.1;
@@ -1393,13 +1408,7 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
     for (node_id,) in &node_ids {
         let (status, snapshot, system_info) = match state.node_rt.get(node_id) {
             Some(rt) => (
-                // Metrics freshness alone decides the status (snapshot every 1s
-                // refreshes rt.ts); the command channel is not required here.
-                if now_ts - rt.ts <= RT_FRESH_SECS {
-                    "online".to_string()
-                } else {
-                    "offline".to_string()
-                },
+                rt_status(rt, now_ts).to_string(),
                 rt.snapshot.to_string(),
                 rt.system.to_string(),
             ),
@@ -1549,16 +1558,20 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
     let base = subnet.as_ref().and_then(|s| s.trim_end_matches("/24").parse::<std::net::Ipv4Addr>().ok());
     let mut created = Vec::new();
     let mut applied = Vec::new();
+    // Offline nodes whose config was stored and will be applied on reconnect.
+    let mut pending = Vec::new();
     let mut failed = Vec::new();
     for (index, node) in body.nodes.iter().enumerate() {
         let Some((status, snapshot, system_info)) = node_info.get(&node.node_id) else {
             failed.push(json!({"node_id": node.node_id, "error": "node not found"}));
             continue;
         };
-        if status != "online" {
-            failed.push(json!({"node_id": node.node_id, "error": "node offline"}));
-            continue;
-        }
+        // Offline nodes are allowed: the generated config is persisted to
+        // config_versions exactly like an online node and the agent applies it
+        // on its next hello (spawn_reconcile), so building a network never
+        // requires every host to be up right now. Only the immediate push is
+        // skipped; the caller still reports success.
+        let node_online = status == "online";
         let underlay_ip = serde_json::from_str::<Value>(system_info).ok()
             .and_then(|v| v.pointer("/network/interfaces/0/ipv4/0").and_then(|v| v.as_str()).map(|s| s.split('/').next().unwrap_or(s).to_string()))
             .or_else(|| serde_json::from_str::<Value>(snapshot).ok()
@@ -1649,6 +1662,11 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
             .bind(&node.node_id).bind(&name).bind(hash_token(&toml_text)).bind(&toml_text).bind(now())
             .execute(&state.db).await;
         created.push(json!({"node_id": node.node_id, "ipv4": ipv4, "listener_port": port, "toml": toml_text}));
+        if body.auto_connect && !node_online {
+            // pending: applied automatically when the agent connects
+            pending.push(node.node_id.clone());
+            continue;
+        }
         if body.auto_connect {
             let mut result = apply_new_network(&state, &node.node_id, &name, &toml_text).await;
             let failed_text = result.get("error").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
@@ -1675,7 +1693,7 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
         }
         let _ = underlay_ip;
     }
-    if body.auto_connect && failed.is_empty() && applied.len() > 1 {
+    if body.auto_connect && failed.is_empty() && pending.is_empty() && applied.len() > 1 {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let mut all_connected = true;
@@ -1700,7 +1718,7 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     }
-    if body.auto_connect && !failed.is_empty() {
+    if body.auto_connect && !failed.is_empty() && pending.is_empty() {
         // Partial rollout must not leave a half-created network behind.
         for node in &applied {
             let _ = delete_network_on_node(&state, node, &name).await;
@@ -1719,6 +1737,7 @@ async fn create_network(State(state): State<AppState>, Json(body): Json<CreateNe
         "subnet": subnet,
         "created": created,
         "applied": applied,
+        "pending": pending,
         "failed": failed,
     }))
 }
@@ -2186,7 +2205,7 @@ async fn set_routing_settings(State(state): State<AppState>, Json(body): Json<Va
     let nodes: Vec<String> = state
         .node_rt
         .iter()
-        .filter(|e| e.value().online && now_ts - e.value().ts <= RT_FRESH_SECS)
+        .filter(|e| rt_status(e.value(), now_ts) == "online")
         .map(|e| e.key().clone())
         .collect();
     for node_id in nodes {
@@ -2745,18 +2764,10 @@ async fn nodes_payload(state: &AppState) -> Value {
     for node_id in ids {
         let meta = statics.get(&node_id);
         let rt = state.node_rt.get(&node_id).map(|r| r.clone());
-        // Metrics freshness alone decides the status: the agent snapshots every
-        // second and each snapshot refreshes rt.ts, so fresh metrics prove the
-        // agent is alive. The command channel is an extra capability only —
-        // during a reconnect it can be briefly absent and must not flip a
-        // metrics-live node to offline; a dead node stops snapshotting, rt.ts
-        // goes stale and it still shows offline.
-        let live = rt.filter(|r| now_ts - r.ts <= RT_FRESH_SECS);
-        let status = if live.is_some() {
-            "online".to_string()
-        } else {
-            "offline".to_string()
-        };
+        // Shared liveness rule: the nodes page, the topology page and the
+        // networks page all read this same answer.
+        let live = rt.filter(|r| rt_status(r, now_ts) == "online");
+        let status = node_status(rt.as_ref(), now_ts).to_string();
         let system_info = match meta.map(|m| m.system.clone()) {
             Some(value) if !value.is_null() => value,
             _ => live.as_ref().map(|r| r.system.clone()).unwrap_or(Value::Null),
@@ -3828,7 +3839,8 @@ async fn flush_one_node(state: AppState, node_id: String, rt: NodeRt) -> bool {
         Ok(tx) => tx,
         Err(_) => return false,
     };
-    let st = if rt.online { "online" } else { "offline" };
+    // Persisted status uses the same rule as every realtime endpoint.
+    let st = rt_status(&rt, now());
     let res = sqlx::query(&q("UPDATE nodes SET last_seen = ?, status = ?, \
             hostname = COALESCE(NULLIF(?, ''), hostname), \
             version = COALESCE(NULLIF(?, ''), version), \
@@ -4243,12 +4255,15 @@ fn build_geo_view(node_list: &[Value], edge_list: &[Value]) -> Value {
 }
 
 async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filter: Option<&str>) -> Value {
-    // realtime data comes exclusively from the in-memory runtime registry
-    let fresh_before = now() - 30;
+    // realtime data comes exclusively from the in-memory runtime registry, and
+    // the liveness window is the shared one (it used to be 30s here and 5s on
+    // the nodes page, so a node lingering in the registry as "online" here was
+    // already "offline" everywhere else).
+    let now_ts = now();
     let rows: Vec<(String, String)> = state
         .node_rt
         .iter()
-        .filter(|e| e.value().ts >= fresh_before)
+        .filter(|e| rt_status(e.value(), now_ts) == "online")
         .map(|e| (e.key().clone(), e.value().snapshot.to_string()))
         .collect();
     // nodes are keyed by (network, peer_id): the same peer exists independently
@@ -4554,6 +4569,12 @@ async fn topology_payload(state: &AppState, net_filter: Option<&str>, group_filt
         })
         .collect();
     let mut node_list: Vec<Value> = nodes.values().cloned().collect();
+    // Nodes in the graph come only from fresh reporters (filtered above), so
+    // the whole graph is online; the field is always present so the UI never
+    // has to guess or fall back to a different source.
+    for node in &mut node_list {
+        node["status"] = json!("online");
+    }
     let mut edge_list: Vec<Value> = edges.values().cloned().collect();
     let mut cross_links: Vec<Value> = Vec::new();
     let peer_group: std::collections::HashMap<u64, String> = node_list
@@ -4721,6 +4742,9 @@ async fn board_events(
         let nodes = nodes_payload_lite(&state).await;
         // the realtime frame must carry the same model as the HTTP endpoint,
         // including the geo aggregation the globe renders
+        // Same payload on the HTTP endpoint and the SSE stream: the geo model
+        // (city + country flags) has to travel with the graph, or the globe and
+        // the map tab render an empty world a second after loading.
         let topology = Event::default().event("topology").data(topology_event_json(&payload));
         let nodes = Event::default().event("nodes").data(
             json!({"type": "nodes", "nodes": nodes.get("nodes").cloned().unwrap_or(Value::Null)}).to_string(),
@@ -4869,7 +4893,7 @@ async fn board_route_path(
     let mut own_peer: HashMap<String, u32> = HashMap::new();
     let mut routes: HashMap<String, HashMap<u32, u32>> = HashMap::new();
     for entry in state.node_rt.iter() {
-        if now_ts - entry.value().ts > RT_FRESH_SECS {
+        if rt_status(entry.value(), now_ts) != "online" {
             continue;
         }
         let value = entry.value().snapshot.clone();
@@ -4963,8 +4987,7 @@ async fn board_overview(State(state): State<AppState>) -> Json<Value> {
     let mut rows: Vec<(bool, Value)> = Vec::new();
     for e in state.node_rt.iter() {
         let rt = e.value();
-        let fresh = now_ts - rt.ts <= RT_FRESH_SECS;
-        rows.push((fresh && rt.online, rt.snapshot.clone()));
+        rows.push((rt_status(rt, now_ts) == "online", rt.snapshot.clone()));
     }
     let total = rows.len();
     let online = rows.iter().filter(|(online, _)| *online).count();

@@ -242,7 +242,7 @@ impl PeerMap {
         // Lock-free: the snapshot is immutable for as long as this `Arc` lives.
         let routes = self.routes.load();
         for route in routes.iter() {
-            if let Some(gateway) = route.get_next_hop_with_policy(dst_peer_id, policy).await {
+            if let Some(gateway) = route.get_next_hop_with_policy(dst_peer_id, policy.clone()).await {
                 // NOTIC: for foreign network, gateway_peer_id may not connect to me
                 return Some(gateway);
             }
