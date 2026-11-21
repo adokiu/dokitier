@@ -15,10 +15,21 @@ use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
-use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
+use tokio::sync::{
+    Semaphore,
+    mpsc::{self, Receiver, Sender, error::TrySendError},
+};
 use tokio_util::task::AbortOnDropHandle;
 
 const DATAGRAM_QUEUE_CAPACITY: usize = 1024;
+/// How many datagrams may be waiting for the host socket write at once. Large
+/// enough to keep the session ring saturated, small enough to bound memory.
+const SEND_IN_FLIGHT_LIMIT: usize = 256;
+/// Let quinn batch this many datagrams into a single `try_send` call. Without
+/// an override `AsyncUdpSocket::max_transmit_segments` is 1, so every QUIC
+/// packet costs a separate endpoint-driver -> socket hand-off regardless of
+/// `enable_segmentation_offload`.
+const MAX_TRANSMIT_SEGMENTS: usize = 32;
 
 type SendBatch = Vec<Vec<u8>>;
 type WritableFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
@@ -95,24 +106,45 @@ impl QuicUdpSessionSocket {
         }));
 
         let send_session = session.clone();
+        let in_flight = Arc::new(Semaphore::new(SEND_IN_FLIGHT_LIMIT));
         let send_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            // `UdpSessionSocket::send` only completes once the datagram has
+            // actually left the host socket (the UDP session replies with a
+            // oneshot completion). Sending datagrams one at a time therefore
+            // caps a tunnel at 1 / per-send-round-trip — measured ~3k
+            // packets/s ≈ 30 Mbit/s on a LAN, independent of RTT. Keep a
+            // bounded number of sends in flight so the session ring is
+            // continuously fed instead of ping-ponging per packet.
+            let mut pending: tokio::task::JoinSet<Result<(usize, usize), io::Error>> =
+                tokio::task::JoinSet::new();
             while let Some(batch) = outgoing_rx.recv().await {
                 for datagram in batch {
-                    match send_session.send(&datagram).await {
-                        Ok(length) if length == datagram.len() => {}
-                        Ok(_) => {
-                            let _ = recv_errors
-                                .send(Err(io::Error::new(
-                                    io::ErrorKind::WriteZero,
-                                    "QUIC UDP session partially sent a datagram",
-                                )))
-                                .await;
-                            return;
-                        }
-                        Err(error) => {
-                            let _ = recv_errors.send(Err(error)).await;
-                            return;
-                        }
+                    let Ok(permit) = in_flight.clone().acquire_owned().await else {
+                        return;
+                    };
+                    let session = send_session.clone();
+                    let expected = datagram.len();
+                    pending.spawn(async move {
+                        let _permit = permit;
+                        session.send(&datagram).await.map(|sent| (sent, expected))
+                    });
+                }
+                while let Some(joined) = pending.try_join_next() {
+                    let failed = match joined {
+                        Ok(Ok((sent, expected))) if sent == expected => None,
+                        Ok(Ok(_)) => Some(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "QUIC UDP session partially sent a datagram",
+                        )),
+                        Ok(Err(error)) => Some(error),
+                        Err(_) => Some(io::Error::new(
+                            io::ErrorKind::Other,
+                            "QUIC UDP session send task failed",
+                        )),
+                    };
+                    if let Some(error) = failed {
+                        let _ = recv_errors.send(Err(error)).await;
+                        return;
                     }
                 }
             }
@@ -275,5 +307,9 @@ impl AsyncUdpSocket for QuicUdpSessionSocket {
 
     fn may_fragment(&self) -> bool {
         false
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        MAX_TRANSMIT_SEGMENTS
     }
 }
