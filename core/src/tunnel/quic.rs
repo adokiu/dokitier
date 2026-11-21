@@ -382,9 +382,18 @@ pub fn transport_config() -> Arc<TransportConfig> {
         .max_concurrent_bidi_streams(u8::MAX.into())
         .max_concurrent_uni_streams(0u8.into())
         .keep_alive_interval(Some(Duration::from_secs(5)))
-        .initial_mtu(1472)
+        // Upstream EasyTier (the known-good baseline) uses 1200-byte QUIC
+        // datagrams: the virtual UDP session underlay has a smaller MTU than
+        // Ethernet, so larger datagrams are dropped and retransmitted.
+        .initial_mtu(1200)
         .min_mtu(1200)
-        .enable_segmentation_offload(false)
+        // Segmentation offload lets quinn hand one batch of datagrams to the
+        // socket per wakeup. With it disabled every 1200-byte packet costs a
+        // separate try_send/poll_writable round trip through the virtual UDP
+        // session (an await on a bounded channel), which caps a LAN QUIC
+        // tunnel at ~30 Mbit/s (≈3k packets/s) while TCP — one kernel stream —
+        // is unaffected. Upstream keeps this enabled.
+        .enable_segmentation_offload(true)
         .stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW))
         .receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW))
         .send_window(SEND_WINDOW)
@@ -420,10 +429,10 @@ pub fn etq1_client_config() -> ClientConfig {
 
 pub(crate) fn endpoint_config_with_versions(versions: Vec<u32>) -> EndpointConfig {
     let mut config = EndpointConfig::default();
-    // Let MTU discovery use full-size packets (the transport starts at 1472
-    // and falls back to min_mtu 1200 on restricted paths). Capping the endpoint
-    // at 1200 threw away ~20% of every datagram.
-    config.max_udp_payload_size(1472).unwrap();
+    // Match upstream: 1200-byte datagrams fit every underlay path used by the
+    // virtual UDP session. When segmentation offload is on, quinn batches these
+    // segments, so the smaller packet size costs no throughput.
+    config.max_udp_payload_size(1200).unwrap();
     config.supported_versions(versions);
     config
 }
