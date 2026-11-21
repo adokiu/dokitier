@@ -136,14 +136,24 @@ jobs:
         shell: bash
         run: |
           set -e
+          # Only the size-constrained armv7/OpenWrt asset uses the size profile
+          # (opt-level="z" costs a large part of the data-plane throughput).
+          # Every other target ships the full release profile: opt-level=3,
+          # fat LTO, codegen-units=1 — no size trimming at all.
+          if [ "${{ matrix.upx }}" = "true" ]; then
+            PROFILE=tiny
+          else
+            PROFILE=release
+          fi
+          echo "core profile: $PROFILE"
           if [ "${{ matrix.zig }}" = "true" ]; then
-            cargo zigbuild --profile tiny -p dokitier --bin dokitier-core \
+            cargo zigbuild --profile $PROFILE -p dokitier --bin dokitier-core \
               --target ${{ matrix.target }}
           else
-            cargo build --profile tiny -p dokitier --bin dokitier-core \
+            cargo build --profile $PROFILE -p dokitier --bin dokitier-core \
               --target ${{ matrix.target }}
           fi
-          cp "target/${{ matrix.target }}/tiny/dokitier-core" "${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/$PROFILE/dokitier-core" "${{ matrix.asset }}"
           ls -l "${{ matrix.asset }}"
 
       - name: Build (full default features, windows)
@@ -187,6 +197,29 @@ jobs:
             --target ${{ matrix.target }}
           cp "target/${{ matrix.target }}/release/dokitier-console.exe" "${{ matrix.console_asset }}"
           ls -l "${{ matrix.console_asset }}"
+
+      - name: Build armv7 performance variant (release-fast + UPX)
+        if: ${{ matrix.upx }}
+        shell: bash
+        run: |
+          set -e
+          cargo zigbuild --profile release -p dokitier --bin dokitier-core \
+            --target ${{ matrix.target }}
+          cp "target/${{ matrix.target }}/release/dokitier-core" dokitier-core-armv7-perf
+          if upx --best --lzma -o dokitier-core-armv7-perf.upx dokitier-core-armv7-perf; then
+            mv dokitier-core-armv7-perf.upx dokitier-core-armv7-perf
+          else
+            rm -f dokitier-core-armv7-perf.upx
+          fi
+          ls -l dokitier-core-armv7-perf
+
+      - name: Upload armv7 performance artifact
+        if: ${{ matrix.upx }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dokitier-core-armv7-perf
+          path: dokitier-core-armv7-perf
+          if-no-files-found: error
 
       - name: Compress armv7 with UPX (OpenWrt flash budget)
         if: ${{ matrix.upx }}

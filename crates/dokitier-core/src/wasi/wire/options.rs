@@ -69,6 +69,7 @@ pub(crate) fn encode_udp_bind_options(options: &UdpBindOptions) -> io::Result<Ve
         UdpSocketPurpose::Socks5 => 6,
         UdpSocketPurpose::PortForward => 7,
         UdpSocketPurpose::PortLease => 8,
+        UdpSocketPurpose::ManualConnect => 9,
     });
     encoded.push(u8::from(options.need_protect));
     encode_bind_device(&mut encoded, &options.bind_device)?;

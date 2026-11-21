@@ -305,7 +305,7 @@ impl Default for ManualConnectorOptions {
             bind_device: false,
             allow_interface_bind: true,
             tcp_bind: TcpBindOptions::default(),
-            udp_bind: UdpBindOptions::direct_connect(),
+            udp_bind: UdpBindOptions::manual_connect(),
         }
     }
 }

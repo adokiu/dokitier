@@ -5,9 +5,9 @@ use std::{
 };
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
-use tokio::sync::RwLock;
 
 use crate::{
     config::PeerId,
@@ -41,7 +41,13 @@ pub struct PeerMap {
     my_peer_id: PeerId,
     peer_map: DashMap<PeerId, Arc<Peer>>,
     packet_send: PacketRecvChan,
-    routes: RwLock<Vec<ArcRoute>>,
+    /// Read-mostly route list. Written only when a route implementation is
+    /// installed (startup / network change), read on every forwarded packet, so
+    /// it is published as an immutable snapshot: forwarding reads it with
+    /// `load()` and never takes a lock, and a writer swaps the whole `Arc`
+    /// instead of mutating the vector in place — a route table snapshot in use
+    /// by a forwarding task can never be torn or dropped underneath it.
+    routes: ArcSwap<Vec<ArcRoute>>,
     alive_client_urls: Arc<Mutex<HashMap<url::Url, HashMap<PeerConnId, PeerId>>>>,
 }
 
@@ -56,7 +62,7 @@ impl PeerMap {
             my_peer_id,
             peer_map: DashMap::with_shard_amount(small_map_shard_amount()),
             packet_send,
-            routes: RwLock::new(Vec::new()),
+            routes: ArcSwap::from_pointee(Vec::new()),
             alive_client_urls: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -218,16 +224,29 @@ impl PeerMap {
         }
 
         // get route info
-        for route in self.routes.read().await.iter() {
-            if let Some(gateway_peer_id) = route
-                .get_next_hop_with_policy(dst_peer_id, policy.clone())
-                .await
-            {
+        self.route_next_hop(dst_peer_id, policy).await
+    }
+
+    /// Route-table part of `get_gateway_peer_id`, split out so a forwarding
+    /// decision that already knows the direct-connection constraints can ask
+    /// for a next hop without paying the lock twice.
+    ///
+    /// Takes no lock: the route list is loaded from an `ArcSwap` snapshot and
+    /// the route tables themselves are `DashMap` reads, so a forwarding fast
+    /// path stays O(1) and can never queue behind a writer or a send.
+    pub async fn route_next_hop(
+        &self,
+        dst_peer_id: PeerId,
+        policy: NextHopPolicy,
+    ) -> Option<PeerId> {
+        // Lock-free: the snapshot is immutable for as long as this `Arc` lives.
+        let routes = self.routes.load();
+        for route in routes.iter() {
+            if let Some(gateway) = route.get_next_hop_with_policy(dst_peer_id, policy).await {
                 // NOTIC: for foreign network, gateway_peer_id may not connect to me
-                return Some(gateway_peer_id);
+                return Some(gateway);
             }
         }
-
         None
     }
 
@@ -236,7 +255,7 @@ impl PeerMap {
         network_identity: &NetworkIdentity,
     ) -> Vec<PeerId> {
         let mut ret = Vec::new();
-        for route in self.routes.read().await.iter() {
+        for route in self.routes.load().iter() {
             let peers = route.list_peers_own_foreign_network(network_identity).await;
             ret.extend(peers);
         }
@@ -261,7 +280,7 @@ impl PeerMap {
     }
 
     pub async fn get_peer_id_by_ipv4(&self, ipv4: &Ipv4Addr) -> Option<PeerId> {
-        for route in self.routes.read().await.iter() {
+        for route in self.routes.load().iter() {
             let peer_id = route.get_peer_id_by_ipv4(ipv4).await;
             if peer_id.is_some() {
                 return peer_id;
@@ -271,7 +290,7 @@ impl PeerMap {
     }
 
     pub async fn get_peer_id_by_ipv6(&self, ipv6: &Ipv6Addr) -> Option<PeerId> {
-        for route in self.routes.read().await.iter() {
+        for route in self.routes.load().iter() {
             let peer_id = route.get_peer_id_by_ipv6(ipv6).await;
             if peer_id.is_some() {
                 return peer_id;
@@ -281,7 +300,7 @@ impl PeerMap {
     }
 
     pub async fn get_route_peer_info(&self, peer_id: PeerId) -> Option<RoutePeerInfo> {
-        for route in self.routes.read().await.iter() {
+        for route in self.routes.load().iter() {
             if let Some(info) = route.get_peer_info(peer_id).await {
                 return Some(info);
             }
@@ -294,7 +313,7 @@ impl PeerMap {
         network_name: &str,
         foreign_my_peer_id: PeerId,
     ) -> Option<PeerId> {
-        for route in self.routes.read().await.iter() {
+        for route in self.routes.load().iter() {
             let origin_peer_id = route
                 .get_origin_my_peer_id(network_name, foreign_my_peer_id)
                 .await;
@@ -378,19 +397,20 @@ impl PeerMap {
     }
 
     pub async fn add_route(&self, route: ArcRoute) {
-        let mut routes = self.routes.write().await;
+        // Copy-on-write publish: route installation is a rare control-plane
+        // event, so rebuilding the small Vec here is cheap and keeps every
+        // forwarding read lock-free (same intent as `routes.insert(0, ..)`).
+        let mut routes = (**self.routes.load()).clone();
         routes.insert(0, route);
+        self.routes.store(std::sync::Arc::new(routes));
     }
 
     pub(crate) async fn clear_resources(&self) {
         for peer_id in self.list_peers() {
             let _ = self.close_peer(peer_id).await;
         }
-        let routes = {
-            let mut routes = self.routes.write().await;
-            std::mem::take(&mut *routes)
-        };
-        for route in routes {
+        let routes = self.routes.swap(std::sync::Arc::new(Vec::new()));
+        for route in routes.iter().cloned() {
             route.close().await;
         }
         self.alive_client_urls.lock().clear();
@@ -413,7 +433,7 @@ impl PeerMap {
 
     pub async fn list_routes(&self) -> DashMap<PeerId, PeerId> {
         let route_map = DashMap::new();
-        for route in self.routes.read().await.iter() {
+        for route in self.routes.load().iter() {
             for item in route.list_routes().await.iter() {
                 route_map.insert(item.peer_id, item.next_hop_peer_id);
             }
@@ -422,7 +442,7 @@ impl PeerMap {
     }
 
     pub async fn list_route_infos(&self) -> Vec<CoreRoute> {
-        if let Some(route) = self.routes.read().await.iter().next() {
+        if let Some(route) = self.routes.load().iter().next() {
             return route.list_routes().await;
         }
         vec![]

@@ -3707,45 +3707,62 @@ pub(crate) async fn send_msg_internal(
     // segment black-holed. Never send a forwarded packet back to the peer it
     // just came from, and when the latency-first answer is unusable, use the
     // other policy's answer instead of dropping the packet.
-    let gateway = resolve_loop_free_gateway(
-        peers,
-        foreign_network_client,
-        dst_peer_id,
-        is_latency_first,
-        avoid_peer,
-    )
-    .await;
+    // Route lookup only when the destination is not directly connected. For a
+    // directly connected peer `has_peer` (a DashMap hit) already decides the
+    // path, and the old unconditional lookup took `routes.read()` twice per
+    // packet before reaching the same branch.
+    let gateway = if peers.has_peer(dst_peer_id) {
+        None
+    } else {
+        resolve_loop_free_gateway(
+            peers,
+            foreign_network_client,
+            dst_peer_id,
+            is_latency_first,
+            avoid_peer,
+        )
+        .await
+    };
 
-    let send_result = match gateway {
-        Some((gateway, gateway_policy)) if gateway != dst_peer_id => {
+    // Direct p2p link first, exactly like the v2.7.12/upstream ordering: the
+    // hot path must not touch the route table at all. Only peers we are not
+    // connected to fall back to gateway resolution.
+    let send_result = if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
+        crate::peers::link_policy::add_link_dst_bytes(dst_peer_id, dst_peer_id, msg_len);
+        peer.send_msg(msg).await
+    } else if peers.is_self(dst_peer_id) {
+        peers.send_msg_directly(msg, dst_peer_id).await
+    } else if foreign_network_client.has_next_hop(dst_peer_id) {
+        foreign_network_client.send_msg(msg, dst_peer_id).await
+    } else if let Some((gateway, gateway_policy)) = gateway {
+        if gateway != dst_peer_id
+            && (peers.has_peer(gateway) || foreign_network_client.has_next_hop(gateway))
+        {
             relay_peer_map
                 .send_msg(msg, dst_peer_id, gateway_policy)
                 .await
+        } else if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
+            peer.send_msg(msg).await
+        } else {
+            tracing::warn!(
+                target: "CORE",
+                dst = dst_peer_id,
+                ?policy,
+                ?avoid_peer,
+                gateway,
+                "no route for packet through gateway; dropping"
+            );
+            Err(Error::RouteError(None))
         }
-        _ => {
-            if let Some(peer) = peers.get_peer_by_id(dst_peer_id) {
-                // Direct p2p link: the link peer IS the destination.
-                crate::peers::link_policy::add_link_dst_bytes(
-                    dst_peer_id,
-                    dst_peer_id,
-                    msg_len,
-                );
-                peer.send_msg(msg).await
-            } else if peers.is_self(dst_peer_id) {
-                peers.send_msg_directly(msg, dst_peer_id).await
-            } else if foreign_network_client.has_next_hop(dst_peer_id) {
-                foreign_network_client.send_msg(msg, dst_peer_id).await
-            } else {
-                tracing::warn!(
-                    target: "CORE",
-                    dst = dst_peer_id,
-                    ?policy,
-                    ?avoid_peer,
-                    "no route for packet; dropping"
-                );
-                Err(Error::RouteError(None))
-            }
-        }
+    } else {
+        tracing::warn!(
+            target: "CORE",
+            dst = dst_peer_id,
+            ?policy,
+            ?avoid_peer,
+            "no route for packet; dropping"
+        );
+        Err(Error::RouteError(None))
     };
 
     if send_result.is_ok()
@@ -3768,11 +3785,11 @@ async fn resolve_loop_free_gateway(
     latency_first: bool,
     avoid_peer: Option<PeerId>,
 ) -> Option<(PeerId, NextHopPolicy)> {
-    // Smart/latency routing only weighs bandwidth, latency and loss (the route
-    // table already did that); hop count is deliberately not a tie-breaker.
-    // The only extra constraint here is loop safety: never hand a forwarded
-    // packet back to the peer it just came from. If the requested policy's
-    // answer would do that, fall back to the other policy's answer.
+    // Same policy precedence as the original implementation: the requested
+    // policy first, the other one only as a fallback. The single difference is
+    // loop safety — a candidate equal to the ingress peer is skipped, because
+    // handing a forwarded packet straight back creates a two-node ping-pong.
+    // Hop ordering itself is untouched.
     let policies: [NextHopPolicy; 2] = if latency_first {
         [NextHopPolicy::LeastCost, NextHopPolicy::LeastHop]
     } else {
@@ -3780,25 +3797,25 @@ async fn resolve_loop_free_gateway(
     };
 
     for policy in policies {
-        let Some(gateway) = peers
-            .get_gateway_peer_id(dst_peer_id, policy.clone())
-            .await
-        else {
-            continue;
+        let usable = |gateway: PeerId| {
+            Some(gateway) != avoid_peer
+                && (gateway == dst_peer_id
+                    || peers.has_peer(gateway)
+                    || foreign_network_client.has_next_hop(gateway))
         };
-        if Some(gateway) == avoid_peer {
-            continue;
-        }
-        if gateway == dst_peer_id
-            || peers.has_peer(gateway)
-            || foreign_network_client.has_next_hop(gateway)
+        if let Some(gateway) = peers.route_next_hop(dst_peer_id, policy.clone()).await
+            && usable(gateway)
         {
             return Some((gateway, policy));
         }
-    }
-
-    if Some(dst_peer_id) != avoid_peer && peers.has_peer(dst_peer_id) {
-        return Some((dst_peer_id, NextHopPolicy::LeastHop));
+        // The original `get_gateway_peer_id` also lets a directly connected
+        // destination answer for the LeastHop policy; keep that as a fallback
+        // so a route-table gap never regresses a previously working path.
+        if matches!(policy, NextHopPolicy::LeastHop) && peers.has_peer(dst_peer_id)
+            && usable(dst_peer_id)
+        {
+            return Some((dst_peer_id, policy));
+        }
     }
 
     None

@@ -186,6 +186,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UdpSocketPurpose {
+    /// Explicitly configured manual peer ([[peer]]): must egress through the
+    /// configured outbound interface.
+    ManualConnect,
     HolePunchControl,
     HolePunchCandidate,
     DirectConnect,
@@ -238,6 +241,10 @@ impl UdpBindOptions {
 
     pub fn direct_connect() -> Self {
         Self::for_purpose(UdpSocketPurpose::DirectConnect)
+    }
+
+    pub fn manual_connect() -> Self {
+        Self::for_purpose(UdpSocketPurpose::ManualConnect)
     }
 
     pub fn port_bound_listener(local_addr: SocketAddr) -> Self {

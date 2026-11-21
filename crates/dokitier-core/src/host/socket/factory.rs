@@ -79,12 +79,13 @@ where
     }
 }
 
-/// Pin core-originated outbound sockets to the configured egress interface
-/// (console-managed, hot-reloadable). Only auto-initiated traffic is pinned:
-/// hole-punch sockets carry explicit local addresses and manual peers are
-/// user-configured, so both are left untouched.
+/// Pin explicitly configured manual peers (`[[peer]]`) to the configured
+/// outbound interface (console-managed, hot-reloadable). Everything else —
+/// automatic direct connects, hole-punch sockets, STUN probes — keeps following
+/// the system routing table, so only operator-configured peers are forced onto
+/// a specific NIC.
 fn apply_outbound_bind_tcp(mut options: TcpConnectOptions) -> TcpConnectOptions {
-    if options.purpose == TcpSocketPurpose::DirectConnect
+    if options.purpose == TcpSocketPurpose::ManualConnect
         && options.bind.bind_device.is_none()
         && let Some(iface) = crate::socket::outbound_interface()
     {
@@ -94,11 +95,7 @@ fn apply_outbound_bind_tcp(mut options: TcpConnectOptions) -> TcpConnectOptions 
 }
 
 fn apply_outbound_bind_udp(mut options: UdpBindOptions) -> UdpBindOptions {
-    let auto_initiated = matches!(
-        options.purpose,
-        UdpSocketPurpose::DirectConnect | UdpSocketPurpose::StunProbe
-    );
-    if auto_initiated
+    if options.purpose == UdpSocketPurpose::ManualConnect
         && options.bind_device.is_none()
         && let Some(iface) = crate::socket::outbound_interface()
     {
