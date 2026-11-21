@@ -366,6 +366,18 @@ pub const QUIC_VERSION_ETQ1: u32 = 0x45545131;
 pub fn transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
 
+    // Flow-control windows are the throughput ceiling of a single QUIC stream:
+    // the sender can never have more than the peer's advertised
+    // `stream_receive_window` in flight, so throughput ≈ window / RTT. quinn's
+    // default (1.25 MiB) caps a cross-border tunnel at ~40 Mbit/s with a 250 ms
+    // RTT — exactly the ceiling reported for quic:// while TCP (autotuned
+    // windows) was fine. Size the windows for a 1 Gbit/s WAN path instead;
+    // buffers are only allocated while data is actually queued, and the tunnel
+    // reader drains eagerly, so idle cost stays negligible.
+    const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+    const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+    const SEND_WINDOW: u64 = 32 * 1024 * 1024;
+
     config
         .max_concurrent_bidi_streams(u8::MAX.into())
         .max_concurrent_uni_streams(0u8.into())
@@ -373,6 +385,9 @@ pub fn transport_config() -> Arc<TransportConfig> {
         .initial_mtu(1472)
         .min_mtu(1200)
         .enable_segmentation_offload(false)
+        .stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW))
+        .receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW))
+        .send_window(SEND_WINDOW)
         // BBR collapses one direction to a trickle when both directions are
         // saturated on low-RTT paths (measured 46 Mbps vs 717 Mbps unidirectional);
         // CUBIC keeps bidirectional bulk transfer fair and full-speed.
@@ -405,7 +420,10 @@ pub fn etq1_client_config() -> ClientConfig {
 
 pub(crate) fn endpoint_config_with_versions(versions: Vec<u32>) -> EndpointConfig {
     let mut config = EndpointConfig::default();
-    config.max_udp_payload_size(1200).unwrap();
+    // Let MTU discovery use full-size packets (the transport starts at 1472
+    // and falls back to min_mtu 1200 on restricted paths). Capping the endpoint
+    // at 1200 threw away ~20% of every datagram.
+    config.max_udp_payload_size(1472).unwrap();
     config.supported_versions(versions);
     config
 }
