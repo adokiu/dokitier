@@ -2491,7 +2491,6 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
                 });
             }
             if let Some(ip) = public_ipv4.clone().or(public_ipv6.clone()) {
-                let db = state.db.clone();
                 let id = node_id.clone();
                 let state_for_geo = state.clone();
                 tokio::spawn(async move { lookup_and_store_geo(state_for_geo, id, ip).await });
@@ -2518,7 +2517,6 @@ async fn handle_agent_frame(state: &AppState, frame: AgentFrame) -> Result<(), S
                     let due = state.geo_attempts.get(&node_id).map(|v| now() - *v > 300).unwrap_or(true);
                     if due {
                         state.geo_attempts.insert(node_id.clone(), now());
-                        let db = state.db.clone();
                         let id = node_id.clone();
                         let state_for_geo = state.clone();
                 tokio::spawn(async move { lookup_and_store_geo(state_for_geo, id, ip).await });
