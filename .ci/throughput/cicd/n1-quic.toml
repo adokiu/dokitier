@@ -1,0 +1,16 @@
+hostname = "cicd-n1"
+instance_name = "cicd-bench"
+instance_id = "22222222-aaaa-4bbb-8ccc-000000000001"
+ipv4 = "10.240.200.1/24"
+listeners = ["quic://0.0.0.0:11012"]
+rpc_portal = "127.0.0.1:15889"
+
+[network_identity]
+network_name = "cicd-bench"
+network_secret = "cicd-bench-key"
+
+[[peer]]
+uri = "quic://172.31.0.3:11012"
+
+[flags]
+no_tun = false

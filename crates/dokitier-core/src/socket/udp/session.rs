@@ -109,6 +109,29 @@ pub trait UdpSessionSocket: Send + Sync + 'static {
 
     async fn send(&self, data: &[u8]) -> std::io::Result<usize>;
 
+    /// Queue a datagram without waiting for the host socket write to complete.
+    ///
+    /// For datagram transports that implement their own reliability (QUIC) the
+    /// per-datagram completion round trip is pure overhead: it costs a lock,
+    /// a ring hand-off and a task wake-up per packet, which dominates the
+    /// profile at high packet rates. Datagrams are still delivered in order
+    /// because they are enqueued into the same ring; failures surface through
+    /// the transport's own timeout/loss detection.
+    async fn send_unreliable(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send(data).await.map(|_| ())
+    }
+
+    /// Enqueue a whole GSO batch without per-datagram completion waits.
+    ///
+    /// Default keeps the one-by-one contract; transports with a ring buffer
+    /// override it to take the queue lock once for the batch.
+    async fn send_batch_unreliable(&self, datagrams: &[Vec<u8>]) -> std::io::Result<()> {
+        for datagram in datagrams {
+            self.send_unreliable(datagram).await?;
+        }
+        Ok(())
+    }
+
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
 
     async fn recv_with_meta(&self, buf: &mut [u8]) -> std::io::Result<(usize, UdpSessionRecvMeta)> {
@@ -716,6 +739,43 @@ impl UdpSessionSocket for UdpSession {
             ret = sent => ret.map_err(|_| udp_session_closed_error())?,
             _ = closed.changed() => Err(udp_session_closed_error()),
         }
+    }
+
+    async fn send_unreliable(&self, data: &[u8]) -> std::io::Result<()> {
+        self.send_batch_unreliable(std::slice::from_ref(&data.to_vec())).await
+    }
+
+    async fn send_batch_unreliable(&self, datagrams: &[Vec<u8>]) -> std::io::Result<()> {
+        if datagrams.is_empty() {
+            return Ok(());
+        }
+        let mut closed = self.closed.clone();
+        if *closed.borrow() {
+            return Err(udp_session_closed_error());
+        }
+        // The completion receivers are dropped on purpose: the socket owner
+        // task treats a failed completion send as "caller went away" and keeps
+        // going, so no error is lost. Taking the queue lock once for the whole
+        // GSO batch removes the per-datagram mutex hand-off from the hot path.
+        let mut outgoing = tokio::select! {
+            biased;
+            _ = closed.changed() => return Err(udp_session_closed_error()),
+            outgoing = self.outgoing.lock() => outgoing,
+        };
+        for data in datagrams {
+            self.codec.validate_payload(data)?;
+            let (completion, _sent) = oneshot::channel();
+            let outbound = UdpSessionOutbound::Datagram {
+                payload: BytesMut::from(data.as_slice()),
+                completion,
+            };
+            tokio::select! {
+                biased;
+                _ = closed.changed() => return Err(udp_session_closed_error()),
+                ret = outgoing.send(outbound) => ret.map_err(ring_socket_error_to_io)?,
+            }
+        }
+        Ok(())
     }
 
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {

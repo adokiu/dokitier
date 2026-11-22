@@ -15,21 +15,18 @@ use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
 };
-use tokio::sync::{
-    Semaphore,
-    mpsc::{self, Receiver, Sender, error::TrySendError},
-};
+use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 use tokio_util::task::AbortOnDropHandle;
 
 const DATAGRAM_QUEUE_CAPACITY: usize = 1024;
-/// How many datagrams may be waiting for the host socket write at once. Large
-/// enough to keep the session ring saturated, small enough to bound memory.
-const SEND_IN_FLIGHT_LIMIT: usize = 256;
 /// Let quinn batch this many datagrams into a single `try_send` call. Without
 /// an override `AsyncUdpSocket::max_transmit_segments` is 1, so every QUIC
 /// packet costs a separate endpoint-driver -> socket hand-off regardless of
 /// `enable_segmentation_offload`.
-const MAX_TRANSMIT_SEGMENTS: usize = 32;
+const MAX_TRANSMIT_SEGMENTS: usize = 64;
+/// Receive up to this many datagrams per poll instead of one, so the QUIC
+/// endpoint driver iterates over a batch rather than a single packet.
+const MAX_RECEIVE_SEGMENTS: usize = 16;
 
 type SendBatch = Vec<Vec<u8>>;
 type WritableFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
@@ -106,46 +103,19 @@ impl QuicUdpSessionSocket {
         }));
 
         let send_session = session.clone();
-        let in_flight = Arc::new(Semaphore::new(SEND_IN_FLIGHT_LIMIT));
         let send_task = AbortOnDropHandle::new(tokio::spawn(async move {
-            // `UdpSessionSocket::send` only completes once the datagram has
-            // actually left the host socket (the UDP session replies with a
-            // oneshot completion). Sending datagrams one at a time therefore
-            // caps a tunnel at 1 / per-send-round-trip — measured ~3k
-            // packets/s ≈ 30 Mbit/s on a LAN, independent of RTT. Keep a
-            // bounded number of sends in flight so the session ring is
-            // continuously fed instead of ping-ponging per packet.
-            let mut pending: tokio::task::JoinSet<Result<(usize, usize), io::Error>> =
-                tokio::task::JoinSet::new();
+            // Datagrams must reach the wire in the order quinn produced them:
+            // concurrent sends complete out of order, QUIC sees the reordering
+            // as loss (one direction collapsed to a 2-packet congestion window
+            // with ~8% spurious loss and only ~175 Mbit/s), and CUBIC keeps
+            // retransmitting instead of opening the window. Send the batch
+            // sequentially; batching is already handled by the socket
+            // advertising `max_transmit_segments`, so the channel hand-off
+            // happens once per batch rather than once per packet.
             while let Some(batch) = outgoing_rx.recv().await {
-                for datagram in batch {
-                    let Ok(permit) = in_flight.clone().acquire_owned().await else {
-                        return;
-                    };
-                    let session = send_session.clone();
-                    let expected = datagram.len();
-                    pending.spawn(async move {
-                        let _permit = permit;
-                        session.send(&datagram).await.map(|sent| (sent, expected))
-                    });
-                }
-                while let Some(joined) = pending.try_join_next() {
-                    let failed = match joined {
-                        Ok(Ok((sent, expected))) if sent == expected => None,
-                        Ok(Ok(_)) => Some(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "QUIC UDP session partially sent a datagram",
-                        )),
-                        Ok(Err(error)) => Some(error),
-                        Err(_) => Some(io::Error::new(
-                            io::ErrorKind::Other,
-                            "QUIC UDP session send task failed",
-                        )),
-                    };
-                    if let Some(error) = failed {
-                        let _ = recv_errors.send(Err(error)).await;
-                        return;
-                    }
+                if let Err(error) = send_session.send_batch_unreliable(&batch).await {
+                    let _ = recv_errors.send(Err(error)).await;
+                    return;
                 }
             }
         }));
@@ -267,35 +237,59 @@ impl AsyncUdpSocket for QuicUdpSessionSocket {
         }
 
         let mut incoming = self.incoming.lock().unwrap();
+        let max_datagrams = buffers.len().min(meta.len());
+        let mut received = 0;
         loop {
-            match Pin::new(&mut *incoming).poll_recv(context) {
+            if received == max_datagrams {
+                return Poll::Ready(Ok(received));
+            }
+            let polled = if received == 0 {
+                Pin::new(&mut *incoming).poll_recv(context)
+            } else {
+                match incoming.try_recv() {
+                    Ok(datagram) => Poll::Ready(Some(datagram)),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        return Poll::Ready(Ok(received));
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        Poll::Ready(None)
+                    }
+                }
+            };
+            match polled {
                 Poll::Ready(Some(Ok(datagram))) => {
-                    if buffers[0].len() < datagram.payload.len() {
+                    let idx = received;
+                    if buffers[idx].len() < datagram.payload.len() {
                         tracing::debug!(
                             payload_len = datagram.payload.len(),
-                            recv_buf_len = buffers[0].len(),
+                            recv_buf_len = buffers[idx].len(),
                             peer_addr = ?self.peer_addr,
                             "drop oversized QUIC UDP session datagram"
                         );
                         continue;
                     }
-                    buffers[0][..datagram.payload.len()].copy_from_slice(&datagram.payload);
-                    meta[0] = RecvMeta {
+                    buffers[idx][..datagram.payload.len()]
+                        .copy_from_slice(&datagram.payload);
+                    meta[idx] = RecvMeta {
                         addr: self.peer_addr,
                         len: datagram.payload.len(),
                         stride: datagram.payload.len(),
                         ecn: None,
                         dst_ip: datagram.dst_ip,
                     };
-                    return Poll::Ready(Ok(1));
+                    received += 1;
                 }
-                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(Some(Err(error))) if received == 0 => {
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Some(Err(_))) => return Poll::Ready(Ok(received)),
                 Poll::Ready(None) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "QUIC UDP session closed",
                     )));
                 }
+                Poll::Pending if received > 0 => return Poll::Ready(Ok(received)),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -311,5 +305,9 @@ impl AsyncUdpSocket for QuicUdpSessionSocket {
 
     fn max_transmit_segments(&self) -> usize {
         MAX_TRANSMIT_SEGMENTS
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        MAX_RECEIVE_SEGMENTS
     }
 }

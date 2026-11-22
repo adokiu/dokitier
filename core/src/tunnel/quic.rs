@@ -385,7 +385,7 @@ pub fn transport_config() -> Arc<TransportConfig> {
         // Upstream EasyTier (the known-good baseline) uses 1200-byte QUIC
         // datagrams: the virtual UDP session underlay has a smaller MTU than
         // Ethernet, so larger datagrams are dropped and retransmitted.
-        .initial_mtu(1200)
+        .initial_mtu(1400)
         .min_mtu(1200)
         // Segmentation offload lets quinn hand one batch of datagrams to the
         // socket per wakeup. With it disabled every 1200-byte packet costs a
@@ -432,7 +432,7 @@ pub(crate) fn endpoint_config_with_versions(versions: Vec<u32>) -> EndpointConfi
     // Match upstream: 1200-byte datagrams fit every underlay path used by the
     // virtual UDP session. When segmentation offload is on, quinn batches these
     // segments, so the smaller packet size costs no throughput.
-    config.max_udp_payload_size(1200).unwrap();
+    config.max_udp_payload_size(1400).unwrap();
     config.supported_versions(versions);
     config
 }
@@ -497,6 +497,22 @@ fn spawn_metrics_sampler(conn: &Connection, addr: SocketAddr) {
                     ..Default::default()
                 },
             );
+            if std::env::var_os("DOKITIER_QUIC_STATS").is_some() {
+                let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+                eprintln!(
+                    "QUIC_STATS sent={} lost={} d_sent={} d_lost={} loss_ewma={:.2}% rtt={:?} cwnd={} mtu={} udp_tx={}MiB udp_rx={}MiB",
+                    sent,
+                    lost,
+                    d_sent,
+                    d_lost,
+                    loss_ewma,
+                    stats.path.rtt,
+                    stats.path.cwnd,
+                    stats.path.current_mtu,
+                    mib(stats.udp_tx.bytes),
+                    mib(stats.udp_rx.bytes),
+                );
+            }
             if conn.close_reason().is_some() {
                 break;
             }
