@@ -11,6 +11,9 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 SCHEMES=${SCHEMES:-"tcp udp quic"}
 MB=${MB:-512}
+# Extra `docker exec` env flags for the core processes, e.g.
+#   CORE_ENV="-e DOKITIER_QUIC_CC=cubic -e DOKITIER_QUIC_MTU=1400"
+CORE_ENV=${CORE_ENV:-}
 IMAGE=${IMAGE:-dokitier-test:local}
 NET=${NET:-doki-bench}
 N1=doki-n1
@@ -89,8 +92,10 @@ for scheme in $SCHEMES; do
   docker rm -f "$N1" "$N2" >/dev/null 2>&1 || true
   start_node "$N1" 172.31.0.2 "n1-$scheme.toml"
   start_node "$N2" 172.31.0.3 "n2-$scheme.toml"
-  docker exec -d "$N1" /usr/local/bin/dokitier-core -c /etc/dokitier/config.toml
-  docker exec -d "$N2" /usr/local/bin/dokitier-core -c /etc/dokitier/config.toml
+  # shellcheck disable=SC2086
+  docker exec $CORE_ENV -d "$N1" /usr/local/bin/dokitier-core -c /etc/dokitier/config.toml
+  # shellcheck disable=SC2086
+  docker exec $CORE_ENV -d "$N2" /usr/local/bin/dokitier-core -c /etc/dokitier/config.toml
 
   if ! wait_tunnel; then
     echo "::error::tunnel did not come up for $scheme" >&2

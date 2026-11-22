@@ -26,6 +26,14 @@ for n in 1 2; do
     -v "$ROOT/dokitier-core:/usr/local/bin/dokitier-core:ro" \
     -v "$ROOT/n$n-$SCHEME.toml:/etc/dokitier/config.toml:ro" \
     "$IMAGE" sleep infinity >/dev/null
+  # Optional WAN emulation: LOSS=1% DELAY=15ms LIMIT=1000 (host tc applied in
+  # the container netns; the image itself has no tc binary).
+  if [ -n "${LOSS:-}" ] || [ -n "${DELAY:-}" ]; then
+    nsp=$(docker inspect -f '{{.State.Pid}}' "doki-n$n")
+    nsenter -t "$nsp" -n tc qdisc add dev eth0 root netem \
+      limit "${LIMIT:-1000}" loss "${LOSS:-0%}" delay "${DELAY:-0ms}" \
+      >/dev/null 2>&1 || echo "netem failed for doki-n$n" >&2
+  fi
   docker exec -e DOKITIER_QUIC_STATS=1 -d "doki-n$n" \
     sh -c "/usr/local/bin/dokitier-core -c /etc/dokitier/config.toml >/tmp/core.log 2>&1"
 done

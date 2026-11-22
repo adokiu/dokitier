@@ -378,14 +378,43 @@ pub fn transport_config() -> Arc<TransportConfig> {
     const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
     const SEND_WINDOW: u64 = 32 * 1024 * 1024;
 
+    // Operational knobs for bandwidth/path-MTU tuning without a rebuild.
+    // Both default to the upstream-compatible, WAN-safe values.
+    let initial_mtu = std::env::var("DOKITIER_QUIC_MTU")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|mtu| mtu.clamp(1200, 1472))
+        .unwrap_or(1200);
+    let congestion_controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
+        match std::env::var("DOKITIER_QUIC_CC").as_deref() {
+            Ok("cubic") => Arc::new(quinn::congestion::CubicConfig::default()),
+            _ => {
+                let mut bbr = quinn::congestion::BbrConfig::default();
+                // BBR's default initial window is ~10 datagrams, which makes
+                // startup crawl on a high-BDP WAN path; allow raising it
+                // operationally (bytes, must be at least 10 datagrams).
+                if let Some(window) = std::env::var("DOKITIER_QUIC_CC_WINDOW")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    && window >= 10 * 1200
+                {
+                    bbr.initial_window(window);
+                }
+                Arc::new(bbr)
+            }
+        };
+
     config
         .max_concurrent_bidi_streams(u8::MAX.into())
         .max_concurrent_uni_streams(0u8.into())
         .keep_alive_interval(Some(Duration::from_secs(5)))
-        // Upstream EasyTier (the known-good baseline) uses 1200-byte QUIC
-        // datagrams: the virtual UDP session underlay has a smaller MTU than
-        // Ethernet, so larger datagrams are dropped and retransmitted.
-        .initial_mtu(1400)
+        // Start conservative like upstream EasyTier: the virtual UDP session
+        // underlay can be narrower than Ethernet (PPPoE/VPN/WireGuard paths),
+        // and starting at 1400 on a 1300-1400 MTU path caused intermittent
+        // loss, congestion-window collapse and the 100 Mbit/s <-> 50 Mbit/s
+        // oscillation seen on real WAN links. MTU discovery is enabled and may
+        // grow up to the endpoint's max_udp_payload_size.
+        .initial_mtu(initial_mtu)
         .min_mtu(1200)
         // Segmentation offload lets quinn hand one batch of datagrams to the
         // socket per wakeup. With it disabled every 1200-byte packet costs a
@@ -397,12 +426,12 @@ pub fn transport_config() -> Arc<TransportConfig> {
         .stream_receive_window(quinn::VarInt::from_u32(STREAM_WINDOW))
         .receive_window(quinn::VarInt::from_u32(CONNECTION_WINDOW))
         .send_window(SEND_WINDOW)
-        // BBR collapses one direction to a trickle when both directions are
-        // saturated on low-RTT paths (measured 46 Mbps vs 717 Mbps unidirectional);
-        // CUBIC keeps bidirectional bulk transfer fair and full-speed.
-        .congestion_controller_factory(Arc::new(
-            quinn_proto::congestion::CubicConfig::default(),
-        ));
+        // BBR like upstream. The earlier note that BBR collapses one direction
+        // on low-RTT paths was measured while the sender reordered datagrams
+        // (concurrent session sends), which made QUIC treat reordering as loss;
+        // with ordered sends CUBIC collapses on real WAN loss instead and the
+        // throughput oscillates. BBR is loss-tolerant and keeps the link busy.
+        .congestion_controller_factory(congestion_controller);
 
     Arc::new(config)
 }
@@ -432,7 +461,9 @@ pub(crate) fn endpoint_config_with_versions(versions: Vec<u32>) -> EndpointConfi
     // Match upstream: 1200-byte datagrams fit every underlay path used by the
     // virtual UDP session. When segmentation offload is on, quinn batches these
     // segments, so the smaller packet size costs no throughput.
-    config.max_udp_payload_size(1400).unwrap();
+    // Allow MTU discovery to grow the path MTU on clean links; the transport
+    // starts at 1200 and only raises the MTU after successful probes.
+    config.max_udp_payload_size(1472).unwrap();
     config.supported_versions(versions);
     config
 }

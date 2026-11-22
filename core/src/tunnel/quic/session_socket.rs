@@ -304,7 +304,14 @@ impl AsyncUdpSocket for QuicUdpSessionSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        MAX_TRANSMIT_SEGMENTS
+        // Large GSO batches reduce hand-off overhead but make the emission
+        // burstier; BBR's delivery-rate estimate prefers smaller batches, so
+        // allow tuning. 64 is the quinn maximum.
+        std::env::var("DOKITIER_QUIC_TX_SEGMENTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|segments| segments.clamp(1, MAX_TRANSMIT_SEGMENTS))
+            .unwrap_or(MAX_TRANSMIT_SEGMENTS)
     }
 
     fn max_receive_segments(&self) -> usize {
